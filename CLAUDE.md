@@ -260,7 +260,9 @@ The nftables forward chain is **default-drop**. Packets only escape via a `(src_
 
 ### State directory
 
-`/var/lib/bugpot/{images,bundles,containers}`. Images are content-addressed by digest; bundles are per-app (`rootfs` is a symlink into the image cache — read-only, no overlayfs yet). `Runtime::start_app` removes stale `containers/<name>` from a prior crash before letting libcontainer recreate it. Note that libcontainer's `with_root_path` takes the **parent** of the per-container state dir, not the dir itself.
+`/var/lib/bugpot/{images,bundles,containers,logs}`. Images are content-addressed by digest; bundles are per-app (`rootfs` is a symlink into the image cache — read-only, no overlayfs yet). `Runtime::start_app` removes stale `containers/<name>` from a prior crash before letting libcontainer recreate it. Note that libcontainer's `with_root_path` takes the **parent** of the per-container state dir, not the dir itself.
+
+`logs/<app>/{stdout,stderr}.log` hold each container's fd 1 / fd 2 output. Container fds are opened by bugpot in `O_APPEND` mode and handed to libcontainer, so they survive bugpot crashes and restarts — `reattach_running` doesn't need to re-establish them. The files are NOT cleaned up when an app is removed (operators may want them for post-mortem); orphan-cleanup at startup explicitly skips them.
 
 ### Multi-arch image handling
 
@@ -275,7 +277,9 @@ bugpot delegates image-index resolution to oci-client's default `current_platfor
 
 - `bugpot-metrics::install_recorder` is called unconditionally at startup so `metrics` macros always emit; the HTTP listener (`/metrics`, `/healthz`) only binds when `BUGPOT_METRICS_LISTEN` is set. No auth — bind to a trusted interface.
 - Cold-start instrumentation: `bugpot_cold_start_seconds{phase=endpoint|pull|start|readiness}` (controller, success-only), `bugpot_image_pull_seconds{step=…}` (runtime), `bugpot_container_start_seconds{step=…}` (runtime).
-- Container stdout/stderr is captured by `bugpot-runtime` and re-emitted through `tracing` under target `bugpot::app` with fields `app` and `stream` — filter with `RUST_LOG=bugpot::app=info`.
+- Container stdout/stderr lands in `<state>/logs/<app>/{stdout,stderr}.log` (container fd 1 / 2 opened `O_APPEND`). A per-stream task tails each file via inotify (`IN_MODIFY`) and re-emits each new line through `tracing` under target `bugpot::app` with fields `app` and `stream` — filter with `RUST_LOG=bugpot::app=info`.
+- The tail opens at offset 0, not EOF: on bugpot restart, anything still in the file (incl. bytes the app wrote during the interregnum) replays through tracing once. The replay window is bounded by the truncation cap below, so a restart costs at most one cap-worth of duplicate emissions.
+- **Log volume bound (#21):** when any of those files grows past `MAX_LOG_BYTES` (10 MiB), the tail truncates it in place via `ftruncate(0)`. The container's existing fd keeps working — its `O_APPEND` semantics make the next write seek to the new end (= 0). Bytes written between the size check and the truncate may be lost on disk; everything before that point was already emitted through tracing, so the loss is only visible to operators reading the file directly. No generations / no rotation files; if richer retention is needed, run an external collector (vector / otel-collector / fluent-bit) against the same files.
 
 ## Conventions
 

@@ -8,9 +8,11 @@ use std::io::SeekFrom;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use bugpot_config::AppSpec;
+use futures::StreamExt;
+use inotify::{Inotify, WatchMask};
 use libcontainer::container::{Container, ContainerStatus};
 use libcontainer::container::builder::ContainerBuilder;
 use libcontainer::signal::Signal;
@@ -19,6 +21,13 @@ use metrics::histogram;
 use nix::sys::signal::Signal as NixSignal;
 use tokio::io::{AsyncBufReadExt, AsyncSeekExt, BufReader};
 use tracing::{debug, info, warn};
+
+/// Per-stream cap on the on-disk log file. When the file grows past this
+/// threshold the tail task truncates it in place. Bytes between the size
+/// check and the truncate may be lost; the tracing pipeline already
+/// emitted everything before the truncate point, so the loss only
+/// matters for operators reading the file directly.
+const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024; // 10 MiB
 
 use crate::auth::Auth;
 use crate::error::{Result, RuntimeError};
@@ -416,16 +425,49 @@ impl Runtime {
     }
 }
 
-/// Poll a per-app log file and forward each new line through tracing.
+async fn truncate_in_place(path: &Path) -> std::io::Result<()> {
+    let file = tokio::fs::OpenOptions::new().write(true).open(path).await?;
+    file.set_len(0).await
+}
+
+/// Follow a per-app log file and forward each new line through tracing.
 ///
-/// Starts at end-of-file so a freshly-started or reattached bugpot does
-/// not replay historical lines. After every transient `Ok(0)` (no new
-/// data), sleeps briefly and re-reads — the kernel keeps the file's
-/// offset across appends, so subsequent reads pick up new bytes
-/// without seeking. Detached on purpose; cancellation happens when
-/// bugpot itself exits (we abort no `JoinHandle`s).
+/// Opens at the start of the file so bugpot restarts replay everything
+/// the file still holds — that's how the interregnum (bugpot down, app
+/// kept writing) gets into the new bugpot's tracing pipeline. Replay
+/// is bounded by `MAX_LOG_BYTES` (truncation cap), so the cost is
+/// at most one cap-worth of duplicate emissions per restart event.
+///
+/// Waits for `IN_MODIFY` from inotify between read passes instead of
+/// polling — idle apps cost zero CPU on bugpot's side. After each
+/// read pass, checks size: when the file has grown past
+/// `MAX_LOG_BYTES`, truncates it in place and seeks the reader back
+/// to 0. Container `fd 1/2` were opened `O_APPEND`, so writes after
+/// truncation resume at offset 0.
+///
+/// Detached on purpose; cancellation happens when bugpot exits (we
+/// hold no `JoinHandle`s).
 async fn forward_log_file(path: PathBuf, app: String, stream: &'static str) {
-    const POLL_INTERVAL: Duration = Duration::from_millis(200);
+    let inotify = match Inotify::init() {
+        Ok(i) => i,
+        Err(e) => {
+            warn!(app = %app, stream, error = %e, "inotify init failed; log tail disabled");
+            return;
+        }
+    };
+    if let Err(e) = inotify.watches().add(&path, WatchMask::MODIFY) {
+        warn!(app = %app, stream, path = %path.display(), error = %e, "inotify watch failed");
+        return;
+    }
+    let buffer = vec![0u8; 1024];
+    let mut events = match inotify.into_event_stream(buffer) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(app = %app, stream, error = %e, "inotify into_event_stream failed");
+            return;
+        }
+    };
+
     let file = match tokio::fs::OpenOptions::new()
         .read(true)
         .open(&path)
@@ -437,29 +479,54 @@ async fn forward_log_file(path: PathBuf, app: String, stream: &'static str) {
             return;
         }
     };
-    let mut file = file;
-    if let Err(e) = file.seek(SeekFrom::End(0)).await {
-        warn!(app = %app, stream, error = %e, "seek to EOF failed");
-        return;
-    }
     let mut reader = BufReader::new(file);
     let mut line = String::new();
+
     loop {
-        line.clear();
-        match reader.read_line(&mut line).await {
-            Ok(0) => {
-                tokio::time::sleep(POLL_INTERVAL).await;
-            }
-            Ok(_) => {
-                let trimmed = line.trim_end();
-                if !trimmed.is_empty() {
-                    info!(target: "bugpot::app", app = %app, stream, "{trimmed}");
+        // Drain everything currently in the file.
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) => break,
+                Ok(_) => {
+                    let trimmed = line.trim_end();
+                    if !trimmed.is_empty() {
+                        info!(target: "bugpot::app", app = %app, stream, "{trimmed}");
+                    }
+                }
+                Err(e) => {
+                    warn!(app = %app, stream, error = %e, "log file tail read failed");
+                    return;
                 }
             }
-            Err(e) => {
-                warn!(app = %app, stream, error = %e, "log file tail read failed");
-                return;
+        }
+
+        // Bound on-disk size. In-place truncate keeps the inode (so
+        // container fd 1/2 keep working); container `O_APPEND` causes
+        // subsequent writes to start at offset 0.
+        match tokio::fs::metadata(&path).await {
+            Ok(meta) if meta.len() > MAX_LOG_BYTES => {
+                if let Err(e) = truncate_in_place(&path).await {
+                    warn!(app = %app, stream, error = %e, "truncate log file failed");
+                } else {
+                    info!(target: "bugpot::app", app = %app, stream, "log file truncated at {MAX_LOG_BYTES} bytes");
+                    if let Err(e) = reader.seek(SeekFrom::Start(0)).await {
+                        warn!(app = %app, stream, error = %e, "seek after truncate failed");
+                        return;
+                    }
+                }
             }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(app = %app, stream, error = %e, "metadata failed");
+            }
+        }
+
+        // Block until the container writes again, or the watch goes
+        // away. We don't care about the event details; one wake-up
+        // per batch of writes is enough.
+        if events.next().await.is_none() {
+            return;
         }
     }
 }

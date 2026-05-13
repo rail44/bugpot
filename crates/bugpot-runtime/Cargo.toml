@@ -11,6 +11,8 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+futures.workspace = true
+inotify.workspace = true
 metrics.workspace = true
 tokio.workspace = true
 tracing.workspace = true
