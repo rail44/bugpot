@@ -1,5 +1,5 @@
 [package]
-name = "bugpot-controller"
+name = "bugpot-metrics"
 version = "0.0.1"
 edition.workspace = true
 license.workspace = true
@@ -11,17 +11,11 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-async-trait.workspace = true
+axum.workspace = true
 metrics.workspace = true
+metrics-exporter-prometheus = { version = "0.17", default-features = false }
 tokio.workspace = true
 tracing.workspace = true
-serde = { workspace = true }
-thiserror.workspace = true
-toml.workspace = true
-bugpot-config.workspace = true
-bugpot-egress.workspace = true
-bugpot-router.workspace = true
-bugpot-runtime.workspace = true
 
 [lints]
 workspace = true

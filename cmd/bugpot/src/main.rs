@@ -27,9 +27,15 @@ const DEFAULT_APPS_DIR: &str = "./apps";
 const DEFAULT_AUTH_FILE: &str = "/etc/bugpot/auth.toml";
 const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(10);
 
+// Metrics: the Prometheus recorder is *always* installed so callsites
+// emit successfully; the HTTP listener is only spawned when
+// `BUGPOT_METRICS_LISTEN` is set, keeping the surface area opt-in.
+
 #[tokio::main]
+#[allow(clippy::too_many_lines)] // entrypoint wiring; splitting yields less clarity, not more
 async fn main() -> Result<()> {
     init_tracing();
+    let metrics_handle = bugpot_metrics::install_recorder().context("install metrics recorder")?;
 
     if !nix::unistd::Uid::effective().is_root() {
         anyhow::bail!(
@@ -107,6 +113,22 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Metrics HTTP listener (optional). The recorder is installed
+    // unconditionally above so emission paths stay no-op-safe even when
+    // the listener is disabled.
+    let metrics_task = if let Ok(raw) = std::env::var("BUGPOT_METRICS_LISTEN") {
+        let addr: SocketAddr = raw.parse().context("parse BUGPOT_METRICS_LISTEN")?;
+        Some(tokio::spawn(async move {
+            if let Err(e) = bugpot_metrics::serve(addr, metrics_handle).await {
+                error!(error = %e, "metrics endpoint exited with error");
+            }
+        }))
+    } else {
+        info!("BUGPOT_METRICS_LISTEN unset; /metrics endpoint disabled");
+        drop(metrics_handle);
+        None
+    };
+
     // Admin HTTP API.
     let admin_auth = Arc::new(AdminAuth::from_token(read_admin_token()?));
     if admin_auth.is_enforced() {
@@ -133,6 +155,9 @@ async fn main() -> Result<()> {
 
     serve_task.abort();
     admin_task.abort();
+    if let Some(t) = metrics_task {
+        t.abort();
+    }
     stopper_task.abort();
     controller.teardown().await;
 

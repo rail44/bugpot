@@ -17,6 +17,7 @@ use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::{TokioExecutor, TokioIo},
 };
+use metrics::counter;
 use std::{
     net::SocketAddr,
     sync::Arc,
@@ -160,14 +161,27 @@ async fn handler(State(state): State<ProxyState>, req: Request) -> Response {
         .unwrap_or("")
         .to_owned();
 
-    let Some(upstream) = state.resolver.resolve(&host).await else {
-        warn!(host = %host, "no app matched");
-        return error_response(StatusCode::NOT_FOUND, format!("no app matched host '{host}'\n"));
+    let app_label = subdomain_of(&host)
+        .unwrap_or("unknown")
+        .to_owned();
+
+    let response = match state.resolver.resolve(&host).await {
+        None => {
+            warn!(host = %host, "no app matched");
+            error_response(StatusCode::NOT_FOUND, format!("no app matched host '{host}'\n"))
+        }
+        Some(upstream) => {
+            info!(host = %host, %upstream, "matched route");
+            forward(state.client, req, upstream, &host).await
+        }
     };
-
-    info!(host = %host, %upstream, "matched route");
-
-    forward(state.client, req, upstream, &host).await
+    counter!(
+        "bugpot_router_requests_total",
+        "app" => app_label,
+        "status" => response.status().as_u16().to_string(),
+    )
+    .increment(1);
+    response
 }
 
 /// Forward a request to the resolved upstream socket.

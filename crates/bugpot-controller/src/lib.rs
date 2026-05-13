@@ -25,6 +25,7 @@ use bugpot_config::{AppSpec, AuthConfig, RegistryCredential, registry_host};
 use bugpot_egress::Egress;
 use bugpot_router::{UpstreamResolver, subdomain_of};
 use bugpot_runtime::{Auth, Runtime};
+use metrics::{gauge, histogram};
 use serde::Serialize;
 use thiserror::Error;
 use tokio::net::TcpStream;
@@ -135,6 +136,8 @@ impl AppController {
             let key = spec.subdomain().to_owned();
             apps.insert(key, make_handle(name, spec));
         }
+        #[allow(clippy::cast_precision_loss)]
+        gauge!("bugpot_apps_active").set(apps.len() as f64);
         Self {
             runtime,
             egress,
@@ -273,6 +276,7 @@ impl AppController {
             }
             apps.insert(subdomain.clone(), handle.clone());
         }
+        gauge!("bugpot_apps_active").increment(1.0);
 
         let eager = spec
             .scaling
@@ -282,6 +286,8 @@ impl AppController {
         if eager {
             info!(app = %name, "eager start on deploy");
             if let Err(e) = self.ensure_running(&handle).await {
+                // remove_by_subdomain decrements the gauge to keep it
+                // balanced with the increment above.
                 let _ = self.remove_by_subdomain(&subdomain).await;
                 return Err(DeployError::StartFailed(e));
             }
@@ -311,6 +317,7 @@ impl AppController {
             apps.remove(subdomain)
                 .ok_or_else(|| anyhow!("subdomain '{subdomain}' not found"))?
         };
+        gauge!("bugpot_apps_active").decrement(1.0);
         if let Err(e) = self.stop(&handle).await {
             warn!(app = %handle.name, error = ?e, "stop failed during remove");
         }
@@ -398,12 +405,21 @@ impl AppController {
         let name = &handle.name;
         info!(app = %name, image = %handle.spec.image, "starting");
 
+        // Each cold-start phase records into bugpot_cold_start_seconds
+        // *only on success*; failure paths intentionally don't record so
+        // the histogram reflects the latency distribution of complete
+        // cold starts. Total cold-start time = sum across phases (queryable
+        // in Prom).
+        let phase_start = Instant::now();
         let endpoint = self
             .egress
             .allocate_endpoint(name, handle.spec.egress.allow.clone())
             .await
             .with_context(|| format!("allocate endpoint for {name}"))?;
+        histogram!("bugpot_cold_start_seconds", "phase" => "endpoint")
+            .record(phase_start.elapsed().as_secs_f64());
 
+        let phase_start = Instant::now();
         if let Err(e) = self
             .runtime
             .pull_image(&handle.spec.image, self.resolve_auth(&handle.spec.image))
@@ -412,7 +428,10 @@ impl AppController {
             let _ = self.egress.release_endpoint(name).await;
             return Err(e).with_context(|| format!("pull image for {name}"));
         }
+        histogram!("bugpot_cold_start_seconds", "phase" => "pull")
+            .record(phase_start.elapsed().as_secs_f64());
 
+        let phase_start = Instant::now();
         let running = match self
             .runtime
             .start_app(&handle.spec, Some(&endpoint.netns_path))
@@ -424,6 +443,9 @@ impl AppController {
                 return Err(e).with_context(|| format!("start container for {name}"));
             }
         };
+        histogram!("bugpot_cold_start_seconds", "phase" => "start")
+            .record(phase_start.elapsed().as_secs_f64());
+
         info!(
             app = %name,
             pid = running.pid,
@@ -435,12 +457,15 @@ impl AppController {
         // otherwise the first proxied request would race ahead of the
         // process's listener.
         let upstream = SocketAddr::from((endpoint.container_ip, handle.spec.port));
+        let phase_start = Instant::now();
         if let Err(e) = wait_for_port(upstream).await {
             warn!(app = %name, error = %e, "readiness probe failed");
             let _ = self.runtime.stop_app(name).await;
             let _ = self.egress.release_endpoint(name).await;
             return Err(e);
         }
+        histogram!("bugpot_cold_start_seconds", "phase" => "readiness")
+            .record(phase_start.elapsed().as_secs_f64());
         Ok(endpoint.container_ip)
     }
 
