@@ -72,6 +72,14 @@ pub trait RuntimeOps: Send + Sync + std::fmt::Debug + 'static {
     /// successful reattach so the new bugpot's tracing pipeline picks
     /// up the surviving container's stdout/stderr from EOF.
     fn ensure_log_tails(&self, id: &str);
+    /// Reap a leftover container whose `AppSpec` is no longer registered
+    /// (TOML deleted while bugpot was down). Stops and removes
+    /// libcontainer state if it exists, deletes the bundle dir. The
+    /// per-app log directory is intentionally left alone — operators
+    /// may want to read it post-mortem.
+    ///
+    /// Idempotent: returns Ok when nothing exists for `name`.
+    fn cleanup_orphan_container(&self, name: &str) -> impl Future<Output = Result<()>> + Send;
 }
 
 /// Container lifecycle runtime.
@@ -355,6 +363,33 @@ impl RuntimeOps for Runtime {
             .lock()
             .expect("apps mutex poisoned")
             .remove(id);
+        Ok(())
+    }
+
+    #[allow(clippy::unused_async)]
+    async fn cleanup_orphan_container(&self, name: &str) -> Result<()> {
+        let container_root = self.containers_dir.join(name);
+        if container_root.exists() {
+            match Container::load(container_root.clone()) {
+                Ok(mut container) => {
+                    if container.status() == ContainerStatus::Running {
+                        let _ = container.kill(Signal::from(NixSignal::SIGKILL), true);
+                    }
+                    if let Err(e) = container.delete(true) {
+                        warn!(app = %name, error = ?e, "libcontainer delete failed; removing state dir manually");
+                        let _ = fs::remove_dir_all(&container_root);
+                    }
+                }
+                Err(e) => {
+                    warn!(app = %name, error = ?e, "libcontainer load failed; removing state dir manually");
+                    let _ = fs::remove_dir_all(&container_root);
+                }
+            }
+        }
+        let bundle_dir = self.bundles_dir.join(name);
+        if bundle_dir.exists() {
+            fs::remove_dir_all(&bundle_dir).map_err(|e| RuntimeError::io(&bundle_dir, e))?;
+        }
         Ok(())
     }
 
