@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
+use std::future::Future;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -30,15 +31,20 @@ use parking_lot::RwLock;
 use crate::allowlist::Allowlist;
 
 /// Inject the upstream resolver behind a trait so tests don't need real DNS.
-#[async_trait]
+/// Native AFIT (no `#[async_trait]`) — used only via generics
+/// (`EgressDnsHandler<U: Upstream, _>`), never `dyn`.
 pub trait Upstream: Send + Sync + 'static {
-    async fn resolve_a(&self, name: &str) -> anyhow::Result<Vec<Ipv4Addr>>;
+    fn resolve_a(&self, name: &str) -> impl Future<Output = anyhow::Result<Vec<Ipv4Addr>>> + Send;
 }
 
 /// Inject the nftables allow-set so tests can capture writes.
-#[async_trait]
+/// Native AFIT — see [`Upstream`] for rationale.
 pub trait AllowSet: Send + Sync + 'static {
-    async fn register(&self, src: Ipv4Addr, dst: Ipv4Addr) -> anyhow::Result<()>;
+    fn register(
+        &self,
+        src: Ipv4Addr,
+        dst: Ipv4Addr,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send;
 }
 
 /// Shared registry of `src_ip → (app_id, allowlist)`. Mutated by `Egress`
@@ -270,7 +276,6 @@ mod tests {
         answers: HashMap<String, Vec<Ipv4Addr>>,
     }
 
-    #[async_trait]
     impl Upstream for MockUpstream {
         async fn resolve_a(&self, name: &str) -> anyhow::Result<Vec<Ipv4Addr>> {
             self.answers
@@ -285,7 +290,6 @@ mod tests {
         calls: Mutex<Vec<(Ipv4Addr, Ipv4Addr)>>,
     }
 
-    #[async_trait]
     impl AllowSet for MockAllowSet {
         async fn register(&self, src: Ipv4Addr, dst: Ipv4Addr) -> anyhow::Result<()> {
             self.calls.lock().unwrap().push((src, dst));

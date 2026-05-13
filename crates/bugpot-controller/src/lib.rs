@@ -22,9 +22,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use bugpot_config::{AppSpec, AuthConfig, RegistryCredential, registry_host};
-use bugpot_egress::Egress;
+use bugpot_egress::EgressOps;
 use bugpot_router::{UpstreamResolver, subdomain_of};
-use bugpot_runtime::{Auth, ResourceUsage, Runtime};
+use bugpot_runtime::{Auth, ResourceUsage, RuntimeOps};
 use metrics::{counter, gauge, histogram};
 use serde::Serialize;
 use thiserror::Error;
@@ -115,9 +115,9 @@ pub enum AppStateView {
 /// apps whose container died unexpectedly or that have been idle too
 /// long.
 #[derive(Debug)]
-pub struct AppController {
-    runtime: Arc<Runtime>,
-    egress: Arc<Egress>,
+pub struct AppController<R: RuntimeOps, E: EgressOps> {
+    runtime: Arc<R>,
+    egress: Arc<E>,
     apps_dir: PathBuf,
     auth: AuthConfig,
     /// Keyed by subdomain (= app name by default).
@@ -129,11 +129,11 @@ pub struct AppController {
     cpu_baselines: tokio::sync::Mutex<HashMap<String, u64>>,
 }
 
-impl AppController {
+impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
     #[must_use]
     pub fn new(
-        runtime: Arc<Runtime>,
-        egress: Arc<Egress>,
+        runtime: Arc<R>,
+        egress: Arc<E>,
         apps_dir: PathBuf,
         auth: AuthConfig,
         specs: Vec<AppSpec>,
@@ -657,7 +657,7 @@ async fn view_of(handle: &Arc<AppHandle>) -> AppView {
 }
 
 #[async_trait]
-impl UpstreamResolver for AppController {
+impl<R: RuntimeOps, E: EgressOps> UpstreamResolver for AppController<R, E> {
     async fn resolve(&self, host: &str) -> Option<SocketAddr> {
         let subdomain = subdomain_of(host)?;
         let handle = {
@@ -689,4 +689,258 @@ async fn wait_for_port(addr: SocketAddr, timeout: Duration) -> Result<()> {
     Err(anyhow!(
         "container did not accept connections on {addr} within {timeout:?}: {last_err:?}"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex as StdMutex;
+
+    use bugpot_config::{
+        AppSpec, Egress as EgressSpec, Readiness, Resources, Runtime as RuntimeCfg, Scaling,
+    };
+    use bugpot_egress::{Endpoint, EgressOps};
+    use bugpot_runtime::{Auth, ImageId, ResourceUsage, RunningApp, RuntimeError, RuntimeOps};
+
+    #[derive(Debug, Default)]
+    struct MockRuntime {
+        pull_results: StdMutex<VecDeque<std::result::Result<ImageId, RuntimeError>>>,
+        start_results: StdMutex<VecDeque<std::result::Result<RunningApp, RuntimeError>>>,
+        running: StdMutex<HashMap<String, bool>>,
+        calls: StdMutex<Vec<String>>,
+    }
+
+    impl MockRuntime {
+        fn push_pull(&self, r: std::result::Result<ImageId, RuntimeError>) {
+            self.pull_results.lock().unwrap().push_back(r);
+        }
+        fn set_running(&self, app: &str, value: bool) {
+            self.running.lock().unwrap().insert(app.to_owned(), value);
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+        fn record(&self, s: impl Into<String>) {
+            self.calls.lock().unwrap().push(s.into());
+        }
+    }
+
+    impl RuntimeOps for MockRuntime {
+        async fn pull_image(
+            &self,
+            image_ref: &str,
+            _auth: Auth,
+        ) -> std::result::Result<ImageId, RuntimeError> {
+            self.record(format!("pull_image({image_ref})"));
+            self.pull_results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Err(RuntimeError::Other("mock: no pull response queued".into())))
+        }
+
+        async fn start_app(
+            &self,
+            spec: &AppSpec,
+            _image_id: &ImageId,
+            _netns_path: Option<&Path>,
+        ) -> std::result::Result<RunningApp, RuntimeError> {
+            let name = spec.name().to_owned();
+            self.record(format!("start_app({name})"));
+            self.start_results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Err(RuntimeError::Other("mock: no start response queued".into())))
+        }
+
+        async fn stop_app(&self, id: &str) -> std::result::Result<(), RuntimeError> {
+            self.record(format!("stop_app({id})"));
+            self.running.lock().unwrap().remove(id);
+            Ok(())
+        }
+
+        fn is_container_running(&self, id: &str) -> bool {
+            *self.running.lock().unwrap().get(id).unwrap_or(&false)
+        }
+
+        fn resource_usage(&self, _id: &str) -> Option<ResourceUsage> {
+            None
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct MockEgress {
+        allocate_fail: StdMutex<bool>,
+        endpoints: StdMutex<HashMap<String, Endpoint>>,
+        calls: StdMutex<Vec<String>>,
+    }
+
+    impl MockEgress {
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl EgressOps for MockEgress {
+        async fn allocate_endpoint(
+            &self,
+            app_id: &str,
+            _allowlist: Vec<String>,
+        ) -> anyhow::Result<Endpoint> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("allocate_endpoint({app_id})"));
+            if *self.allocate_fail.lock().unwrap() {
+                anyhow::bail!("mock: allocate_endpoint failed");
+            }
+            let ep = Endpoint {
+                container_ip: Ipv4Addr::LOCALHOST,
+                netns_path: PathBuf::from(format!("/run/netns/mock-{app_id}")),
+            };
+            self.endpoints
+                .lock()
+                .unwrap()
+                .insert(app_id.to_owned(), ep.clone());
+            Ok(ep)
+        }
+
+        async fn release_endpoint(&self, app_id: &str) -> anyhow::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("release_endpoint({app_id})"));
+            self.endpoints.lock().unwrap().remove(app_id);
+            Ok(())
+        }
+    }
+
+    fn spec_with_name(name: &str) -> AppSpec {
+        AppSpec {
+            image: "registry.example/img:tag".to_owned(),
+            port: 8080,
+            name: Some(name.to_owned()),
+            subdomain: None,
+            egress: EgressSpec::default(),
+            env: HashMap::default(),
+            scaling: Scaling::default(),
+            readiness: Readiness::default(),
+            resources: Resources::default(),
+            runtime: RuntimeCfg::default(),
+            source_path: PathBuf::new(),
+        }
+    }
+
+    fn make_controller(
+        specs: Vec<AppSpec>,
+        apps_dir: PathBuf,
+    ) -> Arc<AppController<MockRuntime, MockEgress>> {
+        Arc::new(AppController::new(
+            Arc::new(MockRuntime::default()),
+            Arc::new(MockEgress::default()),
+            apps_dir,
+            AuthConfig::default(),
+            specs,
+        ))
+    }
+
+    /// `deploy_app` must surface a pull failure as `DeployError::ImagePull`
+    /// and leave no TOML file behind.
+    #[tokio::test]
+    async fn deploy_app_propagates_pull_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let controller = make_controller(vec![], tmp.path().to_owned());
+        controller
+            .runtime
+            .push_pull(Err(RuntimeError::Other("registry unreachable".into())));
+
+        let err = controller
+            .deploy_app(spec_with_name("alpha"))
+            .await
+            .expect_err("expected pull failure");
+        assert!(matches!(err, DeployError::ImagePull(_)), "got {err:?}");
+
+        let toml = tmp.path().join("alpha.toml");
+        assert!(!toml.exists(), "toml should not be written on pull failure");
+    }
+
+    /// On cold-start failure during image pull, the previously-allocated
+    /// endpoint must be released so the next attempt can reallocate
+    /// cleanly.
+    #[tokio::test]
+    async fn cold_start_releases_endpoint_on_pull_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Pre-register so we hit ensure_running without going through
+        // deploy_app's own pull (which would short-circuit).
+        let controller = make_controller(vec![spec_with_name("alpha")], tmp.path().to_owned());
+        controller
+            .runtime
+            .push_pull(Err(RuntimeError::Other("registry down".into())));
+
+        let handle = {
+            let apps = controller.apps.read().await;
+            apps.get("alpha").cloned().expect("handle present")
+        };
+        let res = controller.ensure_running(&handle).await;
+        assert!(res.is_err(), "expected pull failure to propagate");
+
+        let egress_calls = controller.egress.calls();
+        assert!(
+            egress_calls.contains(&"allocate_endpoint(alpha)".to_owned()),
+            "expected allocate; got {egress_calls:?}"
+        );
+        assert!(
+            egress_calls.contains(&"release_endpoint(alpha)".to_owned()),
+            "expected release after pull failure; got {egress_calls:?}"
+        );
+        assert!(
+            !controller.runtime.calls().iter().any(|c| c.starts_with("start_app")),
+            "start_app must not be called when pull fails"
+        );
+    }
+
+    /// Sweep must detect a container that died under the controller's
+    /// feet (`is_container_running` returns false despite the handle
+    /// reporting `Running`) and transition its handle back to `Stopped`.
+    #[tokio::test]
+    async fn sweep_detects_dead_container() {
+        let tmp = tempfile::tempdir().unwrap();
+        let controller = make_controller(vec![spec_with_name("alpha")], tmp.path().to_owned());
+
+        // Force the handle into Running state without going through the
+        // real cold-start path.
+        let handle = {
+            let apps = controller.apps.read().await;
+            apps.get("alpha").cloned().unwrap()
+        };
+        {
+            let mut inner = handle.inner.lock().await;
+            inner.state = AppState::Running {
+                container_ip: Ipv4Addr::LOCALHOST,
+            };
+        }
+        // Simulate the kernel: container is *not* actually running.
+        controller.runtime.set_running("alpha", false);
+
+        controller.sweep().await;
+
+        let state = handle.inner.lock().await.state;
+        assert!(
+            matches!(state, AppState::Stopped),
+            "expected Stopped after sweep, got {state:?}"
+        );
+        let rt_calls = controller.runtime.calls();
+        assert!(
+            rt_calls.contains(&"stop_app(alpha)".to_owned()),
+            "expected stop_app; got {rt_calls:?}"
+        );
+        let eg_calls = controller.egress.calls();
+        assert!(
+            eg_calls.contains(&"release_endpoint(alpha)".to_owned()),
+            "expected release_endpoint; got {eg_calls:?}"
+        );
+    }
 }

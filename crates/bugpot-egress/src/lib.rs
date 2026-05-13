@@ -38,6 +38,7 @@
 
 #![allow(clippy::module_name_repetitions)]
 
+use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -137,6 +138,21 @@ pub struct Endpoint {
     pub netns_path: PathBuf,
 }
 
+/// Trait surface used by callers (the controller) to allocate and release
+/// per-app network endpoints.
+///
+/// Static dispatch only — no `dyn`. Native AFIT to avoid the
+/// `Pin<Box<dyn Future>>` allocation `#[async_trait]` would introduce;
+/// explicit `+ Send` because callers `tokio::spawn` over these futures.
+pub trait EgressOps: Send + Sync + std::fmt::Debug + 'static {
+    fn allocate_endpoint(
+        &self,
+        app_id: &str,
+        allowlist: Vec<String>,
+    ) -> impl Future<Output = anyhow::Result<Endpoint>> + Send;
+    fn release_endpoint(&self, app_id: &str) -> impl Future<Output = anyhow::Result<()>> + Send;
+}
+
 /// In-memory record so we can free addresses on release and apply allowlist
 /// updates without re-allocating.
 #[derive(Debug)]
@@ -231,8 +247,11 @@ impl Egress {
         })
     }
 
+}
+
+impl EgressOps for Egress {
     /// Allocate veth + netns + container IP, register the app's allowlist.
-    pub async fn allocate_endpoint(
+    async fn allocate_endpoint(
         &self,
         app_id: &str,
         allowlist: Vec<String>,
@@ -270,7 +289,7 @@ impl Egress {
         Ok(ep)
     }
 
-    pub async fn release_endpoint(&self, app_id: &str) -> anyhow::Result<()> {
+    async fn release_endpoint(&self, app_id: &str) -> anyhow::Result<()> {
         let Some(app) = self.apps.lock().remove(app_id) else {
             return Ok(());
         };
@@ -286,7 +305,9 @@ impl Egress {
         self.allocator.lock().release(app.container_ip);
         Ok(())
     }
+}
 
+impl Egress {
     #[allow(clippy::unused_async)] // matches the public spec; future versions may push to nft.
     pub async fn update_allowlist(
         &self,
@@ -327,7 +348,6 @@ impl HickoryUpstream {
     }
 }
 
-#[async_trait::async_trait]
 impl Upstream for HickoryUpstream {
     async fn resolve_a(&self, name: &str) -> anyhow::Result<Vec<Ipv4Addr>> {
         use hickory_proto::rr::RData;
@@ -350,7 +370,6 @@ struct NftAllowSet {
     table: String,
 }
 
-#[async_trait::async_trait]
 impl AllowSet for NftAllowSet {
     async fn register(&self, src: Ipv4Addr, dst: Ipv4Addr) -> anyhow::Result<()> {
         nft::add_allow(&self.table, src, dst).await
