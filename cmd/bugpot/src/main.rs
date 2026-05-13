@@ -123,7 +123,7 @@ async fn main() -> Result<()> {
     }
 
     let sweep_task = spawn_sweep(&controller);
-    let serve_task = spawn_router(cfg.listen, &controller);
+    let serve_task = spawn_router(cfg.listen, &controller)?;
 
     // Metrics HTTP listener (optional). The recorder is installed
     // unconditionally above so emission paths stay no-op-safe even when
@@ -235,13 +235,47 @@ fn spawn_sweep<R: RuntimeOps, E: EgressOps>(
 fn spawn_router<R: RuntimeOps, E: EgressOps>(
     listen: SocketAddr,
     controller: &Arc<AppController<R, E>>,
-) -> JoinHandle<()> {
+) -> Result<JoinHandle<()>> {
     let resolver: Arc<dyn UpstreamResolver> = controller.clone();
-    tokio::spawn(async move {
-        if let Err(e) = bugpot_router::serve(listen, resolver).await {
+    let router_cfg = parse_router_config()?;
+    Ok(tokio::spawn(async move {
+        if let Err(e) = bugpot_router::serve(listen, resolver, router_cfg).await {
             error!(error = %e, "router exited with error");
         }
-    })
+    }))
+}
+
+/// Build a `bugpot_router::RouterConfig` from optional env vars.
+///
+/// `BUGPOT_TRUSTED_PROXIES` is a comma-separated CIDR list. Peers
+/// outside this set have their incoming `X-Forwarded-For` discarded
+/// so an attacker cannot spoof an upstream chain. Empty / unset →
+/// behave as the historical proxy (always append).
+///
+/// `BUGPOT_FORWARDED_PROTO` overrides the value bugpot writes into
+/// `X-Forwarded-Proto`. Set to `https` when bugpot sits behind a
+/// TLS-terminating front; default is `http`.
+fn parse_router_config() -> Result<bugpot_router::RouterConfig> {
+    let mut cfg = bugpot_router::RouterConfig::defaults();
+    if let Ok(raw) = std::env::var("BUGPOT_TRUSTED_PROXIES") {
+        for token in raw.split(',') {
+            let trimmed = token.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let net: ipnet::IpNet = trimmed
+                .parse()
+                .with_context(|| format!("parse BUGPOT_TRUSTED_PROXIES entry '{trimmed}'"))?;
+            cfg.trusted_proxies.push(net);
+        }
+    }
+    if let Ok(raw) = std::env::var("BUGPOT_FORWARDED_PROTO") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            trimmed.clone_into(&mut cfg.forwarded_proto);
+        }
+    }
+    Ok(cfg)
 }
 
 fn spawn_admin<R: RuntimeOps, E: EgressOps>(
