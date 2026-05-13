@@ -300,13 +300,22 @@ impl EgressOps for Egress {
         let container_ip = self.allocator.lock().allocate()?;
         let plan = EndpointPlan::new(name, container_ip, self.config.subnet);
 
+        // Defensive pre-detach: a prior `release_endpoint` may have
+        // bailed mid-way and left a netns + veth named the way we're
+        // about to use. The detach is idempotent — no-ops when nothing
+        // exists — so this only does anything on the leaked-state path.
+        netns::force_detach_endpoint(&plan).await;
+
         if let Err(e) = netns::run_cmds(netns::render_attach_endpoint(
             &self.config.bridge_name,
             &plan,
         ))
         .await
         {
-            // Roll back IP allocation on failure.
+            // Roll back: tear down any partial state from a failed
+            // attach (e.g. netns add succeeded but veth move failed),
+            // then return the IP to the allocator.
+            netns::force_detach_endpoint(&plan).await;
             self.allocator.lock().release(container_ip);
             return Err(e).context("attach endpoint");
         }
@@ -377,14 +386,13 @@ impl EgressOps for Egress {
             container_ip,
         ))
         .await;
-        // Render the same detach plan we would use for a clean release;
-        // the netns name + host veth name derive deterministically from
-        // the app name, so this works even though we never called
+        // Use force-detach so a missing veth (e.g. host side already
+        // gone) doesn't prevent deleting the netns. The netns name +
+        // host veth name derive deterministically from the app name,
+        // so this works even though we never called
         // `allocate_endpoint` for this app in this process.
         let plan = netns::EndpointPlan::new(name, container_ip, self.config.subnet);
-        if let Err(e) = netns::run_cmds(netns::render_detach_endpoint(&plan)).await {
-            tracing::warn!(app = %name, error = %e, "detach orphan endpoint failed");
-        }
+        netns::force_detach_endpoint(&plan).await;
         self.allocator.lock().release(container_ip);
         Ok(())
     }

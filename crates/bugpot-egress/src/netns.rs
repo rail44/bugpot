@@ -213,27 +213,50 @@ fn parse_inet_addr(s: &str) -> Option<Ipv4Addr> {
     None
 }
 
-/// Run a sequence of `ip` commands. Errors are returned with the failing
-/// command included for diagnosis.
+/// Run a single `ip` command. Returns an error including the command line
+/// and the program's stderr on non-zero exit.
+async fn run_one_cmd(cmd: &IpCmd) -> anyhow::Result<()> {
+    let (head, tail) = cmd.split_first().ok_or_else(|| anyhow::anyhow!("empty cmd"))?;
+    let status = Command::new(head)
+        .args(tail)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to spawn {head}: {e}"))?
+        .wait_with_output()
+        .await?;
+    anyhow::ensure!(
+        status.status.success(),
+        "command {cmd:?} failed: {}",
+        String::from_utf8_lossy(&status.stderr).trim()
+    );
+    Ok(())
+}
+
+/// Run a sequence of `ip` commands. Bails on the first non-zero exit
+/// with the failing command included for diagnosis.
 pub async fn run_cmds(cmds: Vec<IpCmd>) -> anyhow::Result<()> {
     for cmd in cmds {
-        let (head, tail) = cmd.split_first().ok_or_else(|| anyhow::anyhow!("empty cmd"))?;
-        let status = Command::new(head)
-            .args(tail)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("failed to spawn {head}: {e}"))?
-            .wait_with_output()
-            .await?;
-        anyhow::ensure!(
-            status.status.success(),
-            "command {cmd:?} failed: {}",
-            String::from_utf8_lossy(&status.stderr).trim()
-        );
+        run_one_cmd(&cmd).await?;
     }
     Ok(())
+}
+
+/// Best-effort detach: runs every detach command independently,
+/// ignoring failures.
+///
+/// Tolerates the "target does not exist" case from a partial prior
+/// cleanup. Used by `Egress::allocate_endpoint` to reclaim a leaked
+/// netns from a failed `release_endpoint`, and by
+/// `cleanup_orphan_endpoint` so a missing veth doesn't block deleting
+/// the netns.
+pub async fn force_detach_endpoint(plan: &EndpointPlan) {
+    for cmd in render_detach_endpoint(plan) {
+        if let Err(e) = run_one_cmd(&cmd).await {
+            tracing::debug!(?cmd, error = %e, "force-detach step failed; continuing");
+        }
+    }
 }
 
 #[cfg(test)]
