@@ -155,6 +155,7 @@ name = "bugpot"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "bugpot-admin",
  "bugpot-config",
  "bugpot-controller",
  "bugpot-egress",
@@ -164,6 +165,20 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "bugpot-admin"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "axum",
+ "bugpot-config",
+ "bugpot-controller",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -188,6 +203,7 @@ dependencies = [
  "bugpot-router",
  "bugpot-runtime",
  "serde",
+ "thiserror 2.0.18",
  "tokio",
  "toml",
  "tracing",

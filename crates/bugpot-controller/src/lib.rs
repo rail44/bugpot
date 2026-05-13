@@ -26,9 +26,36 @@ use bugpot_egress::Egress;
 use bugpot_router::{UpstreamResolver, subdomain_of};
 use bugpot_runtime::{Auth, Runtime};
 use serde::Serialize;
+use thiserror::Error;
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Notify, RwLock};
 use tracing::{debug, error, info, warn};
+
+/// Errors surfaced by the public mutation API. Adapter crates map these
+/// to their transport-specific failure shapes (HTTP status codes, etc).
+#[derive(Debug, Error)]
+pub enum DeployError {
+    #[error("spec.name is required for deploy")]
+    MissingName,
+    #[error("app '{0}' already exists")]
+    AlreadyExists(String),
+    #[error("subdomain '{0}' already in use")]
+    SubdomainTaken(String),
+    #[error("image pull failed: {0:#}")]
+    ImagePull(#[source] anyhow::Error),
+    #[error("eager start failed: {0:#}")]
+    StartFailed(#[source] anyhow::Error),
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
+#[derive(Debug, Error)]
+pub enum RemoveError {
+    #[error("app '{0}' not found")]
+    NotFound(String),
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
 
 /// How long to wait for an app to start accepting TCP connections on its
 /// declared port after libcontainer reports the container is running.
@@ -202,28 +229,29 @@ impl AppController {
     /// already exists. The image is pulled before persistence so failure
     /// leaves no state. If `idle_timeout = 0`, the app is eager-started
     /// before this call returns.
-    pub async fn deploy_app(&self, mut spec: AppSpec) -> Result<AppView> {
-        let name = spec
-            .name
-            .clone()
-            .ok_or_else(|| anyhow!("spec.name is required for deploy"))?;
+    pub async fn deploy_app(&self, mut spec: AppSpec) -> std::result::Result<AppView, DeployError> {
+        let name = spec.name.clone().ok_or(DeployError::MissingName)?;
         let subdomain = spec.subdomain().to_owned();
 
         // Fast-fail on obvious collisions before doing the expensive pull.
         {
             let apps = self.apps.read().await;
             if apps.contains_key(&subdomain) {
-                return Err(anyhow!("subdomain '{subdomain}' already in use"));
+                return Err(DeployError::SubdomainTaken(subdomain));
             }
             if apps.values().any(|h| h.name == name) {
-                return Err(anyhow!("app '{name}' already exists"));
+                return Err(DeployError::AlreadyExists(name));
             }
         }
 
         self.runtime
             .pull_image(&spec.image, self.resolve_auth(&spec.image))
             .await
-            .with_context(|| format!("pull image {} for {name}", spec.image))?;
+            .map_err(|e| {
+                DeployError::ImagePull(
+                    anyhow::Error::from(e).context(format!("pull {} for {name}", spec.image)),
+                )
+            })?;
 
         let toml_path = self.apps_dir.join(format!("{name}.toml"));
         let toml_body = toml::to_string_pretty(&spec)
@@ -241,7 +269,7 @@ impl AppController {
             // raced into the same key.
             if apps.contains_key(&subdomain) {
                 let _ = tokio::fs::remove_file(&toml_path).await;
-                return Err(anyhow!("subdomain '{subdomain}' raced into existence"));
+                return Err(DeployError::SubdomainTaken(subdomain));
             }
             apps.insert(subdomain.clone(), handle.clone());
         }
@@ -255,7 +283,7 @@ impl AppController {
             info!(app = %name, "eager start on deploy");
             if let Err(e) = self.ensure_running(&handle).await {
                 let _ = self.remove_by_subdomain(&subdomain).await;
-                return Err(e);
+                return Err(DeployError::StartFailed(e));
             }
         }
 
@@ -264,15 +292,17 @@ impl AppController {
 
     /// Unregister an app by name. Stops the container (if running) and
     /// deletes its TOML file.
-    pub async fn remove_app(&self, name: &str) -> Result<()> {
+    pub async fn remove_app(&self, name: &str) -> std::result::Result<(), RemoveError> {
         let subdomain = {
             let apps = self.apps.read().await;
             apps.iter()
                 .find(|(_, h)| h.name == name)
                 .map(|(k, _)| k.clone())
-                .ok_or_else(|| anyhow!("app '{name}' not found"))?
+                .ok_or_else(|| RemoveError::NotFound(name.to_owned()))?
         };
-        self.remove_by_subdomain(&subdomain).await
+        self.remove_by_subdomain(&subdomain)
+            .await
+            .map_err(RemoveError::Internal)
     }
 
     async fn remove_by_subdomain(&self, subdomain: &str) -> Result<()> {

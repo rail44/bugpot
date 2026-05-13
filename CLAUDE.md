@@ -82,9 +82,41 @@ under `scripts/` are still the canonical end-to-end tests:
 These scripts DO tear down `bugpot0` + the `nft` table on exit because
 they're explicit single-shot tests. The dev-server intentionally does not.
 
-Env vars (read by bugpot directly): `BUGPOT_APPS_DIR` (default `./apps`),
-`BUGPOT_STATE_DIR` (default `/var/lib/bugpot`),
-`BUGPOT_LISTEN` (default `127.0.0.1:8080`), `RUST_LOG`.
+Env vars (read by bugpot directly):
+
+- `BUGPOT_APPS_DIR` (default `./apps`)
+- `BUGPOT_STATE_DIR` (default `/var/lib/bugpot`)
+- `BUGPOT_LISTEN` — public HTTP router (default `127.0.0.1:8080`)
+- `BUGPOT_ADMIN_LISTEN` — admin HTTP API (default `127.0.0.1:8081`)
+- `BUGPOT_AUTH_FILE` — registry-auth TOML (default `/etc/bugpot/auth.toml`, missing file = anonymous)
+- `RUST_LOG`
+
+### Admin HTTP API
+
+`bugpot-admin` exposes a minimal CRUD surface for runtime app management.
+Listener is whatever `BUGPOT_ADMIN_LISTEN` points at — *no* authn/authz in
+code, scoped by the listener choice (loopback for self-hosted runner
+flows, Tailscale IP + ACL for remote CI).
+
+| Method | Path           | Body / Response                                    |
+|--------|----------------|----------------------------------------------------|
+| POST   | `/apps`        | JSON `AppSpec` in, `201` + `AppView`. Pulls image immediately; persists `apps/<name>.toml` only on success. |
+| GET    | `/apps`        | `200` + `[AppView]`                                |
+| GET    | `/apps/{name}` | `200` + `AppView`, `404` if absent                 |
+| DELETE | `/apps/{name}` | `204` on stop+remove, `404` if absent              |
+
+Error → status mapping:
+
+- `400` missing `name`
+- `404` not found
+- `409` name or subdomain already in use
+- `502` image pull failed (registry unreachable / auth wrong)
+- `500` other internal errors
+
+Adapter crates (webhook receiver, GitHub poller, CLI) can be added later
+as siblings of `bugpot-admin`; the public mutation API on
+`AppController` (`deploy_app` / `remove_app` / `list_apps` / `get_app`)
+is the shared boundary.
 
 ## Architecture
 
