@@ -211,6 +211,13 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
                         };
                         inner.last_access = Instant::now();
                     }
+                    // The previous bugpot's tail tasks died with it.
+                    // Spawn fresh ones so the new process's tracing
+                    // pipeline (and `just logs`) keeps showing app
+                    // output. Tails seek to EOF — historical lines
+                    // remain readable in the log file but don't
+                    // replay.
+                    self.runtime.ensure_log_tails(name);
                     info!(app = %name, container_ip = %ep.container_ip, "reattached to running container");
                 }
                 Ok(None) => {
@@ -824,6 +831,10 @@ mod tests {
         fn resource_usage(&self, _id: &str) -> Option<ResourceUsage> {
             None
         }
+
+        fn ensure_log_tails(&self, id: &str) {
+            self.record(format!("ensure_log_tails({id})"));
+        }
     }
 
     #[derive(Debug, Default)]
@@ -1030,6 +1041,13 @@ mod tests {
         assert!(
             !eg_calls.iter().any(|c| c.starts_with("allocate_endpoint")),
             "allocate_endpoint must not be called during reattach; got {eg_calls:?}"
+        );
+        // The fresh tail tasks must be spawned for the reattached app
+        // (the previous bugpot's tails died with it).
+        let rt_calls = controller.runtime.calls();
+        assert!(
+            rt_calls.contains(&"ensure_log_tails(alpha)".to_owned()),
+            "expected ensure_log_tails(alpha); got {rt_calls:?}"
         );
     }
 
