@@ -194,6 +194,7 @@ dependencies = [
  "anyhow",
  "humantime",
  "serde",
+ "thiserror 2.0.18",
  "toml",
  "tracing",
  "walkdir",
@@ -231,6 +232,8 @@ dependencies = [
  "hickory-server",
  "ipnet",
  "parking_lot",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]

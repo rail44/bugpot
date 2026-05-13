@@ -39,6 +39,8 @@ use tracing::{debug, error, info, warn};
 pub enum DeployError {
     #[error("spec.name is required for deploy")]
     MissingName,
+    #[error("invalid spec: {0}")]
+    InvalidSpec(#[from] bugpot_config::InvalidSpec),
     #[error("app '{0}' already exists")]
     AlreadyExists(String),
     #[error("subdomain '{0}' already in use")]
@@ -484,6 +486,10 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
     /// before this call returns.
     pub async fn deploy_app(&self, mut spec: AppSpec) -> std::result::Result<AppView, DeployError> {
         let name = spec.name.clone().ok_or(DeployError::MissingName)?;
+        // Strict validation BEFORE we touch the filesystem — `name`
+        // lands in `<apps_dir>/<name>.toml` and `bugpot-<name>` netns
+        // names, and the admin API accepts arbitrary JSON.
+        spec.validate()?;
         let subdomain = spec.subdomain().to_owned();
 
         // Fast-fail on obvious collisions before doing the expensive pull.

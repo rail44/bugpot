@@ -11,6 +11,8 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+serde = { workspace = true }
+serde_json = "1"
 tokio.workspace = true
 tracing.workspace = true
 bugpot-config.workspace = true
