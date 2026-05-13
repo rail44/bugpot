@@ -379,13 +379,9 @@ impl EgressOps for Egress {
         container_ip: Ipv4Addr,
     ) -> anyhow::Result<()> {
         // Best-effort: drop any allow-set entries left over from the
-        // previous bugpot run. Entries also TTL out, so a failure here
-        // is non-fatal.
-        let _ = nft::run_script(&nft::render_flush_src(
-            &self.nft_table,
-            container_ip,
-        ))
-        .await;
+        // previous bugpot run for *this* container IP. Entries also
+        // TTL out, so a failure here is non-fatal.
+        let _ = nft::flush_src(&self.nft_table, container_ip).await;
         // Use force-detach so a missing veth (e.g. host side already
         // gone) doesn't prevent deleting the netns. The netns name +
         // host veth name derive deterministically from the app name,
@@ -402,13 +398,11 @@ impl EgressOps for Egress {
             return Ok(());
         };
         self.registry.remove(app.container_ip);
-        // Flush this src's entries from the allow set (best-effort; entries
-        // expire via TTL anyway).
-        let _ = nft::run_script(&nft::render_flush_src(
-            &self.nft_table,
-            app.container_ip,
-        ))
-        .await;
+        // Flush this src's entries from the allow set (best-effort; the
+        // 60s TTL is a backstop). Only entries matching *this* src IP
+        // are removed — previous behaviour flushed the whole set, which
+        // briefly broke egress for every other running app.
+        let _ = nft::flush_src(&self.nft_table, app.container_ip).await;
         netns::run_cmds(netns::render_detach_endpoint(&app.plan)).await?;
         self.allocator.lock().release(app.container_ip);
         Ok(())

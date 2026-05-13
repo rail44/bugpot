@@ -216,7 +216,7 @@ impl IntoResponse for AdminError {
 impl From<DeployError> for AdminError {
     fn from(err: DeployError) -> Self {
         let status = match &err {
-            DeployError::MissingName => StatusCode::BAD_REQUEST,
+            DeployError::MissingName | DeployError::InvalidSpec(_) => StatusCode::BAD_REQUEST,
             DeployError::AlreadyExists(_) | DeployError::SubdomainTaken(_) => StatusCode::CONFLICT,
             DeployError::ImagePull(_) => StatusCode::BAD_GATEWAY,
             DeployError::StartFailed(_) | DeployError::Internal(_) => {

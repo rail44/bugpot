@@ -144,6 +144,69 @@ impl AppSpec {
     pub fn subdomain(&self) -> &str {
         self.subdomain.as_deref().unwrap_or_else(|| self.name())
     }
+
+    /// Reject specs that would put user-controlled strings on paths or
+    /// kernel-namespace names. `name` becomes `<apps_dir>/<name>.toml`
+    /// (path traversal would land arbitrary writes as root) and
+    /// `bugpot-<name>` (netns name), so both must be a strict DNS
+    /// label.
+    ///
+    /// Called by [`load_apps`] when reading from disk and by the admin
+    /// API's `deploy_app` path; either rejects before any side effect.
+    pub fn validate(&self) -> Result<(), InvalidSpec> {
+        validate_dns_label("name", self.name())?;
+        // `subdomain()` defaults to `name`, so this also catches the
+        // common case. When explicitly set it gets the same check.
+        validate_dns_label("subdomain", self.subdomain())?;
+        Ok(())
+    }
+}
+
+/// Reason an `AppSpec` field failed validation. Surface this to the
+/// admin API as HTTP 400.
+#[derive(Debug, thiserror::Error)]
+#[error("invalid {field}: {reason} (value={value:?})")]
+pub struct InvalidSpec {
+    pub field: &'static str,
+    pub value: String,
+    pub reason: &'static str,
+}
+
+/// Strict DNS label: ASCII lowercase letters, digits, and hyphens. No
+/// leading or trailing hyphen. Length 1..=63 (kept inline with RFC 1035
+/// section 2.3.4).
+///
+/// Notably **rejects** `..`, `/`, whitespace, uppercase letters,
+/// underscores, and dots — the path-traversal / netns-name-escape
+/// vectors the admin API would otherwise expose.
+fn validate_dns_label(field: &'static str, s: &str) -> Result<(), InvalidSpec> {
+    fn invalid(field: &'static str, value: &str, reason: &'static str) -> InvalidSpec {
+        InvalidSpec {
+            field,
+            value: value.to_owned(),
+            reason,
+        }
+    }
+    if s.is_empty() {
+        return Err(invalid(field, s, "must not be empty"));
+    }
+    if s.len() > 63 {
+        return Err(invalid(field, s, "must be at most 63 characters"));
+    }
+    if s.starts_with('-') || s.ends_with('-') {
+        return Err(invalid(field, s, "must not start or end with '-'"));
+    }
+    for c in s.chars() {
+        let ok = c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-';
+        if !ok {
+            return Err(invalid(
+                field,
+                s,
+                "must contain only lowercase ASCII letters, digits, and '-'",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Per-registry pull credentials.
@@ -247,6 +310,8 @@ pub fn load_apps(dir: impl AsRef<Path>) -> Result<Vec<AppSpec>> {
         let mut spec: AppSpec = toml::from_str(&body)
             .with_context(|| format!("failed to parse {}", path.display()))?;
         spec.source_path = path.to_path_buf();
+        spec.validate()
+            .with_context(|| format!("invalid spec in {}", path.display()))?;
         apps.push(spec);
     }
     apps.sort_by(|a, b| a.name().cmp(b.name()));
@@ -256,6 +321,59 @@ pub fn load_apps(dir: impl AsRef<Path>) -> Result<Vec<AppSpec>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_dns_label_accepts_typical_names() {
+        for s in ["alpha", "beta", "dev-alpha", "app-1", "x", &"a".repeat(63)] {
+            assert!(validate_dns_label("name", s).is_ok(), "should accept: {s:?}");
+        }
+    }
+
+    #[test]
+    fn validate_dns_label_rejects_path_traversal_and_meta() {
+        for s in [
+            "",
+            "../foo",
+            "foo/bar",
+            "foo bar",
+            "foo.bar",
+            "Foo",          // uppercase
+            "foo_bar",      // underscore
+            "-foo",         // leading hyphen
+            "foo-",         // trailing hyphen
+            &"a".repeat(64),
+            "foo\0bar",
+            "foo;bar",
+            "foo$bar",
+        ] {
+            assert!(validate_dns_label("name", s).is_err(), "should reject: {s:?}");
+        }
+    }
+
+    #[test]
+    fn appspec_validate_catches_path_traversal_via_name() {
+        let body = r#"
+            image = "x:1"
+            port = 8080
+            name = "../../etc/cron.d/evil"
+        "#;
+        let spec: AppSpec = toml::from_str(body).unwrap();
+        let err = spec.validate().expect_err("path traversal name must be rejected");
+        assert_eq!(err.field, "name");
+    }
+
+    #[test]
+    fn appspec_validate_catches_bad_subdomain() {
+        let body = r#"
+            image = "x:1"
+            port = 8080
+            name = "ok"
+            subdomain = "Bad-Subdomain"
+        "#;
+        let spec: AppSpec = toml::from_str(body).unwrap();
+        let err = spec.validate().expect_err("uppercase subdomain must be rejected");
+        assert_eq!(err.field, "subdomain");
+    }
 
     #[test]
     fn parses_minimum_toml() {
