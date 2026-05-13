@@ -88,8 +88,8 @@ Env vars (read by bugpot directly):
 - `BUGPOT_STATE_DIR` (default `/var/lib/bugpot`)
 - `BUGPOT_LISTEN` — public HTTP router (default `127.0.0.1:8080`)
 - `BUGPOT_ADMIN_LISTEN` — admin HTTP API (default `127.0.0.1:8081`)
-- `BUGPOT_ADMIN_TOKEN` — bearer token for admin API; if set, all admin routes require `Authorization: Bearer <token>` (constant-time compare via `subtle::ConstantTimeEq`, token held in `Zeroizing`). Unset = no auth (trust delegated to listener binding).
-- `BUGPOT_ADMIN_TOKEN_FILE` — path to a file whose trimmed contents are the token. Used when `BUGPOT_ADMIN_TOKEN` is not set. Typical layout: `/etc/bugpot/admin-token` with `root:root 0600` permissions.
+- `BUGPOT_ADMIN_TOKEN_FILE` — **required** unless `BUGPOT_ADMIN_TOKEN` is set. Path to a file whose trimmed contents are the bearer token. The file must be `0600` (any group/other permission bit set causes bugpot to refuse to start, ssh-key style). Typical layout: `/etc/bugpot/admin-token` with `root:root 0600`.
+- `BUGPOT_ADMIN_TOKEN` — fallback bearer token for development. **Logs a warning** when used because env vars are visible in `/proc/<pid>/environ` and shell history; prefer `BUGPOT_ADMIN_TOKEN_FILE` in production. bugpot refuses to start unless one of these two is set.
 - `BUGPOT_AUTH_FILE` — registry-auth TOML (default `/etc/bugpot/auth.toml`, missing file = anonymous)
 - `BUGPOT_METRICS_LISTEN` — opt-in Prometheus listener (e.g. `127.0.0.1:9090`). Unset = `/metrics` + `/healthz` disabled.
 - `RUST_LOG`
@@ -99,11 +99,17 @@ Env vars (read by bugpot directly):
 `bugpot-admin` exposes a minimal CRUD surface for runtime app management.
 Listener is whatever `BUGPOT_ADMIN_LISTEN` points at.
 
-Auth is optional bearer-token (`BUGPOT_ADMIN_TOKEN` / `BUGPOT_ADMIN_TOKEN_FILE`).
-Verification uses `subtle::ConstantTimeEq` so wrong tokens do not leak
-through timing. When no token is configured, auth is a no-op and trust
-is delegated to the listener binding (loopback for self-hosted runner
-flows, Tailscale IP + ACL for remote CI).
+Bearer-token auth is **mandatory** (`BUGPOT_ADMIN_TOKEN_FILE` preferred,
+`BUGPOT_ADMIN_TOKEN` env var as fallback). bugpot refuses to start
+without one — there is no "trust delegated to the listener binding"
+path, since `BUGPOT_ADMIN_LISTEN=0.0.0.0:8081` is one typo away from
+a fully public admin API. Verification uses `subtle::ConstantTimeEq`
+so wrong tokens do not leak through timing.
+
+The router also enforces a 256 KB request body cap and a 60-req/min
+global rate limit (returns `429 Too Many Requests` when exceeded), so
+brute-forcing the token over the network is infeasible even if a
+weak token is configured.
 
 | Method | Path           | Body / Response                                    |
 |--------|----------------|----------------------------------------------------|

@@ -282,16 +282,9 @@ fn spawn_admin<R: RuntimeOps, E: EgressOps>(
     admin_listen: SocketAddr,
     controller: &Arc<AppController<R, E>>,
 ) -> Result<JoinHandle<()>> {
-    let admin_auth = Arc::new(AdminAuth::from_token(read_admin_token()?));
-    if admin_auth.is_enforced() {
-        info!("admin API requires bearer token");
-    } else {
-        warn!(
-            "admin API has no token configured \
-             (BUGPOT_ADMIN_TOKEN / BUGPOT_ADMIN_TOKEN_FILE unset); \
-             trust is delegated to the listener binding",
-        );
-    }
+    let token = read_admin_token()?;
+    let admin_auth = Arc::new(AdminAuth::from_token(token));
+    info!("admin API bearer token loaded");
     let admin_controller = Arc::clone(controller);
     Ok(tokio::spawn(async move {
         if let Err(e) = bugpot_admin::serve(admin_listen, admin_controller, admin_auth).await {
@@ -300,27 +293,56 @@ fn spawn_admin<R: RuntimeOps, E: EgressOps>(
     }))
 }
 
-/// Read the admin token from env or file.
+/// Read the admin token from env or file. A token is required —
+/// the admin API has no "trust the listener" path (that turned out
+/// to be too easy to defeat by an accidental `0.0.0.0` bind).
 ///
-/// Precedence: `BUGPOT_ADMIN_TOKEN` (env, raw value) > `BUGPOT_ADMIN_TOKEN_FILE`
-/// (path to a file whose trimmed contents are the token). Returns `Ok(None)`
-/// when neither is set, which leaves the admin API unauthenticated.
-fn read_admin_token() -> Result<Option<String>> {
+/// Precedence: `BUGPOT_ADMIN_TOKEN_FILE` first, then `BUGPOT_ADMIN_TOKEN`
+/// as a fallback. The file path is preferred — its strict mode
+/// requirement (`chmod 600`) keeps the secret out of `/proc/PID/environ`,
+/// `ps auxe`, and shell history. The env-var path remains for dev
+/// convenience but logs a warning.
+fn read_admin_token() -> Result<String> {
+    if let Ok(path) = std::env::var("BUGPOT_ADMIN_TOKEN_FILE") {
+        return read_admin_token_from_file(&path);
+    }
     if let Ok(raw) = std::env::var("BUGPOT_ADMIN_TOKEN") {
         let trimmed = raw.trim();
         if !trimmed.is_empty() {
-            return Ok(Some(trimmed.to_owned()));
+            warn!(
+                "admin token loaded from BUGPOT_ADMIN_TOKEN; the env-var \
+                 path is visible in /proc/<pid>/environ. Prefer \
+                 BUGPOT_ADMIN_TOKEN_FILE for production deployments.",
+            );
+            return Ok(trimmed.to_owned());
         }
     }
-    if let Ok(path) = std::env::var("BUGPOT_ADMIN_TOKEN_FILE") {
-        let body =
-            std::fs::read_to_string(&path).with_context(|| format!("read admin token from {path}"))?;
-        let trimmed = body.trim();
-        if !trimmed.is_empty() {
-            return Ok(Some(trimmed.to_owned()));
-        }
+    anyhow::bail!(
+        "admin token is required: set BUGPOT_ADMIN_TOKEN_FILE (preferred) or BUGPOT_ADMIN_TOKEN"
+    );
+}
+
+/// Read the admin token from `path` and reject permissive permissions
+/// (group / other readable, writable, or executable). Mirrors what
+/// `ssh` does for private keys: any of `0o077` set → refuse to start.
+fn read_admin_token_from_file(path: &str) -> Result<String> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("stat admin token file {path}"))?;
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        anyhow::bail!(
+            "admin token file {path} has permissive mode {mode:#o}; \
+             refusing to start (run `chmod 600 {path}` so only its owner can read it)"
+        );
     }
-    Ok(None)
+    let body = std::fs::read_to_string(path)
+        .with_context(|| format!("read admin token from {path}"))?;
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("admin token file {path} is empty");
+    }
+    Ok(trimmed.to_owned())
 }
 
 fn init_tracing() {

@@ -14,17 +14,31 @@
 //!
 //! # Auth
 //!
-//! Optional bearer-token auth via [`AdminAuth`]. When configured, all
-//! routes require `Authorization: Bearer <token>` and use constant-time
-//! comparison to avoid character-by-character timing leaks. When the
-//! token is absent (`AdminAuth::disabled`), auth is a no-op and trust is
-//! delegated entirely to the listener binding (loopback for self-hosted-
-//! runner flows, Tailscale IP + ACL for remote CI).
+//! Bearer-token auth via [`AdminAuth`] is **mandatory**. All routes
+//! require `Authorization: Bearer <token>` and the comparison uses
+//! `subtle::ConstantTimeEq` to avoid character-by-character timing
+//! leaks. `cmd/bugpot::main` refuses to start without a token —
+//! there is no "trust delegated to the listener binding" path, even
+//! when bound to loopback or a private network.
+//!
+//! # Defences
+//!
+//! - `RequestBodyLimitLayer` caps incoming bodies at `MAX_BODY_BYTES`
+//!   (256 KB). `AppSpec` JSON is normally ~1 KB; the cap stops the
+//!   `env` map from being weaponised into memory exhaustion.
+//! - `tower::limit::RateLimitLayer` enforces a global limit of
+//!   `RATE_LIMIT_REQUESTS` per `RATE_LIMIT_PERIOD`. Brute-forcing the
+//!   bearer token over the network is infeasible at that rate.
+//! - Order matters: rate limit + body limit are *outside* the auth
+//!   layer (they protect the constant-time comparison itself); auth
+//!   is *inside* (so unauthorised requests don't consume the
+//!   rate-limit budget for legitimate clients).
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{
-    Json, Router,
+    BoxError, Json, Router,
+    error_handling::HandleErrorLayer,
     extract::{Path, Request, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
@@ -37,50 +51,45 @@ use bugpot_egress::EgressOps;
 use bugpot_runtime::RuntimeOps;
 use serde::Serialize;
 use subtle::ConstantTimeEq;
+use tower::ServiceBuilder;
+use tower::limit::RateLimitLayer;
+use tower_http::limit::RequestBodyLimitLayer;
 use tracing::{info, warn};
 use zeroize::Zeroizing;
 
+/// Maximum POST body size for `POST /apps`. `AppSpec` JSON is usually
+/// well under 1 KB; the cap stops the `env` map from being weaponised
+/// into a memory-exhaustion vector.
+const MAX_BODY_BYTES: usize = 256 * 1024;
+/// Global rate limit on admin API requests. Brute-forcing a bearer
+/// token at this rate is infeasible.
+const RATE_LIMIT_REQUESTS: u64 = 60;
+const RATE_LIMIT_PERIOD: Duration = Duration::from_mins(1);
+
 /// Bearer-token verifier for the admin API.
 ///
-/// When `expected_token` is `Some`, all requests must carry
-/// `Authorization: Bearer <token>` whose body matches. When `None`,
-/// auth is disabled — every request is allowed through (current dev
-/// default).
+/// A token is **mandatory** — `cmd/bugpot::main` refuses to start
+/// without one. The `Token` newtype here exists so the type system
+/// records that fact (no `Option`, no "disabled" path).
+///
+/// The expected value is wrapped in `Zeroizing` so the secret is wiped
+/// on drop and never accidentally exposed via `Debug`.
 #[derive(Debug)]
 pub struct AdminAuth {
-    /// Wrapped in `Zeroizing` so the secret is wiped on drop and never
-    /// accidentally exposed via `Debug`.
-    expected_token: Option<Zeroizing<Vec<u8>>>,
+    expected_token: Zeroizing<Vec<u8>>,
 }
 
 impl AdminAuth {
-    /// Build with a token. Pass `None` (or use [`Self::disabled`]) to
-    /// run without auth.
+    /// Build with a token. The string must not be empty; callers
+    /// should have validated that already.
     #[must_use]
-    pub fn from_token(token: Option<String>) -> Self {
+    pub fn from_token(token: String) -> Self {
         Self {
-            expected_token: token.map(|s| Zeroizing::new(s.into_bytes())),
+            expected_token: Zeroizing::new(token.into_bytes()),
         }
-    }
-
-    /// Convenience: no auth required (passes everything through).
-    #[must_use]
-    pub const fn disabled() -> Self {
-        Self {
-            expected_token: None,
-        }
-    }
-
-    /// `true` when a token is configured.
-    #[must_use]
-    pub const fn is_enforced(&self) -> bool {
-        self.expected_token.is_some()
     }
 
     fn check(&self, headers: &HeaderMap) -> Result<(), StatusCode> {
-        let Some(expected) = self.expected_token.as_ref() else {
-            return Ok(());
-        };
         let presented = headers
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
@@ -88,7 +97,7 @@ impl AdminAuth {
             .ok_or(StatusCode::UNAUTHORIZED)?;
         // `ct_eq` returns Choice(0) for length mismatch without leaking
         // which byte differed; bool::from converts to a normal bool.
-        if bool::from(presented.as_bytes().ct_eq(expected.as_slice())) {
+        if bool::from(presented.as_bytes().ct_eq(self.expected_token.as_slice())) {
             Ok(())
         } else {
             Err(StatusCode::UNAUTHORIZED)
@@ -127,6 +136,16 @@ where
     R: RuntimeOps,
     E: EgressOps,
 {
+    // `RateLimitLayer` makes the inner service non-Clone and produces
+    // `BoxError`, so it has to sit inside a `buffer` (for Clone) and
+    // a `HandleErrorLayer` (so the BoxError can be converted into a
+    // 429/500 response that axum's Router accepts). Both layer compose
+    // via `ServiceBuilder`.
+    let throttle = ServiceBuilder::new()
+        .layer(HandleErrorLayer::new(handle_rate_limit_error))
+        .buffer(32)
+        .layer(RateLimitLayer::new(RATE_LIMIT_REQUESTS, RATE_LIMIT_PERIOD));
+
     Router::new()
         .route("/apps", post(deploy::<R, E>).get(list::<R, E>))
         .route(
@@ -134,7 +153,24 @@ where
             get(get_one::<R, E>).delete(remove::<R, E>),
         )
         .with_state(controller)
+        // Auth runs first (innermost layer) so unauthorised requests
+        // don't burn a rate-limit slot. Body limit + rate limit are
+        // outermost — they protect the auth comparison itself.
         .layer(middleware::from_fn_with_state(auth, require_token))
+        .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
+        .layer(throttle)
+}
+
+/// Map `tower::limit::RateLimitLayer`'s `BoxError` into a 429. The
+/// rate limiter's `poll_ready` returns `Pending` when the bucket is
+/// dry; the `buffer` ahead of it returns `BoxError` when its queue is
+/// full or the inner service yields.
+async fn handle_rate_limit_error(err: BoxError) -> Response {
+    AdminError {
+        status: StatusCode::TOO_MANY_REQUESTS,
+        message: format!("rate limit exceeded: {err}"),
+    }
+    .into_response()
 }
 
 async fn deploy<R, E>(
@@ -259,26 +295,17 @@ mod tests {
     }
 
     #[test]
-    fn auth_disabled_passes_without_header() {
-        let auth = AdminAuth::disabled();
-        assert!(auth.check(&HeaderMap::new()).is_ok());
-        assert!(auth.check(&header("Bearer anything")).is_ok());
-        assert!(!auth.is_enforced());
-    }
-
-    #[test]
     fn auth_rejects_missing_header() {
-        let auth = AdminAuth::from_token(Some("expected-token".into()));
+        let auth = AdminAuth::from_token("expected-token".into());
         assert_eq!(
             auth.check(&HeaderMap::new()).unwrap_err(),
             StatusCode::UNAUTHORIZED
         );
-        assert!(auth.is_enforced());
     }
 
     #[test]
     fn auth_rejects_wrong_scheme() {
-        let auth = AdminAuth::from_token(Some("expected-token".into()));
+        let auth = AdminAuth::from_token("expected-token".into());
         assert_eq!(
             auth.check(&header("Basic expected-token")).unwrap_err(),
             StatusCode::UNAUTHORIZED,
@@ -292,13 +319,13 @@ mod tests {
 
     #[test]
     fn auth_accepts_matching_bearer() {
-        let auth = AdminAuth::from_token(Some("expected-token".into()));
+        let auth = AdminAuth::from_token("expected-token".into());
         assert!(auth.check(&header("Bearer expected-token")).is_ok());
     }
 
     #[test]
     fn auth_rejects_wrong_token_same_length() {
-        let auth = AdminAuth::from_token(Some("expected-token".into()));
+        let auth = AdminAuth::from_token("expected-token".into());
         assert_eq!(
             auth.check(&header("Bearer ExPeCtEd-tOkEn")).unwrap_err(),
             StatusCode::UNAUTHORIZED,
@@ -307,7 +334,7 @@ mod tests {
 
     #[test]
     fn auth_rejects_wrong_token_length_mismatch() {
-        let auth = AdminAuth::from_token(Some("expected-token".into()));
+        let auth = AdminAuth::from_token("expected-token".into());
         assert_eq!(
             auth.check(&header("Bearer expected")).unwrap_err(),
             StatusCode::UNAUTHORIZED,
