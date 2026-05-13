@@ -24,7 +24,7 @@ use async_trait::async_trait;
 use bugpot_config::{AppSpec, AuthConfig, RegistryCredential, registry_host};
 use bugpot_egress::Egress;
 use bugpot_router::{UpstreamResolver, subdomain_of};
-use bugpot_runtime::{Auth, Runtime};
+use bugpot_runtime::{Auth, ResourceUsage, Runtime};
 use metrics::{counter, gauge, histogram};
 use serde::Serialize;
 use thiserror::Error;
@@ -122,6 +122,11 @@ pub struct AppController {
     auth: AuthConfig,
     /// Keyed by subdomain (= app name by default).
     apps: RwLock<HashMap<String, Arc<AppHandle>>>,
+    /// Last-seen cgroup `cpu_usec` per app, used to compute deltas for
+    /// the `bugpot_app_cpu_microseconds_total` counter across sweeps.
+    /// Cleared when an app is stopped so the next run starts from 0 —
+    /// Prometheus `rate()` handles the apparent reset.
+    cpu_baselines: tokio::sync::Mutex<HashMap<String, u64>>,
 }
 
 impl AppController {
@@ -147,6 +152,7 @@ impl AppController {
             apps_dir,
             auth,
             apps: RwLock::new(apps),
+            cpu_baselines: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -261,7 +267,15 @@ impl AppController {
                 continue;
             }
 
-            // 2. Idle timeout (scale-to-zero). always-on apps skip.
+            // 2. Resource sampling. Skip silently when cgroup paths
+            // resolve to nothing (cgroup v1 host or transient /proc
+            // races) — the gauge stops updating, the counter doesn't
+            // move.
+            if let Some(usage) = self.runtime.resource_usage(&handle.name) {
+                self.emit_resource_metrics(&handle.name, usage).await;
+            }
+
+            // 3. Idle timeout (scale-to-zero). always-on apps skip.
             let timeout = match handle.spec.scaling.resolve_idle_timeout() {
                 Ok(Some(t)) => t,
                 Ok(None) => continue,
@@ -281,6 +295,41 @@ impl AppController {
                 }
             }
         }
+    }
+
+    /// Update memory gauge and CPU counter (via delta vs the per-app
+    /// baseline) for `app` from a fresh cgroup sample.
+    ///
+    /// CPU is exposed in microseconds, the cgroup-v2 native unit, to
+    /// preserve full precision through the integer-only counter API.
+    /// Operators querying via Prometheus divide by 1e6 for seconds:
+    /// `rate(bugpot_app_cpu_microseconds_total[5m]) / 1000000`.
+    async fn emit_resource_metrics(&self, app: &str, usage: ResourceUsage) {
+        #[allow(clippy::cast_precision_loss)]
+        gauge!("bugpot_app_memory_bytes", "app" => app.to_owned())
+            .set(usage.memory_bytes as f64);
+
+        let last = {
+            let mut baselines = self.cpu_baselines.lock().await;
+            baselines.insert(app.to_owned(), usage.cpu_usec).unwrap_or(0)
+        };
+        // A container restart resets the cgroup counter under us;
+        // treat any backwards step as a 0-baseline and increment by
+        // the new absolute value. Prometheus `rate()` tolerates the
+        // apparent reset.
+        let delta_usec = if usage.cpu_usec >= last {
+            usage.cpu_usec - last
+        } else {
+            usage.cpu_usec
+        };
+        if delta_usec > 0 {
+            counter!("bugpot_app_cpu_microseconds_total", "app" => app.to_owned())
+                .increment(delta_usec);
+        }
+    }
+
+    async fn clear_cpu_baseline(&self, app: &str) {
+        self.cpu_baselines.lock().await.remove(app);
     }
 
     /// Stop every app that's currently running. Used on shutdown.
@@ -557,6 +606,9 @@ impl AppController {
             inner.state = AppState::Stopping;
         }
         let res = self.do_stop(handle).await;
+        // Drop the CPU baseline so the next start of this app begins
+        // from 0 rather than the (now-stale) last sample.
+        self.clear_cpu_baseline(&handle.name).await;
         let mut inner = handle.inner.lock().await;
         inner.state = AppState::Stopped;
         res

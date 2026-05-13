@@ -34,6 +34,17 @@ pub struct RunningApp {
     pub image: ImageId,
 }
 
+/// A cgroup-v2 sample of a container's memory + CPU consumption.
+///
+/// `cpu_usec` is the cumulative on-CPU time of all processes in the
+/// container's cgroup since the cgroup was created. `memory_bytes` is
+/// the instantaneous resident memory.
+#[derive(Debug, Clone, Copy)]
+pub struct ResourceUsage {
+    pub memory_bytes: u64,
+    pub cpu_usec: u64,
+}
+
 /// Container lifecycle runtime.
 #[derive(Debug)]
 pub struct Runtime {
@@ -254,6 +265,25 @@ impl Runtime {
         Container::load(container_root).is_ok_and(|c| c.status() == ContainerStatus::Running)
     }
 
+    /// Read the live cgroup v2 memory + CPU stats for the container
+    /// named `id`. Returns `None` when the container is not running, or
+    /// when its cgroup path / files cannot be resolved (e.g. cgroup v1
+    /// host, transient `/proc` races).
+    #[must_use]
+    pub fn resource_usage(&self, id: &str) -> Option<ResourceUsage> {
+        let container_root = self.containers_dir.join(id);
+        let container = Container::load(container_root).ok()?;
+        if container.status() != ContainerStatus::Running {
+            return None;
+        }
+        let pid = u32::try_from(container.pid()?.as_raw()).ok()?;
+        let cgroup = cgroup_path_for_pid(pid)?;
+        Some(ResourceUsage {
+            memory_bytes: read_memory_bytes(&cgroup)?,
+            cpu_usec: read_cpu_usec(&cgroup)?,
+        })
+    }
+
     /// Stop and clean up a running container.
     ///
     /// `async` for API symmetry with `start_app` and to leave room for
@@ -331,6 +361,54 @@ async fn forward_pipe(fd: OwnedFd, app: String, stream: &'static str) {
 /// simply create a symlink to the image rootfs, which works for read-only
 /// scenarios; once we want a writable upper layer (overlayfs), this is the
 /// hook to replace.
+/// Resolve the cgroup v2 path of `pid` by reading `/proc/<pid>/cgroup`.
+/// Returns `None` when the file is missing (process gone) or the
+/// expected `0::/...` line is absent (cgroup v1 host).
+fn cgroup_path_for_pid(pid: u32) -> Option<PathBuf> {
+    let body = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    parse_cgroup_v2_path(&body).map(|rel| {
+        let mut p = PathBuf::from("/sys/fs/cgroup");
+        let trimmed = rel.trim_start_matches('/');
+        if !trimmed.is_empty() {
+            p.push(trimmed);
+        }
+        p
+    })
+}
+
+/// Parse the cgroup v2 line (`"0::/foo/bar"`) out of the content of
+/// `/proc/<pid>/cgroup`. Cgroup v1 lines (`"4:cpu:/..."`) are ignored.
+fn parse_cgroup_v2_path(s: &str) -> Option<String> {
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("0::") {
+            return Some(rest.to_owned());
+        }
+    }
+    None
+}
+
+fn read_memory_bytes(cgroup: &Path) -> Option<u64> {
+    let text = fs::read_to_string(cgroup.join("memory.current")).ok()?;
+    text.trim().parse().ok()
+}
+
+fn read_cpu_usec(cgroup: &Path) -> Option<u64> {
+    let text = fs::read_to_string(cgroup.join("cpu.stat")).ok()?;
+    parse_cpu_usec(&text)
+}
+
+/// Parse the `usage_usec <n>` field out of the cgroup v2 `cpu.stat`
+/// file body. Other fields (`user_usec`, `system_usec`, throttling
+/// stats) are ignored.
+fn parse_cpu_usec(stat_content: &str) -> Option<u64> {
+    for line in stat_content.lines() {
+        if let Some(rest) = line.strip_prefix("usage_usec ") {
+            return rest.trim().parse().ok();
+        }
+    }
+    None
+}
+
 fn prepare_bundle_dir(bundle_dir: &Path, image_rootfs: &Path) -> Result<()> {
     if bundle_dir.exists() {
         fs::remove_dir_all(bundle_dir).map_err(|e| RuntimeError::io(bundle_dir, e))?;
@@ -359,6 +437,50 @@ mod tests {
         assert!(rt.bundles_dir.is_dir());
         assert!(rt.containers_dir.is_dir());
         assert_eq!(rt.state_dir(), tmp.path());
+    }
+
+    #[test]
+    fn parse_cgroup_v2_picks_unified_line() {
+        // Real-world `/proc/<pid>/cgroup` on a cgroup-v2-unified host.
+        let body = "0::/system.slice/bugpot-x.service\n";
+        assert_eq!(
+            parse_cgroup_v2_path(body),
+            Some("/system.slice/bugpot-x.service".to_string()),
+        );
+    }
+
+    #[test]
+    fn parse_cgroup_v2_ignores_v1_lines() {
+        // Hybrid mode: v1 controllers come first, v2 is the line with "0::".
+        let body = "\
+13:misc:/\n\
+12:cpuset:/\n\
+11:cpu,cpuacct:/foo\n\
+0::/unified/path\n";
+        assert_eq!(parse_cgroup_v2_path(body), Some("/unified/path".to_string()));
+    }
+
+    #[test]
+    fn parse_cgroup_v2_absent_returns_none() {
+        // v1-only host has no `0::` line.
+        let body = "1:cpu:/foo\n2:memory:/foo\n";
+        assert!(parse_cgroup_v2_path(body).is_none());
+    }
+
+    #[test]
+    fn parse_cpu_usec_finds_usage_field() {
+        let body = "\
+usage_usec 123456789\n\
+user_usec 100000000\n\
+system_usec 23456789\n\
+nr_periods 0\n";
+        assert_eq!(parse_cpu_usec(body), Some(123_456_789));
+    }
+
+    #[test]
+    fn parse_cpu_usec_missing_field_returns_none() {
+        let body = "user_usec 1\nsystem_usec 1\n";
+        assert!(parse_cpu_usec(body).is_none());
     }
 
     #[test]
