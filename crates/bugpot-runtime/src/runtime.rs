@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
 
+use std::future::Future;
+
 use bugpot_config::AppSpec;
 use libcontainer::container::{Container, ContainerStatus};
 use libcontainer::container::builder::ContainerBuilder;
@@ -43,6 +45,32 @@ pub struct RunningApp {
 pub struct ResourceUsage {
     pub memory_bytes: u64,
     pub cpu_usec: u64,
+}
+
+/// Trait surface used by callers that drive a container runtime
+/// (image pulls + per-container lifecycle + introspection).
+///
+/// The production implementation is [`Runtime`]; tests can substitute
+/// an in-memory mock. Static dispatch (`AppController<R: RuntimeOps>`)
+/// only — no `dyn`. Async methods use native AFIT (Rust 1.75+), so
+/// each call avoids the `Pin<Box<dyn Future>>` allocation `#[async_trait]`
+/// would introduce. The explicit `+ Send` bound is required because
+/// callers `tokio::spawn` work that holds these futures across awaits.
+pub trait RuntimeOps: Send + Sync + std::fmt::Debug + 'static {
+    fn pull_image(
+        &self,
+        image_ref: &str,
+        auth: Auth,
+    ) -> impl Future<Output = Result<ImageId>> + Send;
+    fn start_app<'a>(
+        &'a self,
+        spec: &'a AppSpec,
+        image_id: &'a ImageId,
+        netns_path: Option<&'a Path>,
+    ) -> impl Future<Output = Result<RunningApp>> + Send + 'a;
+    fn stop_app(&self, id: &str) -> impl Future<Output = Result<()>> + Send;
+    fn is_container_running(&self, id: &str) -> bool;
+    fn resource_usage(&self, id: &str) -> Option<ResourceUsage>;
 }
 
 /// Container lifecycle runtime.
@@ -88,10 +116,12 @@ impl Runtime {
     pub fn state_dir(&self) -> &Path {
         &self.state_dir
     }
+}
 
+impl RuntimeOps for Runtime {
     /// Pull `image_ref` from its registry and extract its layers into
     /// `<state>/images/<digest>/rootfs`.
-    pub async fn pull_image(&self, image_ref: &str, auth: Auth) -> Result<ImageId> {
+    async fn pull_image(&self, image_ref: &str, auth: Auth) -> Result<ImageId> {
         let puller = Puller::new(self.images_dir.clone());
         let image = puller.pull(image_ref, auth).await?;
         Ok(image.id)
@@ -109,7 +139,7 @@ impl Runtime {
     ///   3. Generate `config.json` from `AppSpec` + image config.
     ///   4. Hand off to `libcontainer::ContainerBuilder` to create/start.
     #[allow(clippy::unused_async)] // pre-pull moved to caller; kept async for API symmetry
-    pub async fn start_app(
+    async fn start_app(
         &self,
         spec: &AppSpec,
         image_id: &ImageId,
@@ -256,8 +286,7 @@ impl Runtime {
     /// whose init has crashed, OOM'd, or been `kill -9`'d shows up as
     /// `Stopped` here, not (stale) `Running`. PID reuse is theoretically
     /// possible but rare on a single-host setup; we accept the limit.
-    #[must_use]
-    pub fn is_container_running(&self, id: &str) -> bool {
+    fn is_container_running(&self, id: &str) -> bool {
         let container_root = self.containers_dir.join(id);
         if !container_root.exists() {
             return false;
@@ -269,8 +298,7 @@ impl Runtime {
     /// named `id`. Returns `None` when the container is not running, or
     /// when its cgroup path / files cannot be resolved (e.g. cgroup v1
     /// host, transient `/proc` races).
-    #[must_use]
-    pub fn resource_usage(&self, id: &str) -> Option<ResourceUsage> {
+    fn resource_usage(&self, id: &str) -> Option<ResourceUsage> {
         let container_root = self.containers_dir.join(id);
         let container = Container::load(container_root).ok()?;
         if container.status() != ContainerStatus::Running {
@@ -290,7 +318,7 @@ impl Runtime {
     /// future use of `tokio` primitives (e.g. waiting on process exit via
     /// a child process abstraction).
     #[allow(clippy::unused_async)]
-    pub async fn stop_app(&self, id: &str) -> Result<()> {
+    async fn stop_app(&self, id: &str) -> Result<()> {
         let container_root = self.containers_dir.join(id);
         if !container_root.exists() {
             return Err(RuntimeError::AppNotFound(id.to_owned()));
@@ -312,7 +340,9 @@ impl Runtime {
             .remove(id);
         Ok(())
     }
+}
 
+impl Runtime {
     /// Snapshot of currently running apps. Note: this is the runtime's
     /// in-memory view; it does not re-scan disk.
     #[must_use]

@@ -15,9 +15,9 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use anyhow::{Context, Result};
 use bugpot_admin::AdminAuth;
 use bugpot_controller::AppController;
-use bugpot_egress::{Egress, EgressConfig};
+use bugpot_egress::{Egress, EgressConfig, EgressOps};
 use bugpot_router::UpstreamResolver;
-use bugpot_runtime::Runtime;
+use bugpot_runtime::{Runtime, RuntimeOps};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -202,12 +202,17 @@ fn parse_egress_config() -> Result<EgressConfig> {
     Ok(cfg)
 }
 
-fn spawn_sweep(controller: &Arc<AppController>) -> JoinHandle<()> {
+fn spawn_sweep<R: RuntimeOps, E: EgressOps>(
+    controller: &Arc<AppController<R, E>>,
+) -> JoinHandle<()> {
     let c = Arc::clone(controller);
     tokio::spawn(c.sweep_loop(SWEEP_INTERVAL))
 }
 
-fn spawn_router(listen: SocketAddr, controller: &Arc<AppController>) -> JoinHandle<()> {
+fn spawn_router<R: RuntimeOps, E: EgressOps>(
+    listen: SocketAddr,
+    controller: &Arc<AppController<R, E>>,
+) -> JoinHandle<()> {
     let resolver: Arc<dyn UpstreamResolver> = controller.clone();
     tokio::spawn(async move {
         if let Err(e) = bugpot_router::serve(listen, resolver).await {
@@ -216,9 +221,9 @@ fn spawn_router(listen: SocketAddr, controller: &Arc<AppController>) -> JoinHand
     })
 }
 
-fn spawn_admin(
+fn spawn_admin<R: RuntimeOps, E: EgressOps>(
     admin_listen: SocketAddr,
-    controller: &Arc<AppController>,
+    controller: &Arc<AppController<R, E>>,
 ) -> Result<JoinHandle<()>> {
     let admin_auth = Arc::new(AdminAuth::from_token(read_admin_token()?));
     if admin_auth.is_enforced() {

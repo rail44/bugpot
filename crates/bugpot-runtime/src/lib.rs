@@ -32,4 +32,4 @@ mod spec;
 pub use auth::Auth;
 pub use error::RuntimeError;
 pub use image::ImageId;
-pub use runtime::{ResourceUsage, RunningApp, Runtime};
+pub use runtime::{ResourceUsage, RunningApp, Runtime, RuntimeOps};

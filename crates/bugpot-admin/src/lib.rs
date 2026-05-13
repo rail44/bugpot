@@ -33,6 +33,8 @@ use axum::{
 };
 use bugpot_config::AppSpec;
 use bugpot_controller::{AppController, AppView, DeployError, RemoveError};
+use bugpot_egress::EgressOps;
+use bugpot_runtime::RuntimeOps;
 use serde::Serialize;
 use subtle::ConstantTimeEq;
 use tracing::{info, warn};
@@ -104,11 +106,15 @@ async fn require_token(
 }
 
 /// Bind the admin API at `addr` and serve until the future is dropped.
-pub async fn serve(
+pub async fn serve<R, E>(
     addr: SocketAddr,
-    controller: Arc<AppController>,
+    controller: Arc<AppController<R, E>>,
     auth: Arc<AdminAuth>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    R: RuntimeOps,
+    E: EgressOps,
+{
     let app = router(controller, auth);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!(%addr, "bugpot-admin listening");
@@ -116,38 +122,61 @@ pub async fn serve(
     Ok(())
 }
 
-fn router(controller: Arc<AppController>, auth: Arc<AdminAuth>) -> Router {
+fn router<R, E>(controller: Arc<AppController<R, E>>, auth: Arc<AdminAuth>) -> Router
+where
+    R: RuntimeOps,
+    E: EgressOps,
+{
     Router::new()
-        .route("/apps", post(deploy).get(list))
-        .route("/apps/{name}", get(get_one).delete(remove))
+        .route("/apps", post(deploy::<R, E>).get(list::<R, E>))
+        .route(
+            "/apps/{name}",
+            get(get_one::<R, E>).delete(remove::<R, E>),
+        )
         .with_state(controller)
         .layer(middleware::from_fn_with_state(auth, require_token))
 }
 
-async fn deploy(
-    State(controller): State<Arc<AppController>>,
+async fn deploy<R, E>(
+    State(controller): State<Arc<AppController<R, E>>>,
     Json(spec): Json<AppSpec>,
-) -> Result<(StatusCode, Json<AppView>), AdminError> {
+) -> Result<(StatusCode, Json<AppView>), AdminError>
+where
+    R: RuntimeOps,
+    E: EgressOps,
+{
     let view = controller.deploy_app(spec).await?;
     Ok((StatusCode::CREATED, Json(view)))
 }
 
-async fn remove(
-    State(controller): State<Arc<AppController>>,
+async fn remove<R, E>(
+    State(controller): State<Arc<AppController<R, E>>>,
     Path(name): Path<String>,
-) -> Result<StatusCode, AdminError> {
+) -> Result<StatusCode, AdminError>
+where
+    R: RuntimeOps,
+    E: EgressOps,
+{
     controller.remove_app(&name).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn list(State(controller): State<Arc<AppController>>) -> Json<Vec<AppView>> {
+async fn list<R, E>(State(controller): State<Arc<AppController<R, E>>>) -> Json<Vec<AppView>>
+where
+    R: RuntimeOps,
+    E: EgressOps,
+{
     Json(controller.list_apps().await)
 }
 
-async fn get_one(
-    State(controller): State<Arc<AppController>>,
+async fn get_one<R, E>(
+    State(controller): State<Arc<AppController<R, E>>>,
     Path(name): Path<String>,
-) -> Result<Json<AppView>, AdminError> {
+) -> Result<Json<AppView>, AdminError>
+where
+    R: RuntimeOps,
+    E: EgressOps,
+{
     controller
         .get_app(&name)
         .await
