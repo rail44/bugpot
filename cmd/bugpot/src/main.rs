@@ -18,6 +18,7 @@ use bugpot_controller::AppController;
 use bugpot_egress::{Egress, EgressConfig};
 use bugpot_router::UpstreamResolver;
 use bugpot_runtime::Runtime;
+use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -31,8 +32,15 @@ const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(10);
 // emit successfully; the HTTP listener is only spawned when
 // `BUGPOT_METRICS_LISTEN` is set, keeping the surface area opt-in.
 
+#[derive(Debug)]
+struct Config {
+    apps_dir: PathBuf,
+    listen: SocketAddr,
+    admin_listen: SocketAddr,
+    auth_file: PathBuf,
+}
+
 #[tokio::main]
-#[allow(clippy::too_many_lines)] // entrypoint wiring; splitting yields less clarity, not more
 async fn main() -> Result<()> {
     init_tracing();
     let metrics_handle = bugpot_metrics::install_recorder().context("install metrics recorder")?;
@@ -44,27 +52,14 @@ async fn main() -> Result<()> {
         );
     }
 
-    let apps_dir = std::env::var("BUGPOT_APPS_DIR")
-        .map_or_else(|_| PathBuf::from(DEFAULT_APPS_DIR), PathBuf::from);
+    let cfg = parse_config()?;
 
-    let listen: SocketAddr = std::env::var("BUGPOT_LISTEN")
-        .unwrap_or_else(|_| DEFAULT_LISTEN.to_owned())
-        .parse()
-        .context("parse BUGPOT_LISTEN")?;
+    let apps = bugpot_config::load_apps(&cfg.apps_dir)?;
+    info!(count = apps.len(), dir = %cfg.apps_dir.display(), "loaded apps");
 
-    let admin_listen: SocketAddr = std::env::var("BUGPOT_ADMIN_LISTEN")
-        .unwrap_or_else(|_| DEFAULT_ADMIN_LISTEN.to_owned())
-        .parse()
-        .context("parse BUGPOT_ADMIN_LISTEN")?;
-
-    let apps = bugpot_config::load_apps(&apps_dir)?;
-    info!(count = apps.len(), dir = %apps_dir.display(), "loaded apps");
-
-    let auth_file = std::env::var("BUGPOT_AUTH_FILE")
-        .map_or_else(|_| PathBuf::from(DEFAULT_AUTH_FILE), PathBuf::from);
-    let auth = bugpot_config::load_auth(&auth_file).context("load auth.toml")?;
+    let auth = bugpot_config::load_auth(&cfg.auth_file).context("load auth.toml")?;
     info!(
-        file = %auth_file.display(),
+        file = %cfg.auth_file.display(),
         registries = auth.registries.len(),
         "loaded registry auth",
     );
@@ -91,7 +86,7 @@ async fn main() -> Result<()> {
     let controller = Arc::new(AppController::new(
         runtime,
         egress,
-        apps_dir.clone(),
+        cfg.apps_dir.clone(),
         auth,
         apps,
     ));
@@ -101,17 +96,8 @@ async fn main() -> Result<()> {
         return Err(e);
     }
 
-    // Background idle stopper.
-    let stopper = Arc::clone(&controller);
-    let stopper_task = tokio::spawn(stopper.idle_stopper_loop(IDLE_SWEEP_INTERVAL));
-
-    // Router.
-    let resolver: Arc<dyn UpstreamResolver> = controller.clone();
-    let serve_task = tokio::spawn(async move {
-        if let Err(e) = bugpot_router::serve(listen, resolver).await {
-            error!(error = %e, "router exited with error");
-        }
-    });
+    let stopper_task = spawn_idle_stopper(&controller);
+    let serve_task = spawn_router(cfg.listen, &controller);
 
     // Metrics HTTP listener (optional). The recorder is installed
     // unconditionally above so emission paths stay no-op-safe even when
@@ -129,25 +115,9 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Admin HTTP API.
-    let admin_auth = Arc::new(AdminAuth::from_token(read_admin_token()?));
-    if admin_auth.is_enforced() {
-        info!("admin API requires bearer token");
-    } else {
-        warn!(
-            "admin API has no token configured \
-             (BUGPOT_ADMIN_TOKEN / BUGPOT_ADMIN_TOKEN_FILE unset); \
-             trust is delegated to the listener binding",
-        );
-    }
-    let admin_controller = Arc::clone(&controller);
-    let admin_task = tokio::spawn(async move {
-        if let Err(e) = bugpot_admin::serve(admin_listen, admin_controller, admin_auth).await {
-            error!(error = %e, "admin api exited with error");
-        }
-    });
+    let admin_task = spawn_admin(cfg.admin_listen, &controller)?;
 
-    info!(%listen, %admin_listen, "bugpot up; press Ctrl+C to shut down");
+    info!(listen = %cfg.listen, admin_listen = %cfg.admin_listen, "bugpot up; press Ctrl+C to shut down");
     if let Err(e) = tokio::signal::ctrl_c().await {
         error!(error = %e, "failed to wait for SIGINT");
     }
@@ -162,6 +132,67 @@ async fn main() -> Result<()> {
     controller.teardown().await;
 
     Ok(())
+}
+
+fn parse_config() -> Result<Config> {
+    let apps_dir = std::env::var("BUGPOT_APPS_DIR")
+        .map_or_else(|_| PathBuf::from(DEFAULT_APPS_DIR), PathBuf::from);
+
+    let listen: SocketAddr = std::env::var("BUGPOT_LISTEN")
+        .unwrap_or_else(|_| DEFAULT_LISTEN.to_owned())
+        .parse()
+        .context("parse BUGPOT_LISTEN")?;
+
+    let admin_listen: SocketAddr = std::env::var("BUGPOT_ADMIN_LISTEN")
+        .unwrap_or_else(|_| DEFAULT_ADMIN_LISTEN.to_owned())
+        .parse()
+        .context("parse BUGPOT_ADMIN_LISTEN")?;
+
+    let auth_file = std::env::var("BUGPOT_AUTH_FILE")
+        .map_or_else(|_| PathBuf::from(DEFAULT_AUTH_FILE), PathBuf::from);
+
+    Ok(Config {
+        apps_dir,
+        listen,
+        admin_listen,
+        auth_file,
+    })
+}
+
+fn spawn_idle_stopper(controller: &Arc<AppController>) -> JoinHandle<()> {
+    let stopper = Arc::clone(controller);
+    tokio::spawn(stopper.idle_stopper_loop(IDLE_SWEEP_INTERVAL))
+}
+
+fn spawn_router(listen: SocketAddr, controller: &Arc<AppController>) -> JoinHandle<()> {
+    let resolver: Arc<dyn UpstreamResolver> = controller.clone();
+    tokio::spawn(async move {
+        if let Err(e) = bugpot_router::serve(listen, resolver).await {
+            error!(error = %e, "router exited with error");
+        }
+    })
+}
+
+fn spawn_admin(
+    admin_listen: SocketAddr,
+    controller: &Arc<AppController>,
+) -> Result<JoinHandle<()>> {
+    let admin_auth = Arc::new(AdminAuth::from_token(read_admin_token()?));
+    if admin_auth.is_enforced() {
+        info!("admin API requires bearer token");
+    } else {
+        warn!(
+            "admin API has no token configured \
+             (BUGPOT_ADMIN_TOKEN / BUGPOT_ADMIN_TOKEN_FILE unset); \
+             trust is delegated to the listener binding",
+        );
+    }
+    let admin_controller = Arc::clone(controller);
+    Ok(tokio::spawn(async move {
+        if let Err(e) = bugpot_admin::serve(admin_listen, admin_controller, admin_auth).await {
+            error!(error = %e, "admin api exited with error");
+        }
+    }))
 }
 
 /// Read the admin token from env or file.
