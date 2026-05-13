@@ -99,6 +99,11 @@ async fn main() -> Result<()> {
     // apps already Running and skips them.
     controller.reattach_running().await;
 
+    // Anything left in egress's discovered set has no current TOML —
+    // tear it down so its IP doesn't sit allocated forever and the
+    // netns / nft entries don't linger.
+    controller.cleanup_orphans().await;
+
     if let Err(e) = controller.deploy_always_on().await {
         error!(error = ?e, "eager-start failed; rolling back");
         controller.teardown().await;

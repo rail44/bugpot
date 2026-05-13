@@ -255,6 +255,33 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         }
     }
 
+    /// Reap state left behind by apps whose `AppSpec` no longer exists.
+    ///
+    /// After `reattach_running` consumes endpoints for known apps, any
+    /// `(app_id, ip)` still in egress's discovered set is an orphan:
+    /// the TOML was deleted while bugpot was down, so the netns +
+    /// container + IP allocation no longer have an owner. This call
+    /// stops the container (if libcontainer state still exists), tears
+    /// down the netns + nft entries, and returns the IP to the
+    /// allocator. The per-app log directory is left alone — operators
+    /// may still want to inspect it.
+    ///
+    /// Called once at startup after `reattach_running`. Safe to call
+    /// when there are no orphans (no-op).
+    pub async fn cleanup_orphans(&self) {
+        let orphans = self.egress.drain_unreclaimed_endpoints();
+        for (name, ip) in orphans {
+            info!(app = %name, %ip, "cleaning up orphan: TOML no longer present");
+            if let Err(e) = self.runtime.cleanup_orphan_container(&name).await {
+                warn!(app = %name, error = ?e, "cleanup orphan container failed");
+            }
+            if let Err(e) = self.egress.cleanup_orphan_endpoint(&name, ip).await {
+                warn!(app = %name, error = ?e, "cleanup orphan endpoint failed");
+            }
+            counter!("bugpot_orphan_cleanups_total").increment(1);
+        }
+    }
+
     /// Eagerly start apps whose `idle_timeout` resolves to "always on".
     ///
     /// Concurrent: all qualifying apps' `ensure_running` futures are
@@ -856,6 +883,14 @@ mod tests {
         fn ensure_log_tails(&self, id: &str) {
             self.record(format!("ensure_log_tails({id})"));
         }
+
+        async fn cleanup_orphan_container(
+            &self,
+            name: &str,
+        ) -> std::result::Result<(), RuntimeError> {
+            self.record(format!("cleanup_orphan_container({name})"));
+            Ok(())
+        }
     }
 
     #[derive(Debug, Default)]
@@ -931,6 +966,30 @@ mod tests {
                 .unwrap()
                 .insert(app_id.to_owned(), ep.clone());
             Ok(Some(ep))
+        }
+
+        fn drain_unreclaimed_endpoints(&self) -> Vec<(String, Ipv4Addr)> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push("drain_unreclaimed_endpoints".to_owned());
+            self.discovered
+                .lock()
+                .unwrap()
+                .drain()
+                .collect()
+        }
+
+        async fn cleanup_orphan_endpoint(
+            &self,
+            app_id: &str,
+            container_ip: Ipv4Addr,
+        ) -> anyhow::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("cleanup_orphan_endpoint({app_id},{container_ip})"));
+            Ok(())
         }
     }
 
@@ -1070,6 +1129,52 @@ mod tests {
             rt_calls.contains(&"ensure_log_tails(alpha)".to_owned()),
             "expected ensure_log_tails(alpha); got {rt_calls:?}"
         );
+    }
+
+    /// After `reattach_running` consumes its endpoints, any leftover
+    /// discovered IPs are orphans: their TOML is gone. `cleanup_orphans`
+    /// must drive the runtime cleanup before the egress teardown so the
+    /// container's processes are gone before we delete the netns they
+    /// live in.
+    #[tokio::test]
+    async fn cleanup_orphans_reaps_unreclaimed_endpoints() {
+        let tmp = tempfile::tempdir().unwrap();
+        // `alpha` is the only known app; `beta` (registered in egress
+        // discovery) has no TOML and must be reaped.
+        let controller = make_controller(vec![spec_with_name("alpha")], tmp.path().to_owned());
+        controller.runtime.set_running("alpha", true);
+        controller
+            .egress
+            .set_discovered("alpha", Ipv4Addr::new(10, 0, 0, 5));
+        controller
+            .egress
+            .set_discovered("beta", Ipv4Addr::new(10, 0, 0, 9));
+
+        controller.reattach_running().await;
+        controller.cleanup_orphans().await;
+
+        // alpha was reattached, not orphaned.
+        let rt_calls = controller.runtime.calls();
+        let eg_calls = controller.egress.calls();
+        assert!(
+            !rt_calls.iter().any(|c| c == "cleanup_orphan_container(alpha)"),
+            "reattached alpha must not be cleaned as orphan; rt_calls={rt_calls:?}"
+        );
+        // beta was orphaned.
+        let beta_runtime_idx = rt_calls
+            .iter()
+            .position(|c| c == "cleanup_orphan_container(beta)")
+            .expect("expected cleanup_orphan_container(beta)");
+        let beta_egress_idx = eg_calls
+            .iter()
+            .position(|c| c == "cleanup_orphan_endpoint(beta,10.0.0.9)")
+            .expect("expected cleanup_orphan_endpoint(beta,10.0.0.9)");
+        // Ordering: cleaning the runtime side first means the container
+        // is dead by the time we tear down its netns; if we reversed
+        // the order the container would lose eth0 while still trying
+        // to exit. (Mock can't expose this, but the call sequence
+        // documents the contract.)
+        let _ = (beta_runtime_idx, beta_egress_idx);
     }
 
     /// A second call to `reattach_running` must be a no-op so accidental

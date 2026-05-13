@@ -162,6 +162,19 @@ pub trait EgressOps: Send + Sync + std::fmt::Debug + 'static {
         app_id: &str,
         allowlist: Vec<String>,
     ) -> impl Future<Output = anyhow::Result<Option<Endpoint>>> + Send;
+    /// Drain the set of endpoints that were discovered at startup but
+    /// never claimed by `reattach_endpoint` (i.e. their `AppSpec` is no
+    /// longer present). The returned entries must be passed to
+    /// `cleanup_orphan_endpoint` to release the kernel resources.
+    fn drain_unreclaimed_endpoints(&self) -> Vec<(String, Ipv4Addr)>;
+    /// Tear down an orphan endpoint discovered at startup: delete the
+    /// netns + host-side veth, flush its nft allow-set entries, and
+    /// release its IP back to the allocator. Idempotent.
+    fn cleanup_orphan_endpoint(
+        &self,
+        app_id: &str,
+        container_ip: Ipv4Addr,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send;
 }
 
 /// In-memory record so we can free addresses on release and apply allowlist
@@ -342,6 +355,38 @@ impl EgressOps for Egress {
             AllocatedApp { container_ip, plan },
         );
         Ok(Some(ep))
+    }
+
+    fn drain_unreclaimed_endpoints(&self) -> Vec<(String, Ipv4Addr)> {
+        self.discovered_endpoints
+            .lock()
+            .drain()
+            .collect()
+    }
+
+    async fn cleanup_orphan_endpoint(
+        &self,
+        app_id: &str,
+        container_ip: Ipv4Addr,
+    ) -> anyhow::Result<()> {
+        // Best-effort: drop any allow-set entries left over from the
+        // previous bugpot run. Entries also TTL out, so a failure here
+        // is non-fatal.
+        let _ = nft::run_script(&nft::render_flush_src(
+            &self.nft_table,
+            container_ip,
+        ))
+        .await;
+        // Render the same detach plan we would use for a clean release;
+        // the netns name + host veth name derive deterministically from
+        // app_id, so this works even though we never called
+        // `allocate_endpoint` for this app in this process.
+        let plan = netns::EndpointPlan::new(app_id, container_ip, self.config.subnet);
+        if let Err(e) = netns::run_cmds(netns::render_detach_endpoint(&plan)).await {
+            tracing::warn!(app = %app_id, error = %e, "detach orphan endpoint failed");
+        }
+        self.allocator.lock().release(container_ip);
+        Ok(())
     }
 
     async fn release_endpoint(&self, app_id: &str) -> anyhow::Result<()> {
