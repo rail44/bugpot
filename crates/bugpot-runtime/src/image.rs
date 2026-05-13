@@ -13,6 +13,7 @@
 //! `digest` is the manifest digest (e.g. `sha256:abc...`) with the `:`
 //! replaced by `_` so it is a valid path component.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::io::Read;
@@ -243,6 +244,61 @@ pub(crate) fn load_cached_image(images_root: &Path, id: &ImageId) -> Result<Opti
     }))
 }
 
+/// Drop image cache dirs whose digest is not in `live`, plus any dir
+/// missing `.done` (incomplete pulls / orphaned `.tmp.*` leftovers
+/// from a previous crash).
+///
+/// `live` is the set of digests currently referenced by something we
+/// care to keep — for the current "flat extract per image" cache
+/// layout that's the bundles' rootfs symlink targets (see
+/// `Runtime::live_image_digests`). The signature stays the same shape
+/// once we move to layer-keyed storage with overlayfs: the caller
+/// will pass a `live_layers` set instead and the body will iterate
+/// `layers/<digest>/`.
+///
+/// Designed to run at startup, before any pull can race with it.
+/// Errors on individual entries are logged + skipped so a single bad
+/// dir doesn't abort the sweep.
+pub(crate) fn gc_unused_images(images_root: &Path, live: &HashSet<ImageId>) -> Result<usize> {
+    if !images_root.exists() {
+        return Ok(0);
+    }
+    let live_fs: HashSet<String> = live.iter().map(ImageId::fs_component).collect();
+    let mut removed = 0usize;
+    let entries = fs::read_dir(images_root).map_err(|e| RuntimeError::io(images_root, e))?;
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(error = %e, "skip unreadable image cache entry");
+                continue;
+            }
+        };
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(s) => s.to_owned(),
+            None => continue,
+        };
+        let has_done = path.join(".done").exists();
+        let should_remove = !has_done || !live_fs.contains(&name);
+        if should_remove {
+            match fs::remove_dir_all(&path) {
+                Ok(()) => {
+                    info!(dir = %path.display(), "image cache GC removed");
+                    removed += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(dir = %path.display(), error = %e, "image cache GC remove failed");
+                }
+            }
+        }
+    }
+    Ok(removed)
+}
+
 fn accepted_media_types() -> Vec<&'static str> {
     vec![
         IMAGE_LAYER_MEDIA_TYPE,
@@ -355,5 +411,56 @@ mod tests {
         extract_layer(tmp.path(), &buf, IMAGE_LAYER_MEDIA_TYPE).unwrap();
         let body = std::fs::read_to_string(tmp.path().join("greeting.txt")).unwrap();
         assert_eq!(body, "hello\n");
+    }
+
+    /// Create a fake image cache dir with a `.done` marker.
+    fn make_cache_dir(root: &Path, digest: &str, with_done: bool) -> PathBuf {
+        let dir = root.join(digest);
+        fs::create_dir_all(&dir).unwrap();
+        if with_done {
+            fs::write(dir.join(".done"), b"").unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn gc_keeps_referenced_drops_others() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live_dir = make_cache_dir(tmp.path(), "sha256_alive", true);
+        let dead_dir = make_cache_dir(tmp.path(), "sha256_dead", true);
+        let mut live = HashSet::new();
+        live.insert(ImageId::new("sha256:alive"));
+
+        let removed = gc_unused_images(tmp.path(), &live).unwrap();
+        assert_eq!(removed, 1);
+        assert!(live_dir.exists(), "referenced image must survive");
+        assert!(!dead_dir.exists(), "unreferenced image must be removed");
+    }
+
+    #[test]
+    fn gc_removes_dirs_without_done_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Orphaned .tmp.* dir from a crashed pull.
+        let orphan = tmp.path().join("sha256_foo.tmp.12345");
+        fs::create_dir_all(&orphan).unwrap();
+        // Half-extracted final dir with no .done.
+        let half = make_cache_dir(tmp.path(), "sha256_half", false);
+        // Even if the live set names it, missing .done means we treat
+        // it as not-fully-extracted and reap it.
+        let mut live = HashSet::new();
+        live.insert(ImageId::new("sha256:half"));
+
+        let removed = gc_unused_images(tmp.path(), &live).unwrap();
+        assert_eq!(removed, 2);
+        assert!(!orphan.exists());
+        assert!(!half.exists());
+    }
+
+    #[test]
+    fn gc_no_op_on_missing_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        let removed = gc_unused_images(&missing, &HashSet::new()).unwrap();
+        assert_eq!(removed, 0);
     }
 }

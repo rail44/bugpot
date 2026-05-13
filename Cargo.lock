@@ -162,6 +162,7 @@ dependencies = [
  "bugpot-metrics",
  "bugpot-router",
  "bugpot-runtime",
+ "metrics",
  "nix 0.29.0",
  "tokio",
  "tracing",

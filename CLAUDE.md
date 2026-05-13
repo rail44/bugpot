@@ -262,6 +262,8 @@ The nftables forward chain is **default-drop**. Packets only escape via a `(src_
 
 `/var/lib/bugpot/{images,bundles,containers,logs}`. Images are content-addressed by digest; bundles are per-app (`rootfs` is a symlink into the image cache — read-only, no overlayfs yet). `Runtime::start_app` removes stale `containers/<name>` from a prior crash before letting libcontainer recreate it. Note that libcontainer's `with_root_path` takes the **parent** of the per-container state dir, not the dir itself.
 
+**Image cache GC (#19):** `Runtime::gc_unused_images` runs once at startup before any pull. It treats the union of every `bundles/<app>/rootfs` symlink's target as the live set of image digests, and removes any `images/<digest>/` not in that set, plus any dir missing `.done` (orphaned `.tmp.*` leftovers from a crashed pull). Tradeoff: an app that's been **registered but never started** has no bundle, so its already-pulled image may get reclaimed and re-pulled on first start. The `live_image_digests` + `gc_unused_images` split keeps the call-site interface stable for the future overlayfs / layer-keyed storage migration — only the internal expansion to live layers changes there.
+
 `logs/<app>/{stdout,stderr}.log` hold each container's fd 1 / fd 2 output. Container fds are opened by bugpot in `O_APPEND` mode and handed to libcontainer, so they survive bugpot crashes and restarts — `reattach_running` doesn't need to re-establish them. The files are NOT cleaned up when an app is removed (operators may want them for post-mortem); orphan-cleanup at startup explicitly skips them.
 
 ### Multi-arch image handling
