@@ -147,19 +147,19 @@ pub struct Endpoint {
 pub trait EgressOps: Send + Sync + std::fmt::Debug + 'static {
     fn allocate_endpoint(
         &self,
-        app_id: &str,
+        name: &str,
         allowlist: Vec<String>,
     ) -> impl Future<Output = anyhow::Result<Endpoint>> + Send;
-    fn release_endpoint(&self, app_id: &str) -> impl Future<Output = anyhow::Result<()>> + Send;
+    fn release_endpoint(&self, name: &str) -> impl Future<Output = anyhow::Result<()>> + Send;
     /// Re-register an endpoint that was already provisioned by a previous
-    /// bugpot run. Returns `Ok(None)` when no live netns matches `app_id`
+    /// bugpot run. Returns `Ok(None)` when no live netns matches `name`
     /// (no IP was discovered for it at startup), `Ok(Some(_))` when the
     /// app has been re-bound to its existing IP + allowlist without
     /// touching netns/veth/nft. Does not allocate or release host
     /// resources.
     fn reattach_endpoint(
         &self,
-        app_id: &str,
+        name: &str,
         allowlist: Vec<String>,
     ) -> impl Future<Output = anyhow::Result<Option<Endpoint>>> + Send;
     /// Drain the set of endpoints that were discovered at startup but
@@ -172,7 +172,7 @@ pub trait EgressOps: Send + Sync + std::fmt::Debug + 'static {
     /// release its IP back to the allocator. Idempotent.
     fn cleanup_orphan_endpoint(
         &self,
-        app_id: &str,
+        name: &str,
         container_ip: Ipv4Addr,
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
 }
@@ -271,8 +271,8 @@ impl Egress {
         // that are still actually running; the rest remain orphans
         // (#35).
         let discovered = discover_endpoints().await;
-        for (app_id, ip) in &discovered {
-            tracing::info!(app = %app_id, %ip, "discovered existing endpoint");
+        for (name, ip) in &discovered {
+            tracing::info!(app = %name, %ip, "discovered existing endpoint");
             allocator.mark_used(*ip);
         }
 
@@ -293,12 +293,12 @@ impl EgressOps for Egress {
     /// Allocate veth + netns + container IP, register the app's allowlist.
     async fn allocate_endpoint(
         &self,
-        app_id: &str,
+        name: &str,
         allowlist: Vec<String>,
     ) -> anyhow::Result<Endpoint> {
         let parsed = Allowlist::parse(allowlist)?;
         let container_ip = self.allocator.lock().allocate()?;
-        let plan = EndpointPlan::new(app_id, container_ip, self.config.subnet);
+        let plan = EndpointPlan::new(name, container_ip, self.config.subnet);
 
         if let Err(e) = netns::run_cmds(netns::render_attach_endpoint(
             &self.config.bridge_name,
@@ -314,7 +314,7 @@ impl EgressOps for Egress {
         self.registry.insert(
             container_ip,
             AppEntry {
-                app_id: app_id.to_string(),
+                name: name.to_string(),
                 allowlist: parsed,
             },
         );
@@ -323,7 +323,7 @@ impl EgressOps for Egress {
             netns_path: plan.ns_path.clone(),
         };
         self.apps.lock().insert(
-            app_id.to_string(),
+            name.to_string(),
             AllocatedApp { container_ip, plan },
         );
         Ok(ep)
@@ -331,14 +331,14 @@ impl EgressOps for Egress {
 
     async fn reattach_endpoint(
         &self,
-        app_id: &str,
+        name: &str,
         allowlist: Vec<String>,
     ) -> anyhow::Result<Option<Endpoint>> {
-        let Some(container_ip) = self.discovered_endpoints.lock().remove(app_id) else {
+        let Some(container_ip) = self.discovered_endpoints.lock().remove(name) else {
             return Ok(None);
         };
         let parsed = Allowlist::parse(allowlist)?;
-        let plan = EndpointPlan::new(app_id, container_ip, self.config.subnet);
+        let plan = EndpointPlan::new(name, container_ip, self.config.subnet);
         let ep = Endpoint {
             container_ip,
             netns_path: plan.ns_path.clone(),
@@ -346,12 +346,12 @@ impl EgressOps for Egress {
         self.registry.insert(
             container_ip,
             AppEntry {
-                app_id: app_id.to_string(),
+                name: name.to_string(),
                 allowlist: parsed,
             },
         );
         self.apps.lock().insert(
-            app_id.to_string(),
+            name.to_string(),
             AllocatedApp { container_ip, plan },
         );
         Ok(Some(ep))
@@ -366,7 +366,7 @@ impl EgressOps for Egress {
 
     async fn cleanup_orphan_endpoint(
         &self,
-        app_id: &str,
+        name: &str,
         container_ip: Ipv4Addr,
     ) -> anyhow::Result<()> {
         // Best-effort: drop any allow-set entries left over from the
@@ -379,18 +379,18 @@ impl EgressOps for Egress {
         .await;
         // Render the same detach plan we would use for a clean release;
         // the netns name + host veth name derive deterministically from
-        // app_id, so this works even though we never called
+        // the app name, so this works even though we never called
         // `allocate_endpoint` for this app in this process.
-        let plan = netns::EndpointPlan::new(app_id, container_ip, self.config.subnet);
+        let plan = netns::EndpointPlan::new(name, container_ip, self.config.subnet);
         if let Err(e) = netns::run_cmds(netns::render_detach_endpoint(&plan)).await {
-            tracing::warn!(app = %app_id, error = %e, "detach orphan endpoint failed");
+            tracing::warn!(app = %name, error = %e, "detach orphan endpoint failed");
         }
         self.allocator.lock().release(container_ip);
         Ok(())
     }
 
-    async fn release_endpoint(&self, app_id: &str) -> anyhow::Result<()> {
-        let Some(app) = self.apps.lock().remove(app_id) else {
+    async fn release_endpoint(&self, name: &str) -> anyhow::Result<()> {
+        let Some(app) = self.apps.lock().remove(name) else {
             return Ok(());
         };
         self.registry.remove(app.container_ip);
@@ -411,19 +411,19 @@ impl Egress {
     #[allow(clippy::unused_async)] // matches the public spec; future versions may push to nft.
     pub async fn update_allowlist(
         &self,
-        app_id: &str,
+        name: &str,
         allowlist: Vec<String>,
     ) -> anyhow::Result<()> {
         let parsed = Allowlist::parse(allowlist)?;
         let ip = self
             .apps
             .lock()
-            .get(app_id)
+            .get(name)
             .map(|a| a.container_ip)
-            .ok_or_else(|| anyhow::anyhow!("unknown app {app_id}"))?;
+            .ok_or_else(|| anyhow::anyhow!("unknown app {name}"))?;
         anyhow::ensure!(
             self.registry.update_allowlist(ip, parsed),
-            "registry desync for {app_id}"
+            "registry desync for {name}"
         );
         Ok(())
     }
@@ -442,16 +442,16 @@ async fn discover_endpoints() -> std::collections::HashMap<String, Ipv4Addr> {
             return out;
         }
     };
-    for app_id in ns_list {
-        match netns::read_eth0_ipv4(&app_id).await {
+    for name in ns_list {
+        match netns::read_eth0_ipv4(&name).await {
             Ok(Some(ip)) => {
-                out.insert(app_id, ip);
+                out.insert(name, ip);
             }
             Ok(None) => {
-                tracing::warn!(app = %app_id, "existing netns has no inet address on eth0; skipping");
+                tracing::warn!(app = %name, "existing netns has no inet address on eth0; skipping");
             }
             Err(e) => {
-                tracing::warn!(app = %app_id, error = %e, "read eth0 ip failed; skipping");
+                tracing::warn!(app = %name, error = %e, "read eth0 ip failed; skipping");
             }
         }
     }

@@ -37,7 +37,7 @@ use crate::spec::{SpecInputs, build_spec};
 /// A bugpot-managed container that has been started.
 #[derive(Debug, Clone)]
 pub struct RunningApp {
-    pub id: String,
+    pub name: String,
     pub pid: u32,
     pub image: ImageId,
 }
@@ -74,13 +74,13 @@ pub trait RuntimeOps: Send + Sync + std::fmt::Debug + 'static {
         image_id: &'a ImageId,
         netns_path: Option<&'a Path>,
     ) -> impl Future<Output = Result<RunningApp>> + Send + 'a;
-    fn stop_app(&self, id: &str) -> impl Future<Output = Result<()>> + Send;
-    fn is_container_running(&self, id: &str) -> bool;
-    fn resource_usage(&self, id: &str) -> Option<ResourceUsage>;
-    /// (Re)spawn log-tail tasks for `id`. Used by the controller after a
-    /// successful reattach so the new bugpot's tracing pipeline picks
+    fn stop_app(&self, name: &str) -> impl Future<Output = Result<()>> + Send;
+    fn is_container_running(&self, name: &str) -> bool;
+    fn resource_usage(&self, name: &str) -> Option<ResourceUsage>;
+    /// (Re)spawn log-tail tasks for `name`. Used by the controller after
+    /// a successful reattach so the new bugpot's tracing pipeline picks
     /// up the surviving container's stdout/stderr from EOF.
-    fn ensure_log_tails(&self, id: &str);
+    fn ensure_log_tails(&self, name: &str);
     /// Reap a leftover container whose `AppSpec` is no longer registered
     /// (TOML deleted while bugpot was down). Stops and removes
     /// libcontainer state if it exists, deletes the bundle dir. The
@@ -300,7 +300,7 @@ impl RuntimeOps for Runtime {
         })?;
 
         let running = RunningApp {
-            id: name.clone(),
+            name: name.clone(),
             pid,
             image: image.id,
         };
@@ -320,8 +320,8 @@ impl RuntimeOps for Runtime {
     /// whose init has crashed, OOM'd, or been `kill -9`'d shows up as
     /// `Stopped` here, not (stale) `Running`. PID reuse is theoretically
     /// possible but rare on a single-host setup; we accept the limit.
-    fn is_container_running(&self, id: &str) -> bool {
-        let container_root = self.containers_dir.join(id);
+    fn is_container_running(&self, name: &str) -> bool {
+        let container_root = self.containers_dir.join(name);
         if !container_root.exists() {
             return false;
         }
@@ -329,11 +329,11 @@ impl RuntimeOps for Runtime {
     }
 
     /// Read the live cgroup v2 memory + CPU stats for the container
-    /// named `id`. Returns `None` when the container is not running, or
-    /// when its cgroup path / files cannot be resolved (e.g. cgroup v1
-    /// host, transient `/proc` races).
-    fn resource_usage(&self, id: &str) -> Option<ResourceUsage> {
-        let container_root = self.containers_dir.join(id);
+    /// named `name`. Returns `None` when the container is not running,
+    /// or when its cgroup path / files cannot be resolved (e.g. cgroup
+    /// v1 host, transient `/proc` races).
+    fn resource_usage(&self, name: &str) -> Option<ResourceUsage> {
+        let container_root = self.containers_dir.join(name);
         let container = Container::load(container_root).ok()?;
         if container.status() != ContainerStatus::Running {
             return None;
@@ -352,10 +352,10 @@ impl RuntimeOps for Runtime {
     /// future use of `tokio` primitives (e.g. waiting on process exit via
     /// a child process abstraction).
     #[allow(clippy::unused_async)]
-    async fn stop_app(&self, id: &str) -> Result<()> {
-        let container_root = self.containers_dir.join(id);
+    async fn stop_app(&self, name: &str) -> Result<()> {
+        let container_root = self.containers_dir.join(name);
         if !container_root.exists() {
-            return Err(RuntimeError::AppNotFound(id.to_owned()));
+            return Err(RuntimeError::AppNotFound(name.to_owned()));
         }
 
         let mut container = Container::load(container_root)?;
@@ -371,7 +371,7 @@ impl RuntimeOps for Runtime {
         self.apps
             .lock()
             .expect("apps mutex poisoned")
-            .remove(id);
+            .remove(name);
         Ok(())
     }
 
@@ -402,12 +402,12 @@ impl RuntimeOps for Runtime {
         Ok(())
     }
 
-    fn ensure_log_tails(&self, id: &str) {
-        let log_dir = self.log_dir_for(id);
+    fn ensure_log_tails(&self, name: &str) {
+        let log_dir = self.log_dir_for(name);
         let stdout_path = log_dir.join("stdout.log");
         let stderr_path = log_dir.join("stderr.log");
-        tokio::spawn(forward_log_file(stdout_path, id.to_owned(), "stdout"));
-        tokio::spawn(forward_log_file(stderr_path, id.to_owned(), "stderr"));
+        tokio::spawn(forward_log_file(stdout_path, name.to_owned(), "stdout"));
+        tokio::spawn(forward_log_file(stderr_path, name.to_owned(), "stderr"));
     }
 }
 
@@ -753,18 +753,18 @@ nr_periods 0\n";
         let tmp = tempfile::tempdir().unwrap();
         let rt = Runtime::new(tmp.path().to_path_buf()).unwrap();
         let running = RunningApp {
-            id: "demo".into(),
+            name: "demo".into(),
             pid: 12345,
             image: ImageId::new("sha256:test"),
         };
         rt.apps
             .lock()
             .unwrap()
-            .insert(running.id.clone(), running);
+            .insert(running.name.clone(), running);
 
         let listed = rt.list();
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].id, "demo");
+        assert_eq!(listed[0].name, "demo");
         assert_eq!(listed[0].pid, 12345);
         assert_eq!(listed[0].image.as_str(), "sha256:test");
     }
