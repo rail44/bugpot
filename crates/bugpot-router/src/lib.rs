@@ -377,6 +377,7 @@ mod tests {
             egress: bugpot_config::Egress::default(),
             env: std::collections::HashMap::default(),
             scaling: bugpot_config::Scaling::default(),
+            readiness: bugpot_config::Readiness::default(),
             resources: bugpot_config::Resources::default(),
             runtime: bugpot_config::Runtime::default(),
             source_path: PathBuf::from(format!("/apps/{name}.toml")),

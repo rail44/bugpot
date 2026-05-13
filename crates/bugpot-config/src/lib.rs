@@ -17,6 +17,8 @@ pub struct AppSpec {
     pub env: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Scaling::is_empty")]
     pub scaling: Scaling,
+    #[serde(default, skip_serializing_if = "Readiness::is_empty")]
+    pub readiness: Readiness,
     #[serde(default, skip_serializing_if = "Resources::is_empty")]
     pub resources: Resources,
     #[serde(default, skip_serializing_if = "Runtime::is_empty")]
@@ -42,7 +44,8 @@ impl Egress {
 pub struct Scaling {
     /// Idle timeout for scale-to-zero. Accepted forms:
     ///   - `"0"`, `""`, missing: always-on (container never auto-stops).
-    ///   - `"30s"`, `"5m"`, `"1h"`: stop after this much idle time.
+    ///   - Any [`humantime`]-compatible duration: `"30s"`, `"5m"`,
+    ///     `"1h"`, `"5m 30s"`, `"2d"`, etc.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_timeout: Option<String>,
 }
@@ -55,20 +58,46 @@ impl Scaling {
 
     /// Resolve `idle_timeout` to a `Duration`. `Ok(None)` means "always on";
     /// `Ok(Some(d))` means "stop after `d` of idleness".
-    pub fn resolve_idle_timeout(&self) -> Result<Option<std::time::Duration>, &'static str> {
+    pub fn resolve_idle_timeout(&self) -> Result<Option<std::time::Duration>, String> {
         let raw = self.idle_timeout.as_deref().unwrap_or("5m").trim();
         if raw.is_empty() || raw == "0" {
             return Ok(None);
         }
-        let (num_part, unit) = raw.split_at(raw.len().saturating_sub(1));
-        let n: u64 = num_part.parse().map_err(|_| "scaling.idle_timeout: leading number must parse")?;
-        let secs = match unit {
-            "s" => n,
-            "m" => n.saturating_mul(60),
-            "h" => n.saturating_mul(3600),
-            _ => return Err("scaling.idle_timeout: trailing unit must be one of s/m/h"),
-        };
-        Ok(Some(std::time::Duration::from_secs(secs)))
+        humantime::parse_duration(raw)
+            .map(Some)
+            .map_err(|e| format!("scaling.idle_timeout: {e}"))
+    }
+}
+
+/// Per-app readiness probe tuning. Currently exposes the timeout for
+/// the post-start TCP probe; the poll interval stays a workspace
+/// constant.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct Readiness {
+    /// How long to wait for the container to bind on its declared port
+    /// before declaring the start a failure. Accepts any
+    /// [`humantime`]-compatible duration (`"30s"`, `"5m"`, `"1m 30s"`,
+    /// etc.). Missing or empty → use the workspace default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<String>,
+}
+
+impl Readiness {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.timeout.is_none()
+    }
+
+    /// Resolve `timeout`, falling back to `default` when unset or empty.
+    pub fn resolve_timeout(
+        &self,
+        default: std::time::Duration,
+    ) -> Result<std::time::Duration, String> {
+        let raw = self.timeout.as_deref().unwrap_or("").trim();
+        if raw.is_empty() {
+            return Ok(default);
+        }
+        humantime::parse_duration(raw).map_err(|e| format!("readiness.timeout: {e}"))
     }
 }
 
@@ -290,7 +319,13 @@ mod tests {
 
     #[test]
     fn scaling_units() {
-        for (raw, want_secs) in [("30s", 30), ("5m", 300), ("2h", 7200)] {
+        for (raw, want_secs) in [
+            ("30s", 30),
+            ("5m", 300),
+            ("2h", 7200),
+            ("1m 30s", 90), // humantime composite form
+            ("2d", 2 * 86_400),
+        ] {
             let s = Scaling {
                 idle_timeout: Some(raw.into()),
             };
@@ -303,17 +338,56 @@ mod tests {
     }
 
     #[test]
+    fn scaling_empty_string_means_always_on() {
+        let s = Scaling {
+            idle_timeout: Some(String::new()),
+        };
+        assert!(s.resolve_idle_timeout().unwrap().is_none());
+    }
+
+    #[test]
     fn scaling_rejects_garbage() {
-        for raw in ["abc", "5", "5y", ""] {
+        // humantime requires a unit on every numeric — bare numbers and
+        // unknown trailing letters both fail.
+        for raw in ["abc", "5", "5xyz"] {
             let s = Scaling {
                 idle_timeout: Some(raw.into()),
             };
-            if raw.is_empty() {
-                assert!(s.resolve_idle_timeout().unwrap().is_none());
-            } else {
-                assert!(s.resolve_idle_timeout().is_err(), "should reject: {raw}");
-            }
+            assert!(s.resolve_idle_timeout().is_err(), "should reject: {raw}");
         }
+    }
+
+    #[test]
+    fn readiness_default_returns_supplied_fallback() {
+        let r = Readiness::default();
+        let got = r.resolve_timeout(std::time::Duration::from_secs(7)).unwrap();
+        assert_eq!(got, std::time::Duration::from_secs(7));
+    }
+
+    #[test]
+    fn readiness_explicit_value_overrides_default() {
+        let r = Readiness {
+            timeout: Some("30s".into()),
+        };
+        let got = r.resolve_timeout(std::time::Duration::from_secs(7)).unwrap();
+        assert_eq!(got, std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn readiness_empty_string_uses_default() {
+        let r = Readiness {
+            timeout: Some(String::new()),
+        };
+        let got = r.resolve_timeout(std::time::Duration::from_secs(7)).unwrap();
+        assert_eq!(got, std::time::Duration::from_secs(7));
+    }
+
+    #[test]
+    fn readiness_rejects_garbage() {
+        let r = Readiness {
+            timeout: Some("not-a-duration".into()),
+        };
+        assert!(r.resolve_timeout(std::time::Duration::from_secs(7)).is_err());
     }
 
     #[test]
