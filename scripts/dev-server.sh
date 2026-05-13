@@ -61,6 +61,9 @@ EOF
     # match "bugpot up" from a prior run of the same unit name.
     since_ts=$(date '+%Y-%m-%d %H:%M:%S')
 
+    # Admin auth is mandatory; dev gets a fixed throwaway token via
+    # env-var. Production deployments must use BUGPOT_ADMIN_TOKEN_FILE
+    # (chmod 600) instead.
     sudo systemd-run \
         --unit="$UNIT" \
         --description="bugpot dev server (managed by scripts/dev-server.sh)" \
@@ -69,6 +72,7 @@ EOF
         --setenv=BUGPOT_APPS_DIR="$APPS" \
         --setenv=BUGPOT_STATE_DIR="$STATE_DIR" \
         --setenv=BUGPOT_LISTEN="$LISTEN" \
+        --setenv=BUGPOT_ADMIN_TOKEN="dev-only-do-not-deploy" \
         --setenv=RUST_LOG=info \
         "$BIN" >/dev/null
 
