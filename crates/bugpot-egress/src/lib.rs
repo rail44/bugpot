@@ -91,6 +91,46 @@ impl Default for EgressConfig {
     }
 }
 
+impl EgressConfig {
+    /// Reject configurations whose fields don't fit together. Called at
+    /// startup so misconfig fails before any bridge / nft work runs.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !self.subnet.contains(&self.bridge_ip) {
+            anyhow::bail!(
+                "bridge_ip {} is not within subnet {}",
+                self.bridge_ip,
+                self.subnet,
+            );
+        }
+        if self.dns_upstream.is_empty() {
+            anyhow::bail!("dns_upstream is empty");
+        }
+        Ok(())
+    }
+}
+
+/// Parse a comma-separated list of `SocketAddr`s (e.g.
+/// `"1.1.1.1:53,8.8.8.8:53"`). Whitespace and empty entries are
+/// tolerated; invalid entries propagate as errors.
+pub fn parse_dns_upstream(s: &str) -> anyhow::Result<Vec<SocketAddr>> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            p.parse::<SocketAddr>()
+                .with_context(|| format!("parse dns upstream entry {p:?}"))
+        })
+        .collect()
+}
+
+/// Pick a default bridge IP for `subnet`: the first usable host address
+/// (e.g. `172.20.0.1` for `172.20.0.0/24`). Falls back to the network
+/// address when the subnet has no hosts (e.g. `/32`).
+#[must_use]
+pub fn derive_bridge_ip(subnet: Ipv4Net) -> Ipv4Addr {
+    subnet.hosts().next().unwrap_or_else(|| subnet.addr())
+}
+
 #[derive(Debug, Clone)]
 pub struct Endpoint {
     pub container_ip: Ipv4Addr,
@@ -328,5 +368,61 @@ mod tests {
         assert!(c.subnet.contains(&c.bridge_ip));
         assert_eq!(c.allow_ttl_secs, 60);
         assert!(!c.dns_upstream.is_empty());
+        c.validate().expect("default config validates");
+    }
+
+    #[test]
+    fn validate_rejects_bridge_ip_outside_subnet() {
+        let c = EgressConfig {
+            bridge_ip: "10.0.0.1".parse().unwrap(),
+            ..EgressConfig::default()
+        };
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("not within subnet"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_empty_dns_upstream() {
+        let c = EgressConfig {
+            dns_upstream: vec![],
+            ..EgressConfig::default()
+        };
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("dns_upstream"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_dns_upstream_single() {
+        let v = parse_dns_upstream("1.1.1.1:53").unwrap();
+        assert_eq!(v, vec!["1.1.1.1:53".parse::<SocketAddr>().unwrap()]);
+    }
+
+    #[test]
+    fn parse_dns_upstream_multi_with_whitespace() {
+        let v = parse_dns_upstream("1.1.1.1:53, 8.8.8.8:53 , 9.9.9.9:53").unwrap();
+        assert_eq!(v.len(), 3);
+    }
+
+    #[test]
+    fn parse_dns_upstream_skips_empty_entries() {
+        let v = parse_dns_upstream("1.1.1.1:53,,8.8.8.8:53").unwrap();
+        assert_eq!(v.len(), 2);
+    }
+
+    #[test]
+    fn parse_dns_upstream_rejects_garbage() {
+        assert!(parse_dns_upstream("not-a-sockaddr").is_err());
+        // No port: rejected (SocketAddr requires :port)
+        assert!(parse_dns_upstream("1.1.1.1").is_err());
+    }
+
+    #[test]
+    fn derive_bridge_ip_picks_first_host() {
+        let subnet: Ipv4Net = "10.0.0.0/24".parse().unwrap();
+        assert_eq!(derive_bridge_ip(subnet), "10.0.0.1".parse::<Ipv4Addr>().unwrap());
+
+        let subnet: Ipv4Net = "192.168.5.0/22".parse().unwrap();
+        // /22 starts at 192.168.4.0, first host is 192.168.4.1
+        assert_eq!(derive_bridge_ip(subnet), "192.168.4.1".parse::<Ipv4Addr>().unwrap());
     }
 }
