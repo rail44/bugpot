@@ -14,8 +14,10 @@ anyhow.workspace = true
 axum.workspace = true
 serde = { workspace = true }
 serde_json = "1"
+subtle = "2"
 tokio.workspace = true
 tracing.workspace = true
+zeroize = "1"
 bugpot-config.workspace = true
 bugpot-controller.workspace = true
 

@@ -88,14 +88,20 @@ Env vars (read by bugpot directly):
 - `BUGPOT_STATE_DIR` (default `/var/lib/bugpot`)
 - `BUGPOT_LISTEN` — public HTTP router (default `127.0.0.1:8080`)
 - `BUGPOT_ADMIN_LISTEN` — admin HTTP API (default `127.0.0.1:8081`)
+- `BUGPOT_ADMIN_TOKEN` — bearer token for admin API; if set, all admin routes require `Authorization: Bearer <token>` (constant-time compare). Unset = no auth (trust delegated to listener binding).
+- `BUGPOT_ADMIN_TOKEN_FILE` — path to a file whose trimmed contents are the token. Used when `BUGPOT_ADMIN_TOKEN` is not set. Typical layout: `/etc/bugpot/admin-token` with `root:root 0600` permissions.
 - `BUGPOT_AUTH_FILE` — registry-auth TOML (default `/etc/bugpot/auth.toml`, missing file = anonymous)
 - `RUST_LOG`
 
 ### Admin HTTP API
 
 `bugpot-admin` exposes a minimal CRUD surface for runtime app management.
-Listener is whatever `BUGPOT_ADMIN_LISTEN` points at — *no* authn/authz in
-code, scoped by the listener choice (loopback for self-hosted runner
+Listener is whatever `BUGPOT_ADMIN_LISTEN` points at.
+
+Auth is optional bearer-token (`BUGPOT_ADMIN_TOKEN` / `BUGPOT_ADMIN_TOKEN_FILE`).
+Verification uses `subtle::ConstantTimeEq` so wrong tokens do not leak
+through timing. When no token is configured, auth is a no-op and trust
+is delegated to the listener binding (loopback for self-hosted runner
 flows, Tailscale IP + ACL for remote CI).
 
 | Method | Path           | Body / Response                                    |

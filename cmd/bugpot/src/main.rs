@@ -13,11 +13,12 @@
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
+use bugpot_admin::AdminAuth;
 use bugpot_controller::AppController;
 use bugpot_egress::{Egress, EgressConfig};
 use bugpot_router::UpstreamResolver;
 use bugpot_runtime::Runtime;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:8080";
@@ -107,9 +108,19 @@ async fn main() -> Result<()> {
     });
 
     // Admin HTTP API.
+    let admin_auth = Arc::new(AdminAuth::from_token(read_admin_token()?));
+    if admin_auth.is_enforced() {
+        info!("admin API requires bearer token");
+    } else {
+        warn!(
+            "admin API has no token configured \
+             (BUGPOT_ADMIN_TOKEN / BUGPOT_ADMIN_TOKEN_FILE unset); \
+             trust is delegated to the listener binding",
+        );
+    }
     let admin_controller = Arc::clone(&controller);
     let admin_task = tokio::spawn(async move {
-        if let Err(e) = bugpot_admin::serve(admin_listen, admin_controller).await {
+        if let Err(e) = bugpot_admin::serve(admin_listen, admin_controller, admin_auth).await {
             error!(error = %e, "admin api exited with error");
         }
     });
@@ -126,6 +137,29 @@ async fn main() -> Result<()> {
     controller.teardown().await;
 
     Ok(())
+}
+
+/// Read the admin token from env or file.
+///
+/// Precedence: `BUGPOT_ADMIN_TOKEN` (env, raw value) > `BUGPOT_ADMIN_TOKEN_FILE`
+/// (path to a file whose trimmed contents are the token). Returns `Ok(None)`
+/// when neither is set, which leaves the admin API unauthenticated.
+fn read_admin_token() -> Result<Option<String>> {
+    if let Ok(raw) = std::env::var("BUGPOT_ADMIN_TOKEN") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return Ok(Some(trimmed.to_owned()));
+        }
+    }
+    if let Ok(path) = std::env::var("BUGPOT_ADMIN_TOKEN_FILE") {
+        let body =
+            std::fs::read_to_string(&path).with_context(|| format!("read admin token from {path}"))?;
+        let trimmed = body.trim();
+        if !trimmed.is_empty() {
+            return Ok(Some(trimmed.to_owned()));
+        }
+    }
+    Ok(None)
 }
 
 fn init_tracing() {
