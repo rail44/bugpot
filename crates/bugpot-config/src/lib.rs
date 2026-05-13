@@ -1,43 +1,58 @@
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppSpec {
     pub image: String,
     pub port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subdomain: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Egress::is_empty")]
     pub egress: Egress,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub env: HashMap<String, String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Scaling::is_empty")]
     pub scaling: Scaling,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Resources::is_empty")]
     pub resources: Resources,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Runtime::is_empty")]
     pub runtime: Runtime,
     #[serde(skip)]
     pub source_path: PathBuf,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Egress {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+impl Egress {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.allow.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Scaling {
     /// Idle timeout for scale-to-zero. Accepted forms:
     ///   - `"0"`, `""`, missing: always-on (container never auto-stops).
     ///   - `"30s"`, `"5m"`, `"1h"`: stop after this much idle time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_timeout: Option<String>,
 }
 
 impl Scaling {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.idle_timeout.is_none()
+    }
+
     /// Resolve `idle_timeout` to a `Duration`. `Ok(None)` means "always on";
     /// `Ok(Some(d))` means "stop after `d` of idleness".
     pub fn resolve_idle_timeout(&self) -> Result<Option<std::time::Duration>, &'static str> {
@@ -57,15 +72,32 @@ impl Scaling {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Resources {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+impl Resources {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.memory.is_none() && self.cpu.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Runtime {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub isolation: Option<String>,
+}
+
+impl Runtime {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.isolation.is_none()
+    }
 }
 
 impl AppSpec {
@@ -216,5 +248,63 @@ port = 80
         spec.source_path = PathBuf::from("/tmp/apps/some-app.toml");
         assert_eq!(spec.name(), "some-app");
         assert_eq!(spec.subdomain(), "some-app");
+    }
+
+    /// Adapter crates persist specs back to disk via `toml::to_string`.
+    /// Guarantee that the round-trip (Serialize → Deserialize) is stable
+    /// so a deploy followed by a restart sees the same logical spec.
+    #[test]
+    fn serialize_deserialize_round_trip_minimum() {
+        let original: AppSpec = toml::from_str(
+            r#"
+            image = "ghcr.io/org/app:sha-abc"
+            port = 3000
+            name = "myapp"
+        "#,
+        )
+        .unwrap();
+        let body = toml::to_string(&original).expect("serialize");
+        let parsed: AppSpec = toml::from_str(&body).expect("deserialize");
+        assert_eq!(parsed.image, original.image);
+        assert_eq!(parsed.port, original.port);
+        assert_eq!(parsed.name, original.name);
+    }
+
+    #[test]
+    fn serialize_omits_default_sections() {
+        let spec: AppSpec = toml::from_str(
+            r#"
+            image = "x"
+            port = 80
+            name = "x"
+        "#,
+        )
+        .unwrap();
+        let body = toml::to_string(&spec).unwrap();
+        assert!(!body.contains("[egress]"), "got: {body}");
+        assert!(!body.contains("[env]"), "got: {body}");
+        assert!(!body.contains("[scaling]"), "got: {body}");
+        assert!(!body.contains("[resources]"), "got: {body}");
+        assert!(!body.contains("[runtime]"), "got: {body}");
+    }
+
+    #[test]
+    fn serialize_preserves_egress_and_scaling() {
+        let original: AppSpec = toml::from_str(
+            r#"
+            image = "x"
+            port = 80
+            name = "x"
+            [egress]
+            allow = ["api.openai.com"]
+            [scaling]
+            idle_timeout = "30s"
+        "#,
+        )
+        .unwrap();
+        let body = toml::to_string(&original).unwrap();
+        let parsed: AppSpec = toml::from_str(&body).unwrap();
+        assert_eq!(parsed.egress.allow, vec!["api.openai.com"]);
+        assert_eq!(parsed.scaling.idle_timeout.as_deref(), Some("30s"));
     }
 }

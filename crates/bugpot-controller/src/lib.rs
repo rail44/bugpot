@@ -1,4 +1,4 @@
-//! Per-app lifecycle controller with scale-to-zero.
+//! Per-app lifecycle controller with scale-to-zero and dynamic mutation.
 //!
 //! Each app handle is a small state machine:
 //!
@@ -8,13 +8,14 @@
 //!     └──────────────────┴────────────────────────────────────────┘
 //! ```
 //!
-//! Concurrent starts on the same `Stopped` app are coalesced: the first
-//! request transitions to `Starting` and performs the work; later requests
-//! park on the per-app `Notify` until the transition lands as either
-//! `Running` (return the upstream) or `Stopped` (start failed).
+//! The set of registered apps is held in a `RwLock<HashMap<..>>` so adapter
+//! crates (HTTP admin, future webhook / poller / CLI frontends) can mutate
+//! it at runtime via [`AppController::deploy_app`] / [`AppController::remove_app`].
+//! Per-app `Mutex`-protected state machines coalesce concurrent starts.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -24,8 +25,9 @@ use bugpot_config::AppSpec;
 use bugpot_egress::Egress;
 use bugpot_router::{UpstreamResolver, subdomain_of};
 use bugpot_runtime::{Auth, Runtime};
+use serde::Serialize;
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, RwLock};
 use tracing::{debug, error, info, warn};
 
 /// How long to wait for an app to start accepting TCP connections on its
@@ -56,47 +58,66 @@ enum AppState {
     Stopping,
 }
 
+/// Public, serialisable snapshot of an app's registration.
+#[derive(Debug, Clone, Serialize)]
+pub struct AppView {
+    pub name: String,
+    pub subdomain: String,
+    pub image: String,
+    pub port: u16,
+    pub state: AppStateView,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppStateView {
+    Stopped,
+    Starting,
+    Running,
+    Stopping,
+}
+
 /// Per-app lifecycle controller.
 ///
-/// Created once during startup with every app spec. Hands out upstream
-/// addresses on request (`UpstreamResolver`), starting stopped apps along
-/// the way. A background `idle_stopper_loop` task should be spawned to
-/// reclaim apps that have been idle for too long.
+/// `new` accepts the initial set of specs loaded at startup; subsequent
+/// add/remove happens through [`Self::deploy_app`] / [`Self::remove_app`].
+/// A background `idle_stopper_loop` task should be spawned to reclaim
+/// apps that have been idle for too long.
 #[derive(Debug)]
 pub struct AppController {
     runtime: Arc<Runtime>,
     egress: Arc<Egress>,
+    apps_dir: PathBuf,
     /// Keyed by subdomain (= app name by default).
-    apps: HashMap<String, Arc<AppHandle>>,
+    apps: RwLock<HashMap<String, Arc<AppHandle>>>,
 }
 
 impl AppController {
-    pub fn new(runtime: Arc<Runtime>, egress: Arc<Egress>, specs: Vec<AppSpec>) -> Self {
+    #[must_use]
+    pub fn new(
+        runtime: Arc<Runtime>,
+        egress: Arc<Egress>,
+        apps_dir: PathBuf,
+        specs: Vec<AppSpec>,
+    ) -> Self {
         let mut apps = HashMap::with_capacity(specs.len());
         for spec in specs {
             let name = spec.name().to_owned();
             let key = spec.subdomain().to_owned();
-            let handle = Arc::new(AppHandle {
-                name,
-                spec,
-                inner: Mutex::new(HandleInner {
-                    state: AppState::Stopped,
-                    last_access: Instant::now(),
-                    notify: None,
-                }),
-            });
-            apps.insert(key, handle);
+            apps.insert(key, make_handle(name, spec));
         }
         Self {
             runtime,
             egress,
-            apps,
+            apps_dir,
+            apps: RwLock::new(apps),
         }
     }
 
     /// Eagerly start apps whose `idle_timeout` resolves to "always on".
     pub async fn deploy_always_on(&self) -> Result<()> {
-        for handle in self.apps.values() {
+        let handles = self.snapshot_handles().await;
+        for handle in handles {
             let timeout = handle
                 .spec
                 .scaling
@@ -104,7 +125,7 @@ impl AppController {
                 .map_err(|e| anyhow!("{}: {e}", handle.name))?;
             if timeout.is_none() {
                 info!(app = %handle.name, "eager start (idle_timeout = 0)");
-                self.ensure_running(handle).await?;
+                self.ensure_running(&handle).await?;
             }
         }
         Ok(())
@@ -122,7 +143,7 @@ impl AppController {
     }
 
     async fn sweep_idle(&self) {
-        for handle in self.apps.values() {
+        for handle in self.snapshot_handles().await {
             let timeout = match handle.spec.scaling.resolve_idle_timeout() {
                 Ok(Some(t)) => t,
                 Ok(None) => continue, // always-on
@@ -138,7 +159,7 @@ impl AppController {
             };
             if should_stop {
                 info!(app = %handle.name, "idle timeout reached, stopping");
-                if let Err(e) = self.stop(handle).await {
+                if let Err(e) = self.stop(&handle).await {
                     warn!(app = %handle.name, error = ?e, "stop on idle failed");
                 }
             }
@@ -147,17 +168,132 @@ impl AppController {
 
     /// Stop every app that's currently running. Used on shutdown.
     pub async fn teardown(&self) {
-        for handle in self.apps.values() {
+        for handle in self.snapshot_handles().await {
             let should_stop = {
                 let inner = handle.inner.lock().await;
                 matches!(inner.state, AppState::Running { .. } | AppState::Starting)
             };
             if should_stop {
-                if let Err(e) = self.stop(handle).await {
+                if let Err(e) = self.stop(&handle).await {
                     warn!(app = %handle.name, error = ?e, "stop failed during teardown");
                 }
             }
         }
+    }
+
+    /// Register a new app. Fails if an app with the same name or subdomain
+    /// already exists. The image is pulled before persistence so failure
+    /// leaves no state. If `idle_timeout = 0`, the app is eager-started
+    /// before this call returns.
+    pub async fn deploy_app(&self, mut spec: AppSpec) -> Result<AppView> {
+        let name = spec
+            .name
+            .clone()
+            .ok_or_else(|| anyhow!("spec.name is required for deploy"))?;
+        let subdomain = spec.subdomain().to_owned();
+
+        // Fast-fail on obvious collisions before doing the expensive pull.
+        {
+            let apps = self.apps.read().await;
+            if apps.contains_key(&subdomain) {
+                return Err(anyhow!("subdomain '{subdomain}' already in use"));
+            }
+            if apps.values().any(|h| h.name == name) {
+                return Err(anyhow!("app '{name}' already exists"));
+            }
+        }
+
+        self.runtime
+            .pull_image(&spec.image, Auth::Anonymous)
+            .await
+            .with_context(|| format!("pull image {} for {name}", spec.image))?;
+
+        let toml_path = self.apps_dir.join(format!("{name}.toml"));
+        let toml_body = toml::to_string_pretty(&spec)
+            .with_context(|| format!("serialize spec for {name}"))?;
+        tokio::fs::write(&toml_path, toml_body)
+            .await
+            .with_context(|| format!("write {}", toml_path.display()))?;
+        spec.source_path.clone_from(&toml_path);
+
+        let handle = make_handle(name.clone(), spec.clone());
+
+        {
+            let mut apps = self.apps.write().await;
+            // Re-check under the write lock — a concurrent deploy may have
+            // raced into the same key.
+            if apps.contains_key(&subdomain) {
+                let _ = tokio::fs::remove_file(&toml_path).await;
+                return Err(anyhow!("subdomain '{subdomain}' raced into existence"));
+            }
+            apps.insert(subdomain.clone(), handle.clone());
+        }
+
+        let eager = spec
+            .scaling
+            .resolve_idle_timeout()
+            .map_err(|e| anyhow!("{name}: {e}"))?
+            .is_none();
+        if eager {
+            info!(app = %name, "eager start on deploy");
+            if let Err(e) = self.ensure_running(&handle).await {
+                let _ = self.remove_by_subdomain(&subdomain).await;
+                return Err(e);
+            }
+        }
+
+        Ok(view_of(&handle).await)
+    }
+
+    /// Unregister an app by name. Stops the container (if running) and
+    /// deletes its TOML file.
+    pub async fn remove_app(&self, name: &str) -> Result<()> {
+        let subdomain = {
+            let apps = self.apps.read().await;
+            apps.iter()
+                .find(|(_, h)| h.name == name)
+                .map(|(k, _)| k.clone())
+                .ok_or_else(|| anyhow!("app '{name}' not found"))?
+        };
+        self.remove_by_subdomain(&subdomain).await
+    }
+
+    async fn remove_by_subdomain(&self, subdomain: &str) -> Result<()> {
+        let handle = {
+            let mut apps = self.apps.write().await;
+            apps.remove(subdomain)
+                .ok_or_else(|| anyhow!("subdomain '{subdomain}' not found"))?
+        };
+        if let Err(e) = self.stop(&handle).await {
+            warn!(app = %handle.name, error = ?e, "stop failed during remove");
+        }
+        let toml_path = self.apps_dir.join(format!("{}.toml", handle.name));
+        if toml_path.exists() {
+            if let Err(e) = tokio::fs::remove_file(&toml_path).await {
+                warn!(path = %toml_path.display(), error = %e, "remove toml failed");
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn list_apps(&self) -> Vec<AppView> {
+        let mut views = Vec::new();
+        for handle in self.snapshot_handles().await {
+            views.push(view_of(&handle).await);
+        }
+        views
+    }
+
+    pub async fn get_app(&self, name: &str) -> Option<AppView> {
+        let handle = {
+            let apps = self.apps.read().await;
+            apps.values().find(|h| h.name == name).cloned()
+        }?;
+        Some(view_of(&handle).await)
+    }
+
+    async fn snapshot_handles(&self) -> Vec<Arc<AppHandle>> {
+        self.apps.read().await.values().cloned().collect()
     }
 
     /// Ensure the app is running, coalescing concurrent starts. Returns
@@ -288,11 +424,43 @@ impl AppController {
     }
 }
 
+fn make_handle(name: String, spec: AppSpec) -> Arc<AppHandle> {
+    Arc::new(AppHandle {
+        name,
+        spec,
+        inner: Mutex::new(HandleInner {
+            state: AppState::Stopped,
+            last_access: Instant::now(),
+            notify: None,
+        }),
+    })
+}
+
+async fn view_of(handle: &Arc<AppHandle>) -> AppView {
+    let snapshot = handle.inner.lock().await.state;
+    let state = match snapshot {
+        AppState::Stopped => AppStateView::Stopped,
+        AppState::Starting => AppStateView::Starting,
+        AppState::Running { .. } => AppStateView::Running,
+        AppState::Stopping => AppStateView::Stopping,
+    };
+    AppView {
+        name: handle.name.clone(),
+        subdomain: handle.spec.subdomain().to_owned(),
+        image: handle.spec.image.clone(),
+        port: handle.spec.port,
+        state,
+    }
+}
+
 #[async_trait]
 impl UpstreamResolver for AppController {
     async fn resolve(&self, host: &str) -> Option<SocketAddr> {
         let subdomain = subdomain_of(host)?;
-        let handle = self.apps.get(subdomain)?.clone();
+        let handle = {
+            let apps = self.apps.read().await;
+            apps.get(subdomain)?.clone()
+        };
         match self.ensure_running(&handle).await {
             Ok(ip) => Some(SocketAddr::from((ip, handle.spec.port))),
             Err(e) => {

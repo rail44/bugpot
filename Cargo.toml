@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "cmd/bugpot",
     "crates/bugpot-config",
+    "crates/bugpot-controller",
     "crates/bugpot-egress",
     "crates/bugpot-router",
     "crates/bugpot-runtime",
@@ -12,7 +13,7 @@ members = [
 [workspace.package]
 edition = "2024"
 license = "MIT"
-rust-version = "1.85"
+rust-version = "1.87"
 authors = ["Satoshi Amemiya <amemiya@proton.me>"]
 description = "Internal Heroku-like platform for experimental apps"
 repository = "https://github.com/rail44/bugpot"
@@ -31,6 +32,7 @@ walkdir = "2"
 async-trait = "0.1"
 
 bugpot-config = { path = "crates/bugpot-config" }
+bugpot-controller = { path = "crates/bugpot-controller" }
 bugpot-egress = { path = "crates/bugpot-egress" }
 bugpot-router = { path = "crates/bugpot-router" }
 bugpot-runtime = { path = "crates/bugpot-runtime" }
