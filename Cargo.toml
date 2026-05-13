@@ -36,6 +36,7 @@ thiserror = "2"
 metrics = "0.24"
 humantime = "2"
 futures = "0.3"
+inotify = { version = "0.11", default-features = false, features = ["stream"] }
 
 bugpot-admin = { path = "crates/bugpot-admin" }
 bugpot-config = { path = "crates/bugpot-config" }
