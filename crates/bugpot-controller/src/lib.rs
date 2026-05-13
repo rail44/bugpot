@@ -25,7 +25,7 @@ use bugpot_config::{AppSpec, AuthConfig, RegistryCredential, registry_host};
 use bugpot_egress::Egress;
 use bugpot_router::{UpstreamResolver, subdomain_of};
 use bugpot_runtime::{Auth, Runtime};
-use metrics::{gauge, histogram};
+use metrics::{counter, gauge, histogram};
 use serde::Serialize;
 use thiserror::Error;
 use tokio::net::TcpStream;
@@ -111,8 +111,9 @@ pub enum AppStateView {
 ///
 /// `new` accepts the initial set of specs loaded at startup; subsequent
 /// add/remove happens through [`Self::deploy_app`] / [`Self::remove_app`].
-/// A background `idle_stopper_loop` task should be spawned to reclaim
-/// apps that have been idle for too long.
+/// A background [`Self::sweep_loop`] task should be spawned to reclaim
+/// apps whose container died unexpectedly or that have been idle too
+/// long.
 #[derive(Debug)]
 pub struct AppController {
     runtime: Arc<Runtime>,
@@ -215,33 +216,65 @@ impl AppController {
         Ok(())
     }
 
-    /// Background task: stop apps idle beyond their configured timeout.
+    /// Background task: sweeps registered apps periodically to:
+    ///
+    /// 1. Reclaim containers whose init has exited unexpectedly (crash,
+    ///    OOM, etc.) so the next request triggers a fresh `do_start`
+    ///    instead of being proxied to a dead IP.
+    /// 2. Stop apps that have been idle beyond their `scaling.idle_timeout`
+    ///    (scale-to-zero).
+    ///
     /// Consumes an `Arc<Self>` so it can be `tokio::spawn`ed.
-    pub async fn idle_stopper_loop(self: Arc<Self>, tick: Duration) {
+    pub async fn sweep_loop(self: Arc<Self>, tick: Duration) {
         let mut interval = tokio::time::interval(tick);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
-            self.sweep_idle().await;
+            self.sweep().await;
         }
     }
 
-    async fn sweep_idle(&self) {
+    async fn sweep(&self) {
         for handle in self.snapshot_handles().await {
+            // Only look at apps we believe are running. Starting /
+            // Stopping / Stopped handles are already in motion or
+            // already-cleaned.
+            let state_snapshot = {
+                let inner = handle.inner.lock().await;
+                inner.state
+            };
+            if !matches!(state_snapshot, AppState::Running { .. }) {
+                continue;
+            }
+
+            // 1. Liveness: did the container die under us?
+            if !self.runtime.is_container_running(&handle.name) {
+                info!(app = %handle.name, "container exited unexpectedly, cleaning up");
+                counter!(
+                    "bugpot_container_crashes_total",
+                    "app" => handle.name.clone(),
+                )
+                .increment(1);
+                if let Err(e) = self.stop(&handle).await {
+                    warn!(app = %handle.name, error = ?e, "cleanup of dead container failed");
+                }
+                continue;
+            }
+
+            // 2. Idle timeout (scale-to-zero). always-on apps skip.
             let timeout = match handle.spec.scaling.resolve_idle_timeout() {
                 Ok(Some(t)) => t,
-                Ok(None) => continue, // always-on
+                Ok(None) => continue,
                 Err(e) => {
                     warn!(app = %handle.name, "bad idle_timeout: {e}");
                     continue;
                 }
             };
-            let should_stop = {
+            let last_access = {
                 let inner = handle.inner.lock().await;
-                matches!(inner.state, AppState::Running { .. })
-                    && inner.last_access.elapsed() >= timeout
+                inner.last_access
             };
-            if should_stop {
+            if last_access.elapsed() >= timeout {
                 info!(app = %handle.name, "idle timeout reached, stopping");
                 if let Err(e) = self.stop(&handle).await {
                     warn!(app = %handle.name, error = ?e, "stop on idle failed");

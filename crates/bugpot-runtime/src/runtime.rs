@@ -237,6 +237,23 @@ impl Runtime {
         Ok(running)
     }
 
+    /// Quick liveness check: does libcontainer believe the container for
+    /// `id` is still `Running`?
+    ///
+    /// `Container::load` invokes `refresh_status()`, which reads
+    /// `/proc/<pid>` to detect zombie / dead processes — so a container
+    /// whose init has crashed, OOM'd, or been `kill -9`'d shows up as
+    /// `Stopped` here, not (stale) `Running`. PID reuse is theoretically
+    /// possible but rare on a single-host setup; we accept the limit.
+    #[must_use]
+    pub fn is_container_running(&self, id: &str) -> bool {
+        let container_root = self.containers_dir.join(id);
+        if !container_root.exists() {
+            return false;
+        }
+        Container::load(container_root).is_ok_and(|c| c.status() == ContainerStatus::Running)
+    }
+
     /// Stop and clean up a running container.
     ///
     /// `async` for API symmetry with `start_app` and to leave room for
