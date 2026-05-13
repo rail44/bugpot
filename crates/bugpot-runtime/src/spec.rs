@@ -323,8 +323,8 @@ fn build_mounts() -> Vec<Mount> {
     // once bugpot-egress wires up name resolution. The actual source path
     // is filled in at start time by the caller if it wants to override.
     // Until then, leave the host's resolv.conf bound in read-only.
-    if Path::new("/etc/resolv.conf").exists() {
-        if let Ok(m) = MountBuilder::default()
+    if Path::new("/etc/resolv.conf").exists()
+        && let Ok(m) = MountBuilder::default()
             .destination(PathBuf::from("/etc/resolv.conf"))
             .source(PathBuf::from("/etc/resolv.conf"))
             .typ("bind")
@@ -335,9 +335,8 @@ fn build_mounts() -> Vec<Mount> {
                 "nodev".to_owned(),
             ])
             .build()
-        {
-            mounts.push(m);
-        }
+    {
+        mounts.push(m);
     }
 
     mounts

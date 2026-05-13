@@ -170,6 +170,63 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         }
     }
 
+    /// Re-bind to containers that survived a previous bugpot run.
+    ///
+    /// For each registered app whose libcontainer state reports
+    /// `Running`, ask the egress layer to re-register the existing netns
+    /// IP + allowlist (no new veth / netns is created). The app's handle
+    /// transitions directly into `Running`, so the very next
+    /// `ensure_running` short-circuits — there is no cold-start, no
+    /// image pull, no port readiness probe.
+    ///
+    /// **Lost on reattach:** the container's stdout/stderr forwarder was
+    /// owned by the previous bugpot process; the write-end of the pipe
+    /// is gone with that process. The container is still alive but its
+    /// logs no longer flow through bugpot's tracing pipeline. Until
+    /// #21 lands, journalctl on the container's app-side mount is the
+    /// only way to retrieve them.
+    ///
+    /// Containers that look running to libcontainer but have no
+    /// discovered egress endpoint are left in `Stopped` — the next
+    /// request triggers a fresh cold start. This is a conservative
+    /// recovery path: there is no way to safely manufacture the missing
+    /// IP, and we would rather rebuild than route traffic to a netns
+    /// we do not fully understand.
+    pub async fn reattach_running(&self) {
+        for handle in self.snapshot_handles().await {
+            let name = &handle.name;
+            if !self.runtime.is_container_running(name) {
+                continue;
+            }
+            match self
+                .egress
+                .reattach_endpoint(name, handle.spec.egress.allow.clone())
+                .await
+            {
+                Ok(Some(ep)) => {
+                    {
+                        let mut inner = handle.inner.lock().await;
+                        inner.state = AppState::Running {
+                            container_ip: ep.container_ip,
+                        };
+                        inner.last_access = Instant::now();
+                    }
+                    info!(app = %name, container_ip = %ep.container_ip, "reattached to running container");
+                }
+                Ok(None) => {
+                    warn!(
+                        app = %name,
+                        "container is running but no netns IP was discovered; \
+                         leaving as Stopped — next request will cold-start"
+                    );
+                }
+                Err(e) => {
+                    warn!(app = %name, error = ?e, "reattach failed; leaving as Stopped");
+                }
+            }
+        }
+    }
+
     /// Eagerly start apps whose `idle_timeout` resolves to "always on".
     ///
     /// Concurrent: all qualifying apps' `ensure_running` futures are
@@ -339,10 +396,8 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
                 let inner = handle.inner.lock().await;
                 matches!(inner.state, AppState::Running { .. } | AppState::Starting)
             };
-            if should_stop {
-                if let Err(e) = self.stop(&handle).await {
-                    warn!(app = %handle.name, error = ?e, "stop failed during teardown");
-                }
+            if should_stop && let Err(e) = self.stop(&handle).await {
+                warn!(app = %handle.name, error = ?e, "stop failed during teardown");
             }
         }
     }
@@ -441,10 +496,10 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
             warn!(app = %handle.name, error = ?e, "stop failed during remove");
         }
         let toml_path = self.apps_dir.join(format!("{}.toml", handle.name));
-        if toml_path.exists() {
-            if let Err(e) = tokio::fs::remove_file(&toml_path).await {
-                warn!(path = %toml_path.display(), error = %e, "remove toml failed");
-            }
+        if toml_path.exists()
+            && let Err(e) = tokio::fs::remove_file(&toml_path).await
+        {
+            warn!(path = %toml_path.display(), error = %e, "remove toml failed");
         }
         Ok(())
     }
@@ -775,12 +830,18 @@ mod tests {
     struct MockEgress {
         allocate_fail: StdMutex<bool>,
         endpoints: StdMutex<HashMap<String, Endpoint>>,
+        /// Pre-discovered endpoints — the reattach analogue of what real
+        /// `Egress::new` would have found by scanning `bugpot-*` netns.
+        discovered: StdMutex<HashMap<String, Ipv4Addr>>,
         calls: StdMutex<Vec<String>>,
     }
 
     impl MockEgress {
         fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
+        }
+        fn set_discovered(&self, app_id: &str, ip: Ipv4Addr) {
+            self.discovered.lock().unwrap().insert(app_id.to_owned(), ip);
         }
     }
 
@@ -815,6 +876,29 @@ mod tests {
                 .push(format!("release_endpoint({app_id})"));
             self.endpoints.lock().unwrap().remove(app_id);
             Ok(())
+        }
+
+        async fn reattach_endpoint(
+            &self,
+            app_id: &str,
+            _allowlist: Vec<String>,
+        ) -> anyhow::Result<Option<Endpoint>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("reattach_endpoint({app_id})"));
+            let Some(container_ip) = self.discovered.lock().unwrap().remove(app_id) else {
+                return Ok(None);
+            };
+            let ep = Endpoint {
+                container_ip,
+                netns_path: PathBuf::from(format!("/run/netns/mock-{app_id}")),
+            };
+            self.endpoints
+                .lock()
+                .unwrap()
+                .insert(app_id.to_owned(), ep.clone());
+            Ok(Some(ep))
         }
     }
 
@@ -899,6 +983,53 @@ mod tests {
         assert!(
             !controller.runtime.calls().iter().any(|c| c.starts_with("start_app")),
             "start_app must not be called when pull fails"
+        );
+    }
+
+    /// `reattach_running` should put a surviving container straight into
+    /// `Running` (no cold-start path) and skip apps with no live
+    /// container.
+    #[tokio::test]
+    async fn reattach_running_recovers_live_containers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let controller = make_controller(
+            vec![spec_with_name("alpha"), spec_with_name("beta")],
+            tmp.path().to_owned(),
+        );
+        // alpha is alive with a recovered IP; beta is gone.
+        controller.runtime.set_running("alpha", true);
+        controller
+            .egress
+            .set_discovered("alpha", Ipv4Addr::new(10, 0, 0, 42));
+
+        controller.reattach_running().await;
+
+        let alpha_state = {
+            let apps = controller.apps.read().await;
+            apps.get("alpha").unwrap().inner.lock().await.state
+        };
+        let beta_state = {
+            let apps = controller.apps.read().await;
+            apps.get("beta").unwrap().inner.lock().await.state
+        };
+        assert!(
+            matches!(alpha_state, AppState::Running { container_ip } if container_ip == Ipv4Addr::new(10, 0, 0, 42)),
+            "alpha should be Running with recovered IP, got {alpha_state:?}"
+        );
+        assert!(
+            matches!(beta_state, AppState::Stopped),
+            "beta should stay Stopped, got {beta_state:?}"
+        );
+        // The mock should NOT have called allocate_endpoint — reattach
+        // must never trigger the cold-start path.
+        let eg_calls = controller.egress.calls();
+        assert!(
+            eg_calls.iter().any(|c| c == "reattach_endpoint(alpha)"),
+            "expected reattach_endpoint(alpha); got {eg_calls:?}"
+        );
+        assert!(
+            !eg_calls.iter().any(|c| c.starts_with("allocate_endpoint")),
+            "allocate_endpoint must not be called during reattach; got {eg_calls:?}"
         );
     }
 

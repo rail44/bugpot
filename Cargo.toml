@@ -15,7 +15,7 @@ members = [
 [workspace.package]
 edition = "2024"
 license = "MIT"
-rust-version = "1.87"
+rust-version = "1.95"
 authors = ["Satoshi Amemiya <amemiya@proton.me>"]
 description = "Internal Heroku-like platform for experimental apps"
 repository = "https://github.com/rail44/bugpot"

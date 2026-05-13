@@ -47,6 +47,13 @@ impl IpAllocator {
         self.in_use.remove(&ip);
     }
 
+    /// Mark `ip` as already taken without going through `allocate`. Used at
+    /// startup to seed the in-use set with addresses recovered from the
+    /// kernel (live netns from a previous bugpot instance).
+    pub fn mark_used(&mut self, ip: Ipv4Addr) {
+        self.in_use.insert(ip);
+    }
+
     #[must_use]
     pub fn is_allocated(&self, ip: Ipv4Addr) -> bool {
         self.in_use.contains(&ip)

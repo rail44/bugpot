@@ -143,6 +143,76 @@ fn s(parts: &[&str]) -> IpCmd {
     parts.iter().map(|p| (*p).to_string()).collect()
 }
 
+/// List the app ids of all `bugpot-*` netns present on the host.
+///
+/// Returns just the suffix after `bugpot-` (i.e. the app id), since
+/// callers match these against loaded `AppSpec` names. Missing `ip` or
+/// no matching netns both produce an empty result.
+pub async fn list_app_namespaces() -> anyhow::Result<Vec<String>> {
+    let output = Command::new("ip")
+        .args(["netns", "list"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn `ip netns list`: {e}"))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "`ip netns list` failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(parse_app_namespaces(&String::from_utf8_lossy(&output.stdout)))
+}
+
+fn parse_app_namespaces(s: &str) -> Vec<String> {
+    s.lines()
+        .filter_map(|l| {
+            // Each line is `<name>` or `<name> (id: <n>)` — we only want
+            // the leading whitespace-delimited token.
+            l.split_whitespace().next()
+        })
+        .filter_map(|name| name.strip_prefix(NS_PREFIX))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Read the IPv4 address of `eth0` inside the netns `bugpot-<app_id>`.
+/// `Ok(None)` when the interface exists but carries no inet address; an
+/// error when the netns or interface itself is gone.
+pub async fn read_eth0_ipv4(app_id: &str) -> anyhow::Result<Option<Ipv4Addr>> {
+    let ns = format!("{NS_PREFIX}{app_id}");
+    let output = Command::new("ip")
+        .args(["-n", &ns, "-4", "addr", "show", "eth0"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn `ip -n {ns} addr show eth0`: {e}"))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "`ip -n {ns} -4 addr show eth0` failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(parse_inet_addr(&String::from_utf8_lossy(&output.stdout)))
+}
+
+fn parse_inet_addr(s: &str) -> Option<Ipv4Addr> {
+    // `ip addr show` output:
+    //   2: eth0@if5: <UP,LOWER_UP> mtu 1500 ...
+    //       inet 172.20.0.2/24 scope global eth0
+    //          valid_lft forever preferred_lft forever
+    for line in s.lines() {
+        if let Some(rest) = line.trim_start().strip_prefix("inet ")
+            && let Some(cidr) = rest.split_whitespace().next()
+            && let Some((ip, _prefix)) = cidr.split_once('/')
+            && let Ok(addr) = ip.parse::<Ipv4Addr>()
+        {
+            return Some(addr);
+        }
+    }
+    None
+}
+
 /// Run a sequence of `ip` commands. Errors are returned with the failing
 /// command included for diagnosis.
 pub async fn run_cmds(cmds: Vec<IpCmd>) -> anyhow::Result<()> {
@@ -235,6 +305,36 @@ mod tests {
                     && c.contains(&"eth0".to_string())),
             "rename to eth0 must happen inside the netns"
         );
+    }
+
+    #[test]
+    fn parse_app_namespaces_filters_to_bugpot_prefix() {
+        let out = "bugpot-alpha\nbugpot-beta (id: 1)\nother-ns\nbugpot-with-dashes\n";
+        let mut got = parse_app_namespaces(out);
+        got.sort();
+        assert_eq!(got, vec!["alpha", "beta", "with-dashes"]);
+    }
+
+    #[test]
+    fn parse_app_namespaces_handles_empty() {
+        assert!(parse_app_namespaces("").is_empty());
+    }
+
+    #[test]
+    fn parse_inet_addr_picks_v4() {
+        let out = "2: eth0@if5: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500\n    \
+            inet 172.20.0.2/24 scope global eth0\n       \
+            valid_lft forever preferred_lft forever\n";
+        assert_eq!(
+            parse_inet_addr(out),
+            Some("172.20.0.2".parse::<Ipv4Addr>().unwrap())
+        );
+    }
+
+    #[test]
+    fn parse_inet_addr_missing_when_no_address() {
+        let out = "2: eth0@if5: <BROADCAST,MULTICAST> mtu 1500\n";
+        assert_eq!(parse_inet_addr(out), None);
     }
 
     #[test]

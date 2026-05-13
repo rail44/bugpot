@@ -151,6 +151,17 @@ pub trait EgressOps: Send + Sync + std::fmt::Debug + 'static {
         allowlist: Vec<String>,
     ) -> impl Future<Output = anyhow::Result<Endpoint>> + Send;
     fn release_endpoint(&self, app_id: &str) -> impl Future<Output = anyhow::Result<()>> + Send;
+    /// Re-register an endpoint that was already provisioned by a previous
+    /// bugpot run. Returns `Ok(None)` when no live netns matches `app_id`
+    /// (no IP was discovered for it at startup), `Ok(Some(_))` when the
+    /// app has been re-bound to its existing IP + allowlist without
+    /// touching netns/veth/nft. Does not allocate or release host
+    /// resources.
+    fn reattach_endpoint(
+        &self,
+        app_id: &str,
+        allowlist: Vec<String>,
+    ) -> impl Future<Output = anyhow::Result<Option<Endpoint>>> + Send;
 }
 
 /// In-memory record so we can free addresses on release and apply allowlist
@@ -166,6 +177,10 @@ pub struct Egress {
     config: EgressConfig,
     allocator: Mutex<IpAllocator>,
     apps: Mutex<std::collections::HashMap<String, AllocatedApp>>,
+    /// IPs recovered from live `bugpot-*` netns at startup. Drained by
+    /// `reattach_endpoint` as each app gets reclaimed by the controller;
+    /// anything left over after reattach is an orphan netns (see #35).
+    discovered_endpoints: Mutex<std::collections::HashMap<String, Ipv4Addr>>,
     registry: Arc<AppRegistry>,
     nft_table: String,
     // Holding the server keeps the DNS task alive for the lifetime of Egress.
@@ -237,11 +252,23 @@ impl Egress {
         let probe = allocator.allocate()?;
         allocator.release(probe);
 
+        // Discover endpoints left behind by a previous bugpot run so
+        // their IPs don't get re-allocated under another app. The
+        // controller drains this map via `reattach_endpoint` for apps
+        // that are still actually running; the rest remain orphans
+        // (#35).
+        let discovered = discover_endpoints().await;
+        for (app_id, ip) in &discovered {
+            tracing::info!(app = %app_id, %ip, "discovered existing endpoint");
+            allocator.mark_used(*ip);
+        }
+
         Ok(Self {
             nft_table: config.nft_table.clone(),
             config,
             allocator: Mutex::new(allocator),
             apps: Mutex::new(std::collections::HashMap::new()),
+            discovered_endpoints: Mutex::new(discovered),
             registry,
             _dns_server: Some(server),
         })
@@ -289,6 +316,34 @@ impl EgressOps for Egress {
         Ok(ep)
     }
 
+    async fn reattach_endpoint(
+        &self,
+        app_id: &str,
+        allowlist: Vec<String>,
+    ) -> anyhow::Result<Option<Endpoint>> {
+        let Some(container_ip) = self.discovered_endpoints.lock().remove(app_id) else {
+            return Ok(None);
+        };
+        let parsed = Allowlist::parse(allowlist)?;
+        let plan = EndpointPlan::new(app_id, container_ip, self.config.subnet);
+        let ep = Endpoint {
+            container_ip,
+            netns_path: plan.ns_path.clone(),
+        };
+        self.registry.insert(
+            container_ip,
+            AppEntry {
+                app_id: app_id.to_string(),
+                allowlist: parsed,
+            },
+        );
+        self.apps.lock().insert(
+            app_id.to_string(),
+            AllocatedApp { container_ip, plan },
+        );
+        Ok(Some(ep))
+    }
+
     async fn release_endpoint(&self, app_id: &str) -> anyhow::Result<()> {
         let Some(app) = self.apps.lock().remove(app_id) else {
             return Ok(());
@@ -327,6 +382,35 @@ impl Egress {
         );
         Ok(())
     }
+}
+
+/// Scan `bugpot-*` netns left over from a prior bugpot instance and
+/// recover the IP of each one's `eth0`. Failures (missing `ip`,
+/// half-deleted netns, no inet on eth0) are logged and skipped — they
+/// must not block startup.
+async fn discover_endpoints() -> std::collections::HashMap<String, Ipv4Addr> {
+    let mut out = std::collections::HashMap::new();
+    let ns_list = match netns::list_app_namespaces().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "list bugpot netns failed; reattach disabled this run");
+            return out;
+        }
+    };
+    for app_id in ns_list {
+        match netns::read_eth0_ipv4(&app_id).await {
+            Ok(Some(ip)) => {
+                out.insert(app_id, ip);
+            }
+            Ok(None) => {
+                tracing::warn!(app = %app_id, "existing netns has no inet address on eth0; skipping");
+            }
+            Err(e) => {
+                tracing::warn!(app = %app_id, error = %e, "read eth0 ip failed; skipping");
+            }
+        }
+    }
+    out
 }
 
 /// Thin adapter from `hickory_resolver` to our [`Upstream`] trait.
