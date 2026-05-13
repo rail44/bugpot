@@ -155,8 +155,8 @@ name = "bugpot"
 version = "0.0.1"
 dependencies = [
  "anyhow",
- "async-trait",
  "bugpot-config",
+ "bugpot-controller",
  "bugpot-egress",
  "bugpot-router",
  "bugpot-runtime",
@@ -175,6 +175,22 @@ dependencies = [
  "toml",
  "tracing",
  "walkdir",
+]
+
+[[package]]
+name = "bugpot-controller"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bugpot-config",
+ "bugpot-egress",
+ "bugpot-router",
+ "bugpot-runtime",
+ "serde",
+ "tokio",
+ "toml",
+ "tracing",
 ]
 
 [[package]]
