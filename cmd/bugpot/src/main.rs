@@ -22,6 +22,7 @@ use tracing_subscriber::EnvFilter;
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:8080";
 const DEFAULT_APPS_DIR: &str = "./apps";
+const DEFAULT_AUTH_FILE: &str = "/etc/bugpot/auth.toml";
 const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(10);
 
 #[tokio::main]
@@ -46,6 +47,15 @@ async fn main() -> Result<()> {
     let apps = bugpot_config::load_apps(&apps_dir)?;
     info!(count = apps.len(), dir = %apps_dir.display(), "loaded apps");
 
+    let auth_file = std::env::var("BUGPOT_AUTH_FILE")
+        .map_or_else(|_| PathBuf::from(DEFAULT_AUTH_FILE), PathBuf::from);
+    let auth = bugpot_config::load_auth(&auth_file).context("load auth.toml")?;
+    info!(
+        file = %auth_file.display(),
+        registries = auth.registries.len(),
+        "loaded registry auth",
+    );
+
     // Egress (bridge + DNS + nftables): idempotent across runs.
     let egress_cfg = EgressConfig::default();
     info!(
@@ -65,7 +75,13 @@ async fn main() -> Result<()> {
     let runtime = Arc::new(Runtime::new(state_dir).context("init runtime")?);
 
     // Controller owns per-app lifecycle.
-    let controller = Arc::new(AppController::new(runtime, egress, apps_dir.clone(), apps));
+    let controller = Arc::new(AppController::new(
+        runtime,
+        egress,
+        apps_dir.clone(),
+        auth,
+        apps,
+    ));
     if let Err(e) = controller.deploy_always_on().await {
         error!(error = ?e, "eager-start failed; rolling back");
         controller.teardown().await;
