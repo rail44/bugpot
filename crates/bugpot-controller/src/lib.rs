@@ -420,21 +420,24 @@ impl AppController {
             .record(phase_start.elapsed().as_secs_f64());
 
         let phase_start = Instant::now();
-        if let Err(e) = self
+        let image_id = match self
             .runtime
             .pull_image(&handle.spec.image, self.resolve_auth(&handle.spec.image))
             .await
         {
-            let _ = self.egress.release_endpoint(name).await;
-            return Err(e).with_context(|| format!("pull image for {name}"));
-        }
+            Ok(id) => id,
+            Err(e) => {
+                let _ = self.egress.release_endpoint(name).await;
+                return Err(e).with_context(|| format!("pull image for {name}"));
+            }
+        };
         histogram!("bugpot_cold_start_seconds", "phase" => "pull")
             .record(phase_start.elapsed().as_secs_f64());
 
         let phase_start = Instant::now();
         let running = match self
             .runtime
-            .start_app(&handle.spec, Some(&endpoint.netns_path))
+            .start_app(&handle.spec, &image_id, Some(&endpoint.netns_path))
             .await
         {
             Ok(r) => r,
