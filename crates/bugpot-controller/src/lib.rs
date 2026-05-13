@@ -68,8 +68,17 @@ const READINESS_POLL: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
 struct AppHandle {
+    /// Immutable identity: the TOML stem (or `AppSpec.name` field).
+    /// Used as the primary key in `AppMaps.by_name`.
     name: String,
-    spec: AppSpec,
+    /// Cached subdomain at construction time. Subdomain is treated as
+    /// part of identity (changes go through delete + re-add) so it
+    /// doesn't need to be re-derived on every routing lookup.
+    subdomain: String,
+    /// Mutable spec fields (image, port, env, etc.). Wrapped in
+    /// `RwLock` so future PUT-style updates can mutate in place
+    /// without rebuilding the handle.
+    spec: RwLock<AppSpec>,
     inner: Mutex<HandleInner>,
 }
 
@@ -108,6 +117,17 @@ pub enum AppStateView {
     Stopping,
 }
 
+/// Both registration maps under a single lock so insert / remove are
+/// atomic across the (name, subdomain) pair. Name is the primary key
+/// (used by `get_app` / `remove_app` / `cleanup`); subdomain is a
+/// reverse index used by `UpstreamResolver::resolve` to route HTTP
+/// requests in O(1).
+#[derive(Debug, Default)]
+struct AppMaps {
+    by_name: HashMap<String, Arc<AppHandle>>,
+    by_subdomain: HashMap<String, String>,
+}
+
 /// Per-app lifecycle controller.
 ///
 /// `new` accepts the initial set of specs loaded at startup; subsequent
@@ -121,8 +141,7 @@ pub struct AppController<R: RuntimeOps, E: EgressOps> {
     egress: Arc<E>,
     apps_dir: PathBuf,
     auth: AuthConfig,
-    /// Keyed by subdomain (= app name by default).
-    apps: RwLock<HashMap<String, Arc<AppHandle>>>,
+    apps: RwLock<AppMaps>,
     /// Last-seen cgroup `cpu_usec` per app, used to compute deltas for
     /// the `bugpot_app_cpu_microseconds_total` counter across sweeps.
     /// Cleared when an app is stopped so the next run starts from 0 —
@@ -145,20 +164,22 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         auth: AuthConfig,
         specs: Vec<AppSpec>,
     ) -> Self {
-        let mut apps = HashMap::with_capacity(specs.len());
+        let mut maps = AppMaps::default();
         for spec in specs {
             let name = spec.name().to_owned();
-            let key = spec.subdomain().to_owned();
-            apps.insert(key, make_handle(name, spec));
+            let subdomain = spec.subdomain().to_owned();
+            let handle = make_handle(spec);
+            maps.by_subdomain.insert(subdomain, name.clone());
+            maps.by_name.insert(name, handle);
         }
         #[allow(clippy::cast_precision_loss)]
-        gauge!("bugpot_apps_active").set(apps.len() as f64);
+        gauge!("bugpot_apps_active").set(maps.by_name.len() as f64);
         Self {
             runtime,
             egress,
             apps_dir,
             auth,
-            apps: RwLock::new(apps),
+            apps: RwLock::new(maps),
             cpu_baselines: tokio::sync::Mutex::new(HashMap::new()),
             reattach_done: AtomicBool::new(false),
         }
@@ -219,11 +240,8 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
             if !self.runtime.is_container_running(name) {
                 continue;
             }
-            match self
-                .egress
-                .reattach_endpoint(name, handle.spec.egress.allow.clone())
-                .await
-            {
+            let allowlist = handle.spec.read().await.egress.allow.clone();
+            match self.egress.reattach_endpoint(name, allowlist).await {
                 Ok(Some(ep)) => {
                     {
                         let mut inner = handle.inner.lock().await;
@@ -303,6 +321,8 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         for handle in handles {
             let timeout = handle
                 .spec
+                .read()
+                .await
                 .scaling
                 .resolve_idle_timeout()
                 .map_err(|e| anyhow!("{}: {e}", handle.name))?;
@@ -388,7 +408,8 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
             }
 
             // 3. Idle timeout (scale-to-zero). always-on apps skip.
-            let timeout = match handle.spec.scaling.resolve_idle_timeout() {
+            let idle_resolved = handle.spec.read().await.scaling.resolve_idle_timeout();
+            let timeout = match idle_resolved {
                 Ok(Some(t)) => t,
                 Ok(None) => continue,
                 Err(e) => {
@@ -467,12 +488,12 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
 
         // Fast-fail on obvious collisions before doing the expensive pull.
         {
-            let apps = self.apps.read().await;
-            if apps.contains_key(&subdomain) {
-                return Err(DeployError::SubdomainTaken(subdomain));
-            }
-            if apps.values().any(|h| h.name == name) {
+            let maps = self.apps.read().await;
+            if maps.by_name.contains_key(&name) {
                 return Err(DeployError::AlreadyExists(name));
+            }
+            if maps.by_subdomain.contains_key(&subdomain) {
+                return Err(DeployError::SubdomainTaken(subdomain));
             }
         }
 
@@ -493,17 +514,22 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
             .with_context(|| format!("write {}", toml_path.display()))?;
         spec.source_path.clone_from(&toml_path);
 
-        let handle = make_handle(name.clone(), spec.clone());
+        let handle = make_handle(spec.clone());
 
         {
-            let mut apps = self.apps.write().await;
+            let mut maps = self.apps.write().await;
             // Re-check under the write lock — a concurrent deploy may have
-            // raced into the same key.
-            if apps.contains_key(&subdomain) {
+            // raced into the same keys.
+            if maps.by_name.contains_key(&name) {
+                let _ = tokio::fs::remove_file(&toml_path).await;
+                return Err(DeployError::AlreadyExists(name));
+            }
+            if maps.by_subdomain.contains_key(&subdomain) {
                 let _ = tokio::fs::remove_file(&toml_path).await;
                 return Err(DeployError::SubdomainTaken(subdomain));
             }
-            apps.insert(subdomain.clone(), handle.clone());
+            maps.by_subdomain.insert(subdomain.clone(), name.clone());
+            maps.by_name.insert(name.clone(), handle.clone());
         }
         gauge!("bugpot_apps_active").increment(1.0);
 
@@ -515,9 +541,9 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         if eager {
             info!(app = %name, "eager start on deploy");
             if let Err(e) = self.ensure_running(&handle).await {
-                // remove_by_subdomain decrements the gauge to keep it
-                // balanced with the increment above.
-                let _ = self.remove_by_subdomain(&subdomain).await;
+                // remove_by_name decrements the gauge to keep it balanced
+                // with the increment above.
+                let _ = self.remove_by_name(&name).await;
                 return Err(DeployError::StartFailed(e));
             }
         }
@@ -528,23 +554,21 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
     /// Unregister an app by name. Stops the container (if running) and
     /// deletes its TOML file.
     pub async fn remove_app(&self, name: &str) -> std::result::Result<(), RemoveError> {
-        let subdomain = {
-            let apps = self.apps.read().await;
-            apps.iter()
-                .find(|(_, h)| h.name == name)
-                .map(|(k, _)| k.clone())
-                .ok_or_else(|| RemoveError::NotFound(name.to_owned()))?
-        };
-        self.remove_by_subdomain(&subdomain)
-            .await
-            .map_err(RemoveError::Internal)
+        if !self.apps.read().await.by_name.contains_key(name) {
+            return Err(RemoveError::NotFound(name.to_owned()));
+        }
+        self.remove_by_name(name).await.map_err(RemoveError::Internal)
     }
 
-    async fn remove_by_subdomain(&self, subdomain: &str) -> Result<()> {
+    async fn remove_by_name(&self, name: &str) -> Result<()> {
         let handle = {
-            let mut apps = self.apps.write().await;
-            apps.remove(subdomain)
-                .ok_or_else(|| anyhow!("subdomain '{subdomain}' not found"))?
+            let mut maps = self.apps.write().await;
+            let handle = maps
+                .by_name
+                .remove(name)
+                .ok_or_else(|| anyhow!("app '{name}' not found"))?;
+            maps.by_subdomain.remove(&handle.subdomain);
+            handle
         };
         gauge!("bugpot_apps_active").decrement(1.0);
         if let Err(e) = self.stop(&handle).await {
@@ -568,15 +592,12 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
     }
 
     pub async fn get_app(&self, name: &str) -> Option<AppView> {
-        let handle = {
-            let apps = self.apps.read().await;
-            apps.values().find(|h| h.name == name).cloned()
-        }?;
+        let handle = self.apps.read().await.by_name.get(name).cloned()?;
         Some(view_of(&handle).await)
     }
 
     async fn snapshot_handles(&self) -> Vec<Arc<AppHandle>> {
-        self.apps.read().await.values().cloned().collect()
+        self.apps.read().await.by_name.values().cloned().collect()
     }
 
     /// Ensure the app is running, coalescing concurrent starts. Returns
@@ -632,7 +653,12 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
 
     async fn do_start(&self, handle: &AppHandle) -> Result<Ipv4Addr> {
         let name = &handle.name;
-        info!(app = %name, image = %handle.spec.image, "starting");
+        // Snapshot the spec once: a cold start interleaves several
+        // awaits with reads of image / port / egress.allow / readiness,
+        // so cloning the small `AppSpec` is cheaper than holding the
+        // RwLock guard across them (or re-locking each time).
+        let spec = handle.spec.read().await.clone();
+        info!(app = %name, image = %spec.image, "starting");
 
         // Each cold-start phase records into bugpot_cold_start_seconds
         // *only on success*; failure paths intentionally don't record so
@@ -642,7 +668,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         let phase_start = Instant::now();
         let endpoint = self
             .egress
-            .allocate_endpoint(name, handle.spec.egress.allow.clone())
+            .allocate_endpoint(name, spec.egress.allow.clone())
             .await
             .with_context(|| format!("allocate endpoint for {name}"))?;
         histogram!("bugpot_cold_start_seconds", "phase" => "endpoint")
@@ -651,7 +677,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         let phase_start = Instant::now();
         let image_id = match self
             .runtime
-            .pull_image(&handle.spec.image, self.resolve_auth(&handle.spec.image))
+            .pull_image(&spec.image, self.resolve_auth(&spec.image))
             .await
         {
             Ok(id) => id,
@@ -666,7 +692,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         let phase_start = Instant::now();
         let running = match self
             .runtime
-            .start_app(&handle.spec, &image_id, Some(&endpoint.netns_path))
+            .start_app(&spec, &image_id, Some(&endpoint.netns_path))
             .await
         {
             Ok(r) => r,
@@ -689,12 +715,11 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         // otherwise the first proxied request would race ahead of the
         // process's listener. Timeout is per-app (TOML
         // `readiness.timeout`), falling back to the workspace default.
-        let timeout = handle
-            .spec
+        let timeout = spec
             .readiness
             .resolve_timeout(READINESS_TIMEOUT_DEFAULT)
             .map_err(|e| anyhow!("{name}: {e}"))?;
-        let upstream = SocketAddr::from((endpoint.container_ip, handle.spec.port));
+        let upstream = SocketAddr::from((endpoint.container_ip, spec.port));
         let phase_start = Instant::now();
         if let Err(e) = wait_for_port(upstream, timeout).await {
             warn!(app = %name, error = %e, "readiness probe failed");
@@ -737,10 +762,13 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
     }
 }
 
-fn make_handle(name: String, spec: AppSpec) -> Arc<AppHandle> {
+fn make_handle(spec: AppSpec) -> Arc<AppHandle> {
+    let name = spec.name().to_owned();
+    let subdomain = spec.subdomain().to_owned();
     Arc::new(AppHandle {
         name,
-        spec,
+        subdomain,
+        spec: RwLock::new(spec),
         inner: Mutex::new(HandleInner {
             state: AppState::Stopped,
             last_access: Instant::now(),
@@ -757,11 +785,12 @@ async fn view_of(handle: &Arc<AppHandle>) -> AppView {
         AppState::Running { .. } => AppStateView::Running,
         AppState::Stopping => AppStateView::Stopping,
     };
+    let spec = handle.spec.read().await;
     AppView {
         name: handle.name.clone(),
-        subdomain: handle.spec.subdomain().to_owned(),
-        image: handle.spec.image.clone(),
-        port: handle.spec.port,
+        subdomain: handle.subdomain.clone(),
+        image: spec.image.clone(),
+        port: spec.port,
         state,
     }
 }
@@ -771,11 +800,13 @@ impl<R: RuntimeOps, E: EgressOps> UpstreamResolver for AppController<R, E> {
     async fn resolve(&self, host: &str) -> Option<SocketAddr> {
         let subdomain = subdomain_of(host)?;
         let handle = {
-            let apps = self.apps.read().await;
-            apps.get(subdomain)?.clone()
+            let maps = self.apps.read().await;
+            let name = maps.by_subdomain.get(subdomain)?;
+            maps.by_name.get(name)?.clone()
         };
+        let port = handle.spec.read().await.port;
         match self.ensure_running(&handle).await {
-            Ok(ip) => Some(SocketAddr::from((ip, handle.spec.port))),
+            Ok(ip) => Some(SocketAddr::from((ip, port))),
             Err(e) => {
                 error!(host, error = ?e, "ensure_running failed");
                 None
@@ -1056,8 +1087,8 @@ mod tests {
             .push_pull(Err(RuntimeError::Other("registry down".into())));
 
         let handle = {
-            let apps = controller.apps.read().await;
-            apps.get("alpha").cloned().expect("handle present")
+            let maps = controller.apps.read().await;
+            maps.by_name.get("alpha").cloned().expect("handle present")
         };
         let res = controller.ensure_running(&handle).await;
         assert!(res.is_err(), "expected pull failure to propagate");
@@ -1096,12 +1127,12 @@ mod tests {
         controller.reattach_running().await;
 
         let alpha_state = {
-            let apps = controller.apps.read().await;
-            apps.get("alpha").unwrap().inner.lock().await.state
+            let maps = controller.apps.read().await;
+            maps.by_name.get("alpha").unwrap().inner.lock().await.state
         };
         let beta_state = {
-            let apps = controller.apps.read().await;
-            apps.get("beta").unwrap().inner.lock().await.state
+            let maps = controller.apps.read().await;
+            maps.by_name.get("beta").unwrap().inner.lock().await.state
         };
         assert!(
             matches!(alpha_state, AppState::Running { container_ip } if container_ip == Ipv4Addr::new(10, 0, 0, 42)),
@@ -1218,8 +1249,8 @@ mod tests {
         // Force the handle into Running state without going through the
         // real cold-start path.
         let handle = {
-            let apps = controller.apps.read().await;
-            apps.get("alpha").cloned().unwrap()
+            let maps = controller.apps.read().await;
+            maps.by_name.get("alpha").cloned().unwrap()
         };
         {
             let mut inner = handle.inner.lock().await;
