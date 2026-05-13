@@ -177,8 +177,10 @@ dependencies = [
  "bugpot-controller",
  "serde",
  "serde_json",
+ "subtle",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
