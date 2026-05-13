@@ -1,13 +1,12 @@
 //! Public `Runtime` API: container lifecycle on top of `oci-client` and
 //! `libcontainer`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::future::Future;
 use std::io::SeekFrom;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::time::Instant;
 
 use bugpot_config::AppSpec;
@@ -92,14 +91,22 @@ pub trait RuntimeOps: Send + Sync + std::fmt::Debug + 'static {
 }
 
 /// Container lifecycle runtime.
+/// Container lifecycle handle.
+///
+/// **No in-memory app map.** libcontainer's on-disk state under
+/// `<state>/containers/<name>/` is the single source of truth for
+/// "what's running": `is_container_running`, `resource_usage`,
+/// `stop_app`, and the duplicate-start check in `start_app` all read
+/// from there. Bug audit follow-up: keeping a parallel in-memory mirror
+/// invited subtle drift on crash / cleanup paths.
 #[derive(Debug)]
+#[allow(clippy::struct_field_names)] // every field IS a directory; the `_dir` suffix is the point.
 pub struct Runtime {
     state_dir: PathBuf,
     images_dir: PathBuf,
     bundles_dir: PathBuf,
     containers_dir: PathBuf,
     logs_dir: PathBuf,
-    apps: Mutex<HashMap<String, RunningApp>>,
 }
 
 impl Runtime {
@@ -120,7 +127,6 @@ impl Runtime {
             bundles_dir,
             containers_dir,
             logs_dir,
-            apps: Mutex::new(HashMap::new()),
         })
     }
 
@@ -168,12 +174,16 @@ impl RuntimeOps for Runtime {
     ) -> Result<RunningApp> {
         let name = spec.name().to_owned();
 
-        // Reject duplicates.
-        if self
-            .apps
-            .lock()
-            .expect("apps mutex poisoned")
-            .contains_key(&name)
+        // Reject duplicates. Source of truth = libcontainer on-disk
+        // state, not an in-memory map: callers can crash and restart;
+        // the controller's reattach path will skip do_start in that
+        // case, but a defensive check here means a buggy caller can't
+        // wipe a live container's state below (the "stale state" cleanup
+        // assumes the dir is from a *dead* container).
+        let per_container_dir = self.containers_dir.join(&name);
+        if per_container_dir.exists()
+            && Container::load(per_container_dir.clone())
+                .is_ok_and(|c| c.status() == ContainerStatus::Running)
         {
             return Err(RuntimeError::AppAlreadyRunning(name));
         }
@@ -223,8 +233,10 @@ impl RuntimeOps for Runtime {
         // `init_builder.rs::create_container_dir`). So we pass
         // `self.containers_dir` (parent), not `containers_dir/<name>`. The
         // per-container dir is created by libcontainer itself; we only
-        // ensure stale state from a prior crash is gone first.
-        let per_container_dir = self.containers_dir.join(&name);
+        // ensure stale state from a prior crash is gone first. The
+        // running-check above has already refused this start if the
+        // container were live, so anything we see now is genuinely
+        // stale.
         if per_container_dir.exists() {
             warn!(?per_container_dir, "removing stale container state");
             fs::remove_dir_all(&per_container_dir)
@@ -299,17 +311,11 @@ impl RuntimeOps for Runtime {
             RuntimeError::Other(format!("unexpected negative pid from libcontainer: {raw_pid}"))
         })?;
 
-        let running = RunningApp {
-            name: name.clone(),
+        Ok(RunningApp {
+            name,
             pid,
             image: image.id,
-        };
-
-        self.apps
-            .lock()
-            .expect("apps mutex poisoned")
-            .insert(name, running.clone());
-        Ok(running)
+        })
     }
 
     /// Quick liveness check: does libcontainer believe the container for
@@ -367,11 +373,6 @@ impl RuntimeOps for Runtime {
             }
         }
         container.delete(true)?;
-
-        self.apps
-            .lock()
-            .expect("apps mutex poisoned")
-            .remove(name);
         Ok(())
     }
 
@@ -412,14 +413,6 @@ impl RuntimeOps for Runtime {
 }
 
 impl Runtime {
-    /// Snapshot of currently running apps. Note: this is the runtime's
-    /// in-memory view; it does not re-scan disk.
-    #[must_use]
-    pub fn list(&self) -> Vec<RunningApp> {
-        let apps = self.apps.lock().expect("apps mutex poisoned");
-        apps.values().cloned().collect()
-    }
-
     fn log_dir_for(&self, app: &str) -> PathBuf {
         self.logs_dir.join(app)
     }
@@ -713,13 +706,6 @@ nr_periods 0\n";
     }
 
     #[test]
-    fn list_starts_empty() {
-        let tmp = tempfile::tempdir().unwrap();
-        let rt = Runtime::new(tmp.path().to_path_buf()).unwrap();
-        assert!(rt.list().is_empty());
-    }
-
-    #[test]
     fn default_state_dir_falls_back_to_var_lib() {
         // Only check the no-env fallback; mutating the process env from a
         // test would require `unsafe`, which the crate denies.
@@ -742,31 +728,6 @@ nr_periods 0\n";
         let marker = link.join("marker");
         let body = fs::read_to_string(&marker).unwrap();
         assert_eq!(body, "hi");
-    }
-
-    /// Mocked lifecycle: verifies the *state-tracking* logic of `Runtime`
-    /// without invoking libcontainer (which requires root and a kernel
-    /// configured for namespaces). We populate `apps` directly and check
-    /// that `list` / a stop-style operation surface those entries.
-    #[test]
-    fn list_returns_inserted_running_apps() {
-        let tmp = tempfile::tempdir().unwrap();
-        let rt = Runtime::new(tmp.path().to_path_buf()).unwrap();
-        let running = RunningApp {
-            name: "demo".into(),
-            pid: 12345,
-            image: ImageId::new("sha256:test"),
-        };
-        rt.apps
-            .lock()
-            .unwrap()
-            .insert(running.name.clone(), running);
-
-        let listed = rt.list();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].name, "demo");
-        assert_eq!(listed[0].pid, 12345);
-        assert_eq!(listed[0].image.as_str(), "sha256:test");
     }
 
     /// Confirms `stop_app` returns `AppNotFound` for an unknown id without
