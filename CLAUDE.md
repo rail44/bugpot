@@ -145,6 +145,21 @@ Then enable HTTPS in the Tailscale admin console (DNS → HTTPS
 Certificates → Enable). This authorises `*.ts.net` cert provisioning
 for every device in the tailnet.
 
+### Expose the admin API as a Service
+
+For CI to call `POST /apps` over the tailnet, the admin port also gets
+its own Service. (Service host devices cannot access their own
+Services — this also keeps operator-local access and CI access on
+different paths.)
+
+```sh
+sudo tailscale serve --service=svc:bugpot-admin --bg http://localhost:8081
+```
+
+Admin is then reachable from any other tailnet device at
+`https://bugpot-admin.<tailnet>.ts.net/apps` with TLS provisioned by
+Tailscale automatically.
+
 ### Per-app Service registration
 
 For each app subdomain you want reachable from the tailnet, register a
@@ -163,16 +178,40 @@ header that arrives at bugpot is `<service>.<tailnet>.ts.net`, so
 **Names must align**: `tailscale serve --service=svc:alpha …` ↔ app
 spec `name = "alpha"` (or `subdomain = "alpha"`).
 
-### Verifying
+### CI deploy flow
 
-From a *different* tailnet device (a Service host cannot reach the
-Service it hosts):
+`examples/github-actions-deploy.yml` is a copy-pasteable workflow for an
+**application repo** that builds, pushes to GHCR, joins the tailnet via
+`tailscale/github-action@v4`, and `POST`s the new spec to bugpot's admin
+Service. Required secrets in the application repo:
 
-```sh
-curl https://alpha.<tailnet>.ts.net/
-```
+- `TS_OAUTH_CLIENT_ID` / `TS_OAUTH_SECRET` — Tailscale OAuth client with
+  `devices:core:write` and `tag:bugpot-ci`
+- `BUGPOT_ADMIN_TOKEN` — bearer token from the bugpot host's
+  `/etc/bugpot/admin-token`
+- (`GHCR_PAT`) — only needed if the org disables packages:write on
+  `GITHUB_TOKEN`
 
-TLS cert is provisioned on first request; the first hit can be slow.
+### Verifying end-to-end
+
+Checklist for confirming a fresh tailnet deploy resolves all the way
+through to a container:
+
+1. `tailscale status` on the bugpot host: device shows as online, tags
+   include `tag:bugpot`.
+2. `sudo tailscale serve status` lists `svc:bugpot-admin` (and any
+   per-app Services).
+3. From a *second* tailnet device:
+   `curl -fsS -H "Authorization: Bearer $TOKEN" https://bugpot-admin.<tailnet>.ts.net/apps`
+   returns `200` + the current app list.
+4. Trigger the deploy workflow (push to main, or
+   `gh workflow run deploy.yml`); job log shows `DELETE` (`404` first
+   time) and `POST` (`201` with `AppView`).
+5. `curl -fsS https://<APP_NAME>.<tailnet>.ts.net/` from the second
+   device returns the app's HTTP response. First request triggers TLS
+   provisioning and can take ~30 s.
+6. `journalctl` on the bugpot host shows
+   `bugpot_router: matched route host=<APP_NAME>.<tailnet>.ts.net`.
 
 ### Phase 2 (deferred): automated Service registration
 
