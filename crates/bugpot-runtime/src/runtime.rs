@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -11,7 +12,11 @@ use libcontainer::container::{Container, ContainerStatus};
 use libcontainer::container::builder::ContainerBuilder;
 use libcontainer::signal::Signal;
 use libcontainer::syscall::syscall::SyscallType;
+use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use nix::sys::signal::Signal as NixSignal;
+use nix::unistd::pipe;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::net::unix::pipe::Receiver as PipeReceiver;
 use tracing::{debug, info, warn};
 
 use crate::auth::Auth;
@@ -148,8 +153,29 @@ impl Runtime {
         // `containers_dir` itself must exist (created by `Runtime::new`).
 
         info!(app = %name, bundle = %bundle_dir.display(), "creating container");
+
+        // Capture the container's stdout/stderr by passing pipe write-ends
+        // to libcontainer (which dup2's them onto fd 1/2 in the container
+        // init). We keep the read-ends and forward each line through
+        // tracing with `app` / `stream` fields. Pipes are blocking on the
+        // container side and non-blocking on ours (required by tokio's
+        // pipe Receiver).
+        let (stdout_r, stdout_w) = pipe()
+            .map_err(|e| RuntimeError::Other(format!("stdout pipe for {name}: {e}")))?;
+        let (stderr_r, stderr_w) = pipe()
+            .map_err(|e| RuntimeError::Other(format!("stderr pipe for {name}: {e}")))?;
+        fcntl(stdout_r.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
+            .map_err(|e| RuntimeError::Other(format!("set stdout NONBLOCK: {e}")))?;
+        fcntl(stderr_r.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
+            .map_err(|e| RuntimeError::Other(format!("set stderr NONBLOCK: {e}")))?;
+
+        // `with_stdout`/`with_stderr` live on `ContainerBuilder`, so they
+        // must be called *before* `.as_init(...)` flips us into the
+        // init-builder type.
         let mut container: Container = ContainerBuilder::new(name.clone(), SyscallType::Linux)
             .with_root_path(&self.containers_dir)?
+            .with_stdout(stdout_w)
+            .with_stderr(stderr_w)
             .as_init(&bundle_dir)
             .with_systemd(false)
             .with_detach(true)
@@ -158,6 +184,12 @@ impl Runtime {
         // libcontainer `as_init().build()` runs the init process up to the
         // "created" state. We then transition it to "running".
         container.start()?;
+
+        // Forwarders self-terminate on EOF (container exit closes the
+        // write-ends, our read-ends see 0 bytes). Detached on purpose;
+        // tracking JoinHandles isn't worth the bookkeeping at this scale.
+        tokio::spawn(forward_pipe(stdout_r, name.clone(), "stdout"));
+        tokio::spawn(forward_pipe(stderr_r, name.clone(), "stderr"));
 
         let raw_pid = container
             .pid()
@@ -216,6 +248,37 @@ impl Runtime {
     pub fn list(&self) -> Vec<RunningApp> {
         let apps = self.apps.lock().expect("apps mutex poisoned");
         apps.values().cloned().collect()
+    }
+}
+
+/// Forward each line from a container pipe into bugpot's tracing log,
+/// tagged with the app name and stream identifier ("stdout" / "stderr").
+/// Returns when the pipe reaches EOF or hits a read error.
+async fn forward_pipe(fd: OwnedFd, app: String, stream: &'static str) {
+    let recv = match PipeReceiver::from_owned_fd(fd) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(app = %app, stream, error = %e, "wrap pipe failed; dropping log stream");
+            return;
+        }
+    };
+    let mut reader = BufReader::new(recv);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) => return,
+            Ok(_) => {
+                let trimmed = line.trim_end();
+                if !trimmed.is_empty() {
+                    info!(target: "bugpot::app", app = %app, stream, "{trimmed}");
+                }
+            }
+            Err(e) => {
+                warn!(app = %app, stream, error = %e, "pipe read failed");
+                return;
+            }
+        }
     }
 }
 
