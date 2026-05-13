@@ -38,6 +38,7 @@ struct Config {
     listen: SocketAddr,
     admin_listen: SocketAddr,
     auth_file: PathBuf,
+    egress: EgressConfig,
 }
 
 #[tokio::main]
@@ -65,14 +66,14 @@ async fn main() -> Result<()> {
     );
 
     // Egress (bridge + DNS + nftables): idempotent across runs.
-    let egress_cfg = EgressConfig::default();
     info!(
-        bridge = %egress_cfg.bridge_name,
-        subnet = %egress_cfg.subnet,
+        bridge = %cfg.egress.bridge_name,
+        subnet = %cfg.egress.subnet,
+        bridge_ip = %cfg.egress.bridge_ip,
         "bringing up egress"
     );
     let egress = Arc::new(
-        Egress::new(egress_cfg)
+        Egress::new(cfg.egress)
             .await
             .context("init egress (bridge/DNS/nftables)")?,
     );
@@ -151,12 +152,52 @@ fn parse_config() -> Result<Config> {
     let auth_file = std::env::var("BUGPOT_AUTH_FILE")
         .map_or_else(|_| PathBuf::from(DEFAULT_AUTH_FILE), PathBuf::from);
 
+    let egress = parse_egress_config()?;
+
     Ok(Config {
         apps_dir,
         listen,
         admin_listen,
         auth_file,
+        egress,
     })
+}
+
+/// Build an `EgressConfig`, layering env-var overrides on top of defaults.
+///
+/// Recognised env vars:
+///
+/// - `BUGPOT_EGRESS_SUBNET` (e.g. `10.10.0.0/24`)
+/// - `BUGPOT_EGRESS_BRIDGE_IP` (e.g. `10.10.0.1`)
+/// - `BUGPOT_EGRESS_DNS_UPSTREAM` (comma-separated socket addrs)
+///
+/// When only the subnet is set, the bridge IP defaults to the first host
+/// of that subnet — so a single override changes both consistently.
+/// Setting the bridge IP without the subnet, or any inconsistent
+/// combination, fails `EgressConfig::validate`.
+fn parse_egress_config() -> Result<EgressConfig> {
+    let mut cfg = EgressConfig::default();
+
+    let subnet_env = std::env::var("BUGPOT_EGRESS_SUBNET").ok();
+    let bridge_ip_env = std::env::var("BUGPOT_EGRESS_BRIDGE_IP").ok();
+
+    if let Some(s) = subnet_env {
+        cfg.subnet = s.parse().context("parse BUGPOT_EGRESS_SUBNET")?;
+        if bridge_ip_env.is_none() {
+            cfg.bridge_ip = bugpot_egress::derive_bridge_ip(cfg.subnet);
+        }
+    }
+    if let Some(ip) = bridge_ip_env {
+        cfg.bridge_ip = ip.parse().context("parse BUGPOT_EGRESS_BRIDGE_IP")?;
+    }
+
+    if let Ok(raw) = std::env::var("BUGPOT_EGRESS_DNS_UPSTREAM") {
+        cfg.dns_upstream = bugpot_egress::parse_dns_upstream(&raw)
+            .context("parse BUGPOT_EGRESS_DNS_UPSTREAM")?;
+    }
+
+    cfg.validate().context("validate egress config")?;
+    Ok(cfg)
 }
 
 fn spawn_idle_stopper(controller: &Arc<AppController>) -> JoinHandle<()> {
