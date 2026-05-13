@@ -26,7 +26,9 @@ const DEFAULT_LISTEN: &str = "127.0.0.1:8080";
 const DEFAULT_ADMIN_LISTEN: &str = "127.0.0.1:8081";
 const DEFAULT_APPS_DIR: &str = "./apps";
 const DEFAULT_AUTH_FILE: &str = "/etc/bugpot/auth.toml";
-const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(10);
+/// Cadence for the controller's lifecycle sweep (crash detection +
+/// scale-to-zero idle stop).
+const SWEEP_INTERVAL: Duration = Duration::from_secs(10);
 
 // Metrics: the Prometheus recorder is *always* installed so callsites
 // emit successfully; the HTTP listener is only spawned when
@@ -97,7 +99,7 @@ async fn main() -> Result<()> {
         return Err(e);
     }
 
-    let stopper_task = spawn_idle_stopper(&controller);
+    let sweep_task = spawn_sweep(&controller);
     let serve_task = spawn_router(cfg.listen, &controller);
 
     // Metrics HTTP listener (optional). The recorder is installed
@@ -129,7 +131,7 @@ async fn main() -> Result<()> {
     if let Some(t) = metrics_task {
         t.abort();
     }
-    stopper_task.abort();
+    sweep_task.abort();
     controller.teardown().await;
 
     Ok(())
@@ -200,9 +202,9 @@ fn parse_egress_config() -> Result<EgressConfig> {
     Ok(cfg)
 }
 
-fn spawn_idle_stopper(controller: &Arc<AppController>) -> JoinHandle<()> {
-    let stopper = Arc::clone(controller);
-    tokio::spawn(stopper.idle_stopper_loop(IDLE_SWEEP_INTERVAL))
+fn spawn_sweep(controller: &Arc<AppController>) -> JoinHandle<()> {
+    let c = Arc::clone(controller);
+    tokio::spawn(c.sweep_loop(SWEEP_INTERVAL))
 }
 
 fn spawn_router(listen: SocketAddr, controller: &Arc<AppController>) -> JoinHandle<()> {
