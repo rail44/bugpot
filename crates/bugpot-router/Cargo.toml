@@ -14,9 +14,12 @@ anyhow.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 hyper.workspace = true
-hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "server", "server-auto", "service", "tokio"] }
+ipnet = "2"
 metrics.workspace = true
 tokio.workspace = true
+tower = { version = "0.5", features = ["limit"] }
+tower-http = { version = "0.6", features = ["limit", "timeout"] }
 tracing.workspace = true
 bugpot-config.workspace = true
 

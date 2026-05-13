@@ -15,25 +15,90 @@ use axum::{
 use bugpot_config::AppSpec;
 use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
-    rt::{TokioExecutor, TokioIo},
+    rt::{TokioExecutor, TokioIo, TokioTimer},
+    server::conn::auto,
+    service::TowerToHyperService,
 };
+use ipnet::IpNet;
 use metrics::counter;
 use std::{
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::Arc,
     time::Duration,
 };
+use tower::Service;
+use tower::limit::ConcurrencyLimitLayer;
+use tower_http::{limit::RequestBodyLimitLayer, timeout::TimeoutLayer};
 use tracing::{debug, info, warn};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Total per-request timeout enforced at the tower layer. Caps any single
+/// request including slow body uploads and slow upstream responses.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const IDLE_TIMEOUT: Duration = Duration::from_mins(1);
+/// Slowloris guard: how long the HTTP/1 reader will wait for the full
+/// request headers before tearing down the connection.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// Hard upper bound on a single request body. Larger bodies are
+/// rejected with 413 by `tower_http::limit::RequestBodyLimitLayer`.
+const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+/// Maximum simultaneous in-flight requests. Excess requests queue at
+/// the tower layer; combined with `REQUEST_TIMEOUT` they cannot pile
+/// up unboundedly.
+const MAX_CONCURRENT_REQUESTS: usize = 1024;
 
 const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
 const X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");
 
+/// RFC 7230 §6.1 hop-by-hop headers. Stored as lowercase strings so we
+/// can store them in a `const` (compound `HeaderName` arrays don't
+/// survive `const` because of interior mutability) and parsed at call
+/// time via `HeaderMap::remove(&str)`. `Upgrade` is in the list but
+/// the WebSocket path runs *before* the strip and keeps it.
+const HOP_BY_HOP_HEADERS: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
 type ProxyClient = Client<HttpConnector, Body>;
+
+/// Per-deployment knobs the router reads from env at startup.
+///
+/// Kept separate from `serve()` so callers can build it from anywhere
+/// (`cmd/bugpot::parse_router_config`, tests, etc.) and so the
+/// defaults stay in one place.
+#[derive(Debug, Clone, Default)]
+pub struct RouterConfig {
+    /// IPv4/IPv6 networks whose `X-Forwarded-For` is honoured. Requests
+    /// from any other peer have their incoming XFF discarded — the
+    /// peer's IP becomes the head of a fresh chain. Empty (default)
+    /// means trust the existing chain (current behaviour); set to
+    /// loopback / Tailscale tailnet ranges in real deployments.
+    pub trusted_proxies: Vec<IpNet>,
+    /// Value to set in `X-Forwarded-Proto` when the upstream request
+    /// doesn't already carry one. Defaults to `http`. Set to `https`
+    /// when bugpot sits behind a TLS-terminating front (Tailscale
+    /// Services, an external LB, etc.).
+    pub forwarded_proto: String,
+}
+
+impl RouterConfig {
+    /// Hard-coded sensible defaults: trust nothing, advertise `http`.
+    #[must_use]
+    pub fn defaults() -> Self {
+        Self {
+            trusted_proxies: Vec::new(),
+            forwarded_proto: "http".to_owned(),
+        }
+    }
+}
 
 /// One registered app paired with the concrete upstream to forward to.
 ///
@@ -77,8 +142,19 @@ pub trait UpstreamResolver: Send + Sync + std::fmt::Debug {
 
 /// Convenience extractor used by both [`AppRouter`] and any custom
 /// resolver implementation.
+///
+/// `host` is the literal `Host` header value, optionally with a
+/// trailing `:port`. Returns the first DNS label of the hostname, or
+/// `None` for IPv6 literals (`[::1]:8080`) — bugpot routes by
+/// subdomain, so an IPv6 literal can't ever match an app.
 #[must_use]
 pub fn subdomain_of(host: &str) -> Option<&str> {
+    // IPv6 literal in URL form: `[::1]` or `[::1]:8080`. Reject early
+    // so the `:port` splitter below doesn't trip on the address
+    // separator.
+    if host.starts_with('[') {
+        return None;
+    }
     host.split(':').next()?.split('.').next()
 }
 
@@ -117,12 +193,14 @@ impl UpstreamResolver for AppRouter {
 struct ProxyState {
     resolver: Arc<dyn UpstreamResolver>,
     client: ProxyClient,
+    config: Arc<RouterConfig>,
 }
 
 impl std::fmt::Debug for ProxyState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProxyState")
             .field("resolver", &self.resolver)
+            .field("config", &self.config)
             .finish_non_exhaustive()
     }
 }
@@ -137,20 +215,79 @@ fn build_client() -> ProxyClient {
         .build(connector)
 }
 
-pub async fn serve(addr: SocketAddr, resolver: Arc<dyn UpstreamResolver>) -> Result<()> {
+/// Run the bugpot proxy.
+///
+/// Drops down to `hyper_util::server::conn::auto::Builder` directly
+/// (rather than `axum::serve`) because we need
+/// `http1.header_read_timeout` for slowloris protection, and axum 0.8
+/// doesn't expose that knob through its `Serve` wrapper.
+pub async fn serve(
+    addr: SocketAddr,
+    resolver: Arc<dyn UpstreamResolver>,
+    config: RouterConfig,
+) -> Result<()> {
     let state = ProxyState {
         resolver,
         client: build_client(),
+        config: Arc::new(config),
     };
-    let app = Router::new().fallback(any(handler)).with_state(state);
+    let app = Router::new()
+        .fallback(any(handler))
+        .with_state(state)
+        // Tower layers — applied to every request the service sees,
+        // including upgrades. The body limit only counts bytes that
+        // pass through the proxy before an upgrade, which is exactly
+        // what we want (WebSocket frame bytes are not "body").
+        .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::GATEWAY_TIMEOUT,
+            REQUEST_TIMEOUT,
+        ))
+        .layer(ConcurrencyLimitLayer::new(MAX_CONCURRENT_REQUESTS));
+
     info!(%addr, "bugpot-router listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await?;
-    Ok(())
+
+    // Per-connection hyper builder, configured once and cloned for each
+    // accepted connection. `_with_upgrades` keeps the WebSocket splice
+    // path working. `header_read_timeout` requires a timer; the global
+    // builder timer needs `TokioTimer`.
+    let mut builder = auto::Builder::new(TokioExecutor::new());
+    builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT);
+
+    // `into_make_service_with_connect_info` returns a `MakeService` that
+    // takes a `SocketAddr` and produces a per-connection service whose
+    // request extensions include `ConnectInfo(SocketAddr)`. We call it
+    // with the peer addr on each accept.
+    let mut make_svc = app.into_make_service_with_connect_info::<SocketAddr>();
+
+    loop {
+        let (socket, peer_addr) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                warn!(error = %e, "accept failed; continuing");
+                continue;
+            }
+        };
+        let svc = match make_svc.call(peer_addr).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "make_service failed; dropping connection");
+                continue;
+            }
+        };
+        let svc = TowerToHyperService::new(svc);
+        let io = TokioIo::new(socket);
+        let builder = builder.clone();
+        tokio::spawn(async move {
+            if let Err(e) = builder.serve_connection_with_upgrades(io, svc).await {
+                debug!(error = %e, "connection closed with error");
+            }
+        });
+    }
 }
 
 async fn handler(State(state): State<ProxyState>, req: Request) -> Response {
@@ -172,7 +309,7 @@ async fn handler(State(state): State<ProxyState>, req: Request) -> Response {
         }
         Some(upstream) => {
             info!(host = %host, %upstream, "matched route");
-            forward(state.client, req, upstream, &host).await
+            forward(state.client, &state.config, req, upstream, &host).await
         }
     };
     counter!(
@@ -189,6 +326,7 @@ async fn handler(State(state): State<ProxyState>, req: Request) -> Response {
 /// Handles HTTP and HTTP/1.1 Upgrade (e.g. WebSocket) transparently.
 async fn forward(
     client: ProxyClient,
+    config: &RouterConfig,
     mut req: Request,
     upstream: SocketAddr,
     original_host: &str,
@@ -202,7 +340,7 @@ async fn forward(
     let peer_addr = req
         .extensions()
         .get::<axum::extract::ConnectInfo<SocketAddr>>()
-        .map(|c| c.0.ip().to_string());
+        .map(|c| c.0.ip());
 
     // Rewrite URI to point at the upstream.
     let new_uri = match rewrite_uri(req.uri(), upstream) {
@@ -217,16 +355,25 @@ async fn forward(
     };
     *req.uri_mut() = new_uri;
 
-    inject_forwarded_headers(req.headers_mut(), peer_addr.as_deref(), original_host);
+    inject_forwarded_headers(req.headers_mut(), peer_addr, original_host, config);
 
     if is_upgrade {
+        // The Upgrade path needs `Connection: Upgrade` and the
+        // `Upgrade:` token to flow through to the upstream so it
+        // returns 101. Skip the hop-by-hop strip here; the splice
+        // takes over once both sides agree.
         return forward_upgrade(client, req).await;
     }
+
+    strip_hop_by_hop_headers(req.headers_mut());
 
     let pending = client.request(req);
     let result = tokio::time::timeout(REQUEST_TIMEOUT, pending).await;
     match result {
-        Ok(Ok(res)) => res.map(Body::new),
+        Ok(Ok(mut res)) => {
+            strip_hop_by_hop_headers(res.headers_mut());
+            res.map(Body::new)
+        }
         Ok(Err(e)) => {
             warn!(error = %e, "upstream request failed");
             error_response(StatusCode::BAD_GATEWAY, "upstream connection failed\n".to_owned())
@@ -321,22 +468,17 @@ fn is_upgrade_request(headers: &HeaderMap) -> bool {
 
 fn inject_forwarded_headers(
     headers: &mut HeaderMap,
-    peer_ip: Option<&str>,
+    peer_ip: Option<IpAddr>,
     original_host: &str,
+    config: &RouterConfig,
 ) {
     if let Some(ip) = peer_ip {
-        append_forwarded_for(headers, ip);
+        rewrite_forwarded_for(headers, ip, &config.trusted_proxies);
     }
-    // bugpot terminates plain HTTP (TLS is handled upstream of the router, by
-    // tailscale/the load balancer); from the upstream app's perspective the
-    // proto is whatever the client originally requested. We don't have that
-    // information here, so we always advertise http. When TLS termination
-    // lands inside bugpot-router this should be revised.
-    if !headers.contains_key(&X_FORWARDED_PROTO) {
-        headers.insert(
-            X_FORWARDED_PROTO,
-            HeaderValue::from_static("http"),
-        );
+    if !headers.contains_key(&X_FORWARDED_PROTO)
+        && let Ok(v) = HeaderValue::from_str(&config.forwarded_proto)
+    {
+        headers.insert(X_FORWARDED_PROTO, v);
     }
     if !headers.contains_key(&X_FORWARDED_HOST)
         && let Ok(v) = HeaderValue::from_str(original_host)
@@ -345,13 +487,47 @@ fn inject_forwarded_headers(
     }
 }
 
-fn append_forwarded_for(headers: &mut HeaderMap, peer_ip: &str) {
-    let new_value = headers
-        .get(&X_FORWARDED_FOR)
-        .and_then(|v| v.to_str().ok())
-        .map_or_else(|| peer_ip.to_owned(), |s| format!("{s}, {peer_ip}"));
+/// Append the peer's IP to `X-Forwarded-For` when the peer is in
+/// `trusted_proxies`; otherwise reset XFF to just the peer's IP so an
+/// attacker can't spoof an upstream chain.
+///
+/// `trusted_proxies` empty (default) preserves the historical
+/// behaviour of unconditionally appending — operators who haven't
+/// configured trust boundaries see no behaviour change.
+fn rewrite_forwarded_for(headers: &mut HeaderMap, peer_ip: IpAddr, trusted: &[IpNet]) {
+    let peer_str = peer_ip.to_string();
+    let trust_peer = trusted.is_empty() || trusted.iter().any(|n| n.contains(&peer_ip));
+    let new_value = if trust_peer {
+        headers
+            .get(&X_FORWARDED_FOR)
+            .and_then(|v| v.to_str().ok())
+            .map_or_else(|| peer_str.clone(), |s| format!("{s}, {peer_str}"))
+    } else {
+        peer_str
+    };
     if let Ok(v) = HeaderValue::from_str(&new_value) {
         headers.insert(X_FORWARDED_FOR, v);
+    }
+}
+
+/// RFC 7230 §6.1: drop the static hop-by-hop set plus any header
+/// listed in `Connection`. Run before forwarding to the upstream and
+/// on the way back to the client.
+fn strip_hop_by_hop_headers(headers: &mut HeaderMap) {
+    // Collect Connection-listed extras first; HeaderMap doesn't let us
+    // iterate while we mutate.
+    let extras: Vec<HeaderName> = headers
+        .get_all(CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .filter_map(|name| HeaderName::try_from(name.trim()).ok())
+        .collect();
+    for h in HOP_BY_HOP_HEADERS {
+        headers.remove(*h);
+    }
+    for h in extras {
+        headers.remove(&h);
     }
 }
 
@@ -424,14 +600,15 @@ mod tests {
     }
 
     #[test]
-    fn appends_forwarded_for() {
+    fn appends_forwarded_for_with_empty_trust_list() {
+        // Empty trust list = trust everyone (back-compat).
         let mut h = HeaderMap::new();
-        append_forwarded_for(&mut h, "10.0.0.1");
+        rewrite_forwarded_for(&mut h, "10.0.0.1".parse().unwrap(), &[]);
         assert_eq!(
             h.get(&X_FORWARDED_FOR).and_then(|v| v.to_str().ok()),
             Some("10.0.0.1")
         );
-        append_forwarded_for(&mut h, "10.0.0.2");
+        rewrite_forwarded_for(&mut h, "10.0.0.2".parse().unwrap(), &[]);
         assert_eq!(
             h.get(&X_FORWARDED_FOR).and_then(|v| v.to_str().ok()),
             Some("10.0.0.1, 10.0.0.2")
@@ -448,5 +625,89 @@ mod tests {
         assert_eq!(rewritten.port_u16(), Some(8123));
         assert_eq!(rewritten.path(), "/foo/bar");
         assert_eq!(rewritten.query(), Some("x=1"));
+    }
+
+    #[test]
+    fn subdomain_of_rejects_ipv6_literal() {
+        // IPv6 literals in Host headers wrap the address in `[...]`.
+        // They never match a bugpot subdomain — and the naive
+        // `split(':').next()` would have returned `"[" ...` which is
+        // not a valid label.
+        assert_eq!(subdomain_of("[::1]"), None);
+        assert_eq!(subdomain_of("[::1]:8080"), None);
+        assert_eq!(subdomain_of("[2001:db8::1]:443"), None);
+        // Regression: regular host:port still works.
+        assert_eq!(subdomain_of("alpha.bugpot.ts.net:443"), Some("alpha"));
+    }
+
+    #[test]
+    fn strip_hop_by_hop_removes_static_set() {
+        let mut h = HeaderMap::new();
+        h.insert(CONNECTION, HeaderValue::from_static("close"));
+        h.insert(
+            HeaderName::from_static("keep-alive"),
+            HeaderValue::from_static("timeout=5"),
+        );
+        h.insert(
+            HeaderName::from_static("transfer-encoding"),
+            HeaderValue::from_static("chunked"),
+        );
+        h.insert(
+            HeaderName::from_static("x-bugpot-app"),
+            HeaderValue::from_static("alpha"),
+        );
+        strip_hop_by_hop_headers(&mut h);
+        assert!(!h.contains_key(CONNECTION));
+        assert!(!h.contains_key("keep-alive"));
+        assert!(!h.contains_key("transfer-encoding"));
+        // Non-hop-by-hop headers must survive.
+        assert!(h.contains_key("x-bugpot-app"));
+    }
+
+    #[test]
+    fn strip_hop_by_hop_removes_connection_extras() {
+        // Headers named in `Connection` should also be stripped.
+        let mut h = HeaderMap::new();
+        h.insert(
+            CONNECTION,
+            HeaderValue::from_static("close, x-internal-token"),
+        );
+        h.insert(
+            HeaderName::from_static("x-internal-token"),
+            HeaderValue::from_static("secret"),
+        );
+        h.insert(
+            HeaderName::from_static("x-bugpot-app"),
+            HeaderValue::from_static("alpha"),
+        );
+        strip_hop_by_hop_headers(&mut h);
+        assert!(!h.contains_key("x-internal-token"));
+        assert!(h.contains_key("x-bugpot-app"));
+    }
+
+    #[test]
+    fn xff_appends_when_trusted_or_empty() {
+        // Empty trusted list = trust everything (historical behaviour).
+        let mut h = HeaderMap::new();
+        h.insert(X_FORWARDED_FOR, HeaderValue::from_static("1.2.3.4"));
+        rewrite_forwarded_for(&mut h, "5.6.7.8".parse().unwrap(), &[]);
+        assert_eq!(h.get(X_FORWARDED_FOR).unwrap(), "1.2.3.4, 5.6.7.8");
+
+        // Trusted peer: append.
+        let mut h = HeaderMap::new();
+        h.insert(X_FORWARDED_FOR, HeaderValue::from_static("1.2.3.4"));
+        let trusted: Vec<IpNet> = vec!["5.6.7.0/24".parse().unwrap()];
+        rewrite_forwarded_for(&mut h, "5.6.7.8".parse().unwrap(), &trusted);
+        assert_eq!(h.get(X_FORWARDED_FOR).unwrap(), "1.2.3.4, 5.6.7.8");
+    }
+
+    #[test]
+    fn xff_resets_when_peer_not_trusted() {
+        // Untrusted peer: drop the spoofed chain and use peer IP only.
+        let mut h = HeaderMap::new();
+        h.insert(X_FORWARDED_FOR, HeaderValue::from_static("evil-spoof"));
+        let trusted: Vec<IpNet> = vec!["10.0.0.0/8".parse().unwrap()];
+        rewrite_forwarded_for(&mut h, "5.6.7.8".parse().unwrap(), &trusted);
+        assert_eq!(h.get(X_FORWARDED_FOR).unwrap(), "5.6.7.8");
     }
 }

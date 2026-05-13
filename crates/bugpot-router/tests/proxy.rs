@@ -18,7 +18,7 @@ use axum::{
     routing::any,
 };
 use bugpot_config::{AppSpec, Egress, Readiness, Resources, Runtime, Scaling};
-use bugpot_router::{AppRouter, Deployment, serve};
+use bugpot_router::{AppRouter, Deployment, RouterConfig, serve};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use tokio::{net::TcpListener, time::timeout};
@@ -90,7 +90,7 @@ async fn start_router(apps: Vec<AppSpec>) -> SocketAddr {
     let addr = probe.local_addr().unwrap();
     drop(probe);
     tokio::spawn(async move {
-        serve(addr, app_router).await.unwrap();
+        serve(addr, app_router, RouterConfig::defaults()).await.unwrap();
     });
     // Wait until the router accepts connections.
     for _ in 0..100 {
