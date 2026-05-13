@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use bugpot_config::AppSpec;
+use bugpot_config::{AppSpec, AuthConfig, RegistryCredential, registry_host};
 use bugpot_egress::Egress;
 use bugpot_router::{UpstreamResolver, subdomain_of};
 use bugpot_runtime::{Auth, Runtime};
@@ -88,6 +88,7 @@ pub struct AppController {
     runtime: Arc<Runtime>,
     egress: Arc<Egress>,
     apps_dir: PathBuf,
+    auth: AuthConfig,
     /// Keyed by subdomain (= app name by default).
     apps: RwLock<HashMap<String, Arc<AppHandle>>>,
 }
@@ -98,6 +99,7 @@ impl AppController {
         runtime: Arc<Runtime>,
         egress: Arc<Egress>,
         apps_dir: PathBuf,
+        auth: AuthConfig,
         specs: Vec<AppSpec>,
     ) -> Self {
         let mut apps = HashMap::with_capacity(specs.len());
@@ -110,7 +112,22 @@ impl AppController {
             runtime,
             egress,
             apps_dir,
+            auth,
             apps: RwLock::new(apps),
+        }
+    }
+
+    /// Resolve pull credentials for an image reference by looking the
+    /// registry hostname up in [`AuthConfig`]. Falls back to anonymous.
+    fn resolve_auth(&self, image_ref: &str) -> Auth {
+        let host = registry_host(image_ref);
+        match self.auth.registries.get(host) {
+            Some(RegistryCredential::Bearer { token }) => Auth::BearerToken(token.clone()),
+            Some(RegistryCredential::Basic { username, password }) => Auth::Basic {
+                user: username.clone(),
+                pass: password.clone(),
+            },
+            None => Auth::Anonymous,
         }
     }
 
@@ -204,7 +221,7 @@ impl AppController {
         }
 
         self.runtime
-            .pull_image(&spec.image, Auth::Anonymous)
+            .pull_image(&spec.image, self.resolve_auth(&spec.image))
             .await
             .with_context(|| format!("pull image {} for {name}", spec.image))?;
 
@@ -359,7 +376,7 @@ impl AppController {
 
         if let Err(e) = self
             .runtime
-            .pull_image(&handle.spec.image, Auth::Anonymous)
+            .pull_image(&handle.spec.image, self.resolve_auth(&handle.spec.image))
             .await
         {
             let _ = self.egress.release_endpoint(name).await;

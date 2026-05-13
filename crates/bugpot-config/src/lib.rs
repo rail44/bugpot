@@ -117,6 +117,83 @@ impl AppSpec {
     }
 }
 
+/// Per-registry pull credentials.
+///
+/// Loaded from a single TOML file (typically `/etc/bugpot/auth.toml`,
+/// root:root 0600) and keyed by registry hostname (e.g. `"ghcr.io"`,
+/// `"docker.io"`, `"registry.gitlab.com"`).
+#[derive(Clone, Default, Deserialize)]
+pub struct AuthConfig {
+    #[serde(default)]
+    pub registries: HashMap<String, RegistryCredential>,
+}
+
+impl std::fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Don't expose hostnames in case the set itself is sensitive; just
+        // show the count.
+        f.debug_struct("AuthConfig")
+            .field("registries", &self.registries.len())
+            .finish()
+    }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum RegistryCredential {
+    Bearer { token: String },
+    Basic { username: String, password: String },
+}
+
+impl std::fmt::Debug for RegistryCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bearer { .. } => f
+                .debug_struct("Bearer")
+                .field("token", &"<redacted>")
+                .finish(),
+            Self::Basic { username, .. } => f
+                .debug_struct("Basic")
+                .field("username", username)
+                .field("password", &"<redacted>")
+                .finish(),
+        }
+    }
+}
+
+/// Load a registry-auth TOML. Returns an empty config when `path` does
+/// not exist (so missing `auth.toml` is silently equivalent to "no auth
+/// configured").
+pub fn load_auth(path: impl AsRef<Path>) -> Result<AuthConfig> {
+    let path = path.as_ref();
+    if !path.exists() {
+        return Ok(AuthConfig::default());
+    }
+    let body = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    toml::from_str(&body).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+/// Extract the registry hostname from an image reference.
+///
+/// Follows the OCI / Docker rule: a reference with no `/` (e.g.
+/// `alpine:latest`) implies `docker.io`. Otherwise, if the part before
+/// the first `/` contains a `.` or a `:`, or equals `"localhost"`, treat
+/// it as a hostname; else also default to `"docker.io"` (e.g.
+/// `library/alpine:latest`).
+#[must_use]
+pub fn registry_host(image_ref: &str) -> &str {
+    let Some(first_slash) = image_ref.find('/') else {
+        return "docker.io";
+    };
+    let first = &image_ref[..first_slash];
+    if first.contains('.') || first.contains(':') || first == "localhost" {
+        first
+    } else {
+        "docker.io"
+    }
+}
+
 pub fn load_apps(dir: impl AsRef<Path>) -> Result<Vec<AppSpec>> {
     let dir = dir.as_ref();
     anyhow::ensure!(
@@ -286,6 +363,69 @@ port = 80
         assert!(!body.contains("[scaling]"), "got: {body}");
         assert!(!body.contains("[resources]"), "got: {body}");
         assert!(!body.contains("[runtime]"), "got: {body}");
+    }
+
+    #[test]
+    fn registry_host_extracts_hostname() {
+        assert_eq!(registry_host("ghcr.io/owner/repo:tag"), "ghcr.io");
+        assert_eq!(
+            registry_host("registry.gitlab.com/group/project:1.0"),
+            "registry.gitlab.com"
+        );
+        assert_eq!(registry_host("localhost:5000/foo:bar"), "localhost:5000");
+        // No hostname-looking first component → defaults to docker.io.
+        assert_eq!(registry_host("library/alpine:latest"), "docker.io");
+        assert_eq!(registry_host("alpine:latest"), "docker.io");
+    }
+
+    #[test]
+    fn parses_auth_toml() {
+        let body = r#"
+            [registries."ghcr.io"]
+            type = "bearer"
+            token = "ghp_abc"
+
+            [registries."docker.io"]
+            type = "basic"
+            username = "myuser"
+            password = "mypass"
+        "#;
+        let cfg: AuthConfig = toml::from_str(body).unwrap();
+        assert_eq!(cfg.registries.len(), 2);
+        let RegistryCredential::Bearer { token } = cfg.registries.get("ghcr.io").unwrap() else {
+            panic!("expected Bearer for ghcr.io");
+        };
+        assert_eq!(token, "ghp_abc");
+        let RegistryCredential::Basic { username, password } =
+            cfg.registries.get("docker.io").unwrap()
+        else {
+            panic!("expected Basic for docker.io");
+        };
+        assert_eq!(username, "myuser");
+        assert_eq!(password, "mypass");
+    }
+
+    #[test]
+    fn auth_debug_redacts_secrets() {
+        let bearer = RegistryCredential::Bearer {
+            token: "supersecret-xyz".to_string(),
+        };
+        let basic = RegistryCredential::Basic {
+            username: "alice".to_string(),
+            password: "p4ssw0rd!".to_string(),
+        };
+        let bearer_dbg = format!("{bearer:?}");
+        let basic_dbg = format!("{basic:?}");
+        assert!(!bearer_dbg.contains("supersecret-xyz"), "got: {bearer_dbg}");
+        assert!(!basic_dbg.contains("p4ssw0rd!"), "got: {basic_dbg}");
+        // Non-secret fields stay visible for debugging.
+        assert!(basic_dbg.contains("alice"), "got: {basic_dbg}");
+    }
+
+    #[test]
+    fn load_auth_missing_file_is_empty() {
+        let cfg = load_auth("/nonexistent/path/auth.toml").unwrap();
+        assert!(cfg.registries.is_empty());
     }
 
     #[test]
