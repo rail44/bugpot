@@ -1,0 +1,111 @@
+# Example workflow for deploying an application to a bugpot instance over
+# a Tailscale tailnet. Copy this file into your **application** repo at
+# `.github/workflows/deploy.yml`, then edit the `env:` block and add the
+# required secrets to the repo (Settings → Secrets and variables → Actions):
+#
+#   GHCR_PAT                  (optional) PAT with packages:write if you
+#                             can't use GITHUB_TOKEN
+#   TS_OAUTH_CLIENT_ID        Tailscale OAuth client ID
+#                             (Admin → Settings → OAuth clients,
+#                              scope: devices:core:write, tags: tag:bugpot-ci)
+#   TS_OAUTH_SECRET           Tailscale OAuth client secret
+#   BUGPOT_ADMIN_TOKEN        bearer token issued by the bugpot operator
+#
+# Prerequisites on the bugpot host (one-time, by the operator):
+#
+#   sudo tailscale serve --service=svc:bugpot-admin --bg http://localhost:8081
+#   sudo tailscale serve --service=svc:<APP_NAME>   --bg http://localhost:8080
+#
+# After this workflow runs, the deployed app is reachable at:
+#
+#   https://<APP_NAME>.<your-tailnet>.ts.net/
+
+name: Deploy to bugpot
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  # Tweak per app:
+  APP_NAME: my-app
+  APP_PORT: 8080
+  IMAGE: ghcr.io/${{ github.repository }}
+  # The bugpot admin Service registered on the operator's tailnet.
+  # Replace <your-tailnet> with your actual tailnet name (the ts.net suffix).
+  BUGPOT_ADMIN_URL: https://bugpot-admin.<your-tailnet>.ts.net
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          # Use GITHUB_TOKEN by default; swap to a PAT if your org disables
+          # packages:write on the default token.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+
+      - name: Connect to tailnet
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:bugpot-ci
+
+      - name: Deploy to bugpot
+        env:
+          TOKEN: ${{ secrets.BUGPOT_ADMIN_TOKEN }}
+        run: |
+          set -euo pipefail
+          # bugpot's POST /apps creates only. For a redeploy of an
+          # existing app, delete first then re-create. Ignore the 404 on
+          # first deploy.
+          curl -fsS -X DELETE \
+            -H "Authorization: Bearer $TOKEN" \
+            "${BUGPOT_ADMIN_URL}/apps/${APP_NAME}" \
+            -o /dev/null \
+            -w 'DELETE status: %{http_code}\n' || true
+
+          curl -fsS -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            "${BUGPOT_ADMIN_URL}/apps" \
+            -d @- <<JSON
+          {
+            "image": "${IMAGE}:${GITHUB_SHA}",
+            "port": ${APP_PORT},
+            "name": "${APP_NAME}",
+            "scaling": {"idle_timeout": "5m"}
+          }
+          JSON
+
+      - name: Smoke check
+        run: |
+          # First request triggers cert provisioning if it's a fresh
+          # Service, which can take ~30s. Retry briefly.
+          for i in $(seq 1 12); do
+            if curl -fsS -o /dev/null -w '%{http_code}' \
+                "https://${APP_NAME}.<your-tailnet>.ts.net/" | grep -q 200; then
+              echo "deployed and reachable"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "smoke check failed" >&2
+          exit 1
