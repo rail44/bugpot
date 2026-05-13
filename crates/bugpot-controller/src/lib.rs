@@ -60,7 +60,9 @@ pub enum RemoveError {
 
 /// How long to wait for an app to start accepting TCP connections on its
 /// declared port after libcontainer reports the container is running.
-const READINESS_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default readiness timeout when an app does not override
+/// `readiness.timeout` in its TOML.
+const READINESS_TIMEOUT_DEFAULT: Duration = Duration::from_secs(10);
 const READINESS_POLL: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
@@ -458,10 +460,16 @@ impl AppController {
 
         // Wait for the app to bind on its declared port before returning,
         // otherwise the first proxied request would race ahead of the
-        // process's listener.
+        // process's listener. Timeout is per-app (TOML
+        // `readiness.timeout`), falling back to the workspace default.
+        let timeout = handle
+            .spec
+            .readiness
+            .resolve_timeout(READINESS_TIMEOUT_DEFAULT)
+            .map_err(|e| anyhow!("{name}: {e}"))?;
         let upstream = SocketAddr::from((endpoint.container_ip, handle.spec.port));
         let phase_start = Instant::now();
-        if let Err(e) = wait_for_port(upstream).await {
+        if let Err(e) = wait_for_port(upstream, timeout).await {
             warn!(app = %name, error = %e, "readiness probe failed");
             let _ = self.runtime.stop_app(name).await;
             let _ = self.egress.release_endpoint(name).await;
@@ -546,8 +554,8 @@ impl UpstreamResolver for AppController {
     }
 }
 
-async fn wait_for_port(addr: SocketAddr) -> Result<()> {
-    let deadline = Instant::now() + READINESS_TIMEOUT;
+async fn wait_for_port(addr: SocketAddr, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
     let mut last_err: Option<std::io::Error> = None;
     while Instant::now() < deadline {
         match TcpStream::connect(addr).await {
@@ -559,6 +567,6 @@ async fn wait_for_port(addr: SocketAddr) -> Result<()> {
         }
     }
     Err(anyhow!(
-        "container did not accept connections on {addr} within {READINESS_TIMEOUT:?}: {last_err:?}"
+        "container did not accept connections on {addr} within {timeout:?}: {last_err:?}"
     ))
 }
