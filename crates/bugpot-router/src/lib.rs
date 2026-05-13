@@ -27,7 +27,7 @@ use tracing::{debug, info, warn};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const IDLE_TIMEOUT: Duration = Duration::from_mins(1);
 
 const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
@@ -338,10 +338,10 @@ fn inject_forwarded_headers(
             HeaderValue::from_static("http"),
         );
     }
-    if !headers.contains_key(&X_FORWARDED_HOST) {
-        if let Ok(v) = HeaderValue::from_str(original_host) {
-            headers.insert(X_FORWARDED_HOST, v);
-        }
+    if !headers.contains_key(&X_FORWARDED_HOST)
+        && let Ok(v) = HeaderValue::from_str(original_host)
+    {
+        headers.insert(X_FORWARDED_HOST, v);
     }
 }
 

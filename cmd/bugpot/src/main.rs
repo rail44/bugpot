@@ -93,6 +93,12 @@ async fn main() -> Result<()> {
         auth,
         apps,
     ));
+    // Reclaim any containers + endpoints that survived a previous bugpot
+    // process (e.g. a crash, or a planned binary upgrade in a later
+    // version). Done before deploy_always_on so eager-start sees these
+    // apps already Running and skips them.
+    controller.reattach_running().await;
+
     if let Err(e) = controller.deploy_always_on().await {
         error!(error = ?e, "eager-start failed; rolling back");
         controller.teardown().await;

@@ -305,7 +305,7 @@ mod tests {
         let s = Scaling::default();
         assert_eq!(
             s.resolve_idle_timeout().unwrap(),
-            Some(std::time::Duration::from_secs(300))
+            Some(std::time::Duration::from_mins(5))
         );
     }
 
