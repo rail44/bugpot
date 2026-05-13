@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -88,14 +88,16 @@ struct AppHandle {
 struct HandleInner {
     state: AppState,
     last_access: Instant,
-    /// `Some` while `state == Starting`. Waiters subscribe here.
-    notify: Option<Arc<Notify>>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum AppState {
     Stopped,
-    Starting,
+    /// A concurrent start is in flight. Waiters subscribe on the inner
+    /// `Notify`. The `Arc` lives only while the state machine is in
+    /// this variant; transitioning away drops it (held clones held by
+    /// waiters keep the channel alive long enough to receive the wake).
+    Starting { notify: Arc<Notify> },
     Running { container_ip: Ipv4Addr },
     Stopping,
 }
@@ -255,9 +257,10 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
                     // The previous bugpot's tail tasks died with it.
                     // Spawn fresh ones so the new process's tracing
                     // pipeline (and `just logs`) keeps showing app
-                    // output. Tails seek to EOF — historical lines
-                    // remain readable in the log file but don't
-                    // replay.
+                    // output. The tail opens at the start of the
+                    // file, so bytes the app wrote during the
+                    // interregnum replay through tracing once
+                    // (bounded by `MAX_LOG_BYTES`).
                     self.runtime.ensure_log_tails(name);
                     info!(app = %name, container_ip = %ep.container_ip, "reattached to running container");
                 }
@@ -379,11 +382,11 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
             // Only look at apps we believe are running. Starting /
             // Stopping / Stopped handles are already in motion or
             // already-cleaned.
-            let state_snapshot = {
-                let inner = handle.inner.lock().await;
-                inner.state
-            };
-            if !matches!(state_snapshot, AppState::Running { .. }) {
+            let is_running = matches!(
+                handle.inner.lock().await.state,
+                AppState::Running { .. }
+            );
+            if !is_running {
                 continue;
             }
 
@@ -472,7 +475,10 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         for handle in self.snapshot_handles().await {
             let should_stop = {
                 let inner = handle.inner.lock().await;
-                matches!(inner.state, AppState::Running { .. } | AppState::Starting)
+                matches!(
+                    inner.state,
+                    AppState::Running { .. } | AppState::Starting { .. }
+                )
             };
             if should_stop && let Err(e) = self.stop(&handle).await {
                 warn!(app = %handle.name, error = ?e, "stop failed during teardown");
@@ -527,11 +533,11 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
             // Re-check under the write lock — a concurrent deploy may have
             // raced into the same keys.
             if maps.by_name.contains_key(&name) {
-                let _ = tokio::fs::remove_file(&toml_path).await;
+                cleanup_orphan_toml(&toml_path).await;
                 return Err(DeployError::AlreadyExists(name));
             }
             if maps.by_subdomain.contains_key(&subdomain) {
-                let _ = tokio::fs::remove_file(&toml_path).await;
+                cleanup_orphan_toml(&toml_path).await;
                 return Err(DeployError::SubdomainTaken(subdomain));
             }
             maps.by_subdomain.insert(subdomain.clone(), name.clone());
@@ -611,16 +617,17 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
     async fn ensure_running(&self, handle: &Arc<AppHandle>) -> Result<Ipv4Addr> {
         loop {
             // Phase 1: inspect / transition state under the lock.
+            //
+            // The `Notify` lives inside the `Starting` variant so the
+            // "starting state without a notify" footgun is gone at the
+            // type level — no more `expect` here.
             let own_notify = {
                 let mut inner = handle.inner.lock().await;
                 inner.last_access = Instant::now();
-                match inner.state {
-                    AppState::Running { container_ip } => return Ok(container_ip),
-                    AppState::Starting => {
-                        let n = inner
-                            .notify
-                            .clone()
-                            .expect("Starting state must carry a notify");
+                match &inner.state {
+                    AppState::Running { container_ip } => return Ok(*container_ip),
+                    AppState::Starting { notify } => {
+                        let n = notify.clone();
                         drop(inner);
                         debug!(app = %handle.name, "awaiting concurrent start");
                         n.notified().await;
@@ -633,8 +640,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
                     }
                     AppState::Stopped => {
                         let n = Arc::new(Notify::new());
-                        inner.state = AppState::Starting;
-                        inner.notify = Some(n.clone());
+                        inner.state = AppState::Starting { notify: n.clone() };
                         n
                     }
                 }
@@ -645,9 +651,10 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
 
             // Phase 3: commit state + wake waiters (after dropping the
             // lock so concurrent readers don't contend on `Notify`).
+            // Transitioning out of `Starting` drops the in-state `Arc`;
+            // `own_notify` keeps it alive for the wake below.
             {
                 let mut inner = handle.inner.lock().await;
-                inner.notify = None;
                 inner.state = result.as_ref().map_or(AppState::Stopped, |ip| {
                     AppState::Running { container_ip: *ip }
                 });
@@ -741,7 +748,10 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
     async fn stop(&self, handle: &Arc<AppHandle>) -> Result<()> {
         {
             let mut inner = handle.inner.lock().await;
-            if !matches!(inner.state, AppState::Running { .. } | AppState::Starting) {
+            if !matches!(
+                inner.state,
+                AppState::Running { .. } | AppState::Starting { .. }
+            ) {
                 return Ok(());
             }
             inner.state = AppState::Stopping;
@@ -768,6 +778,21 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
     }
 }
 
+/// Best-effort cleanup of a TOML written by `deploy_app` that the
+/// subsequent collision-check rejected. The error is non-fatal — the
+/// stale file will be picked up by orphan cleanup at the next bugpot
+/// restart — but we log it so operators see leak when it happens.
+async fn cleanup_orphan_toml(path: &Path) {
+    if let Err(e) = tokio::fs::remove_file(path).await {
+        warn!(
+            path = %path.display(),
+            error = %e,
+            "leftover TOML from a failed deploy_app could not be removed; \
+             orphan cleanup at next startup will reclaim it"
+        );
+    }
+}
+
 fn make_handle(spec: AppSpec) -> Arc<AppHandle> {
     let name = spec.name().to_owned();
     let subdomain = spec.subdomain().to_owned();
@@ -778,16 +803,14 @@ fn make_handle(spec: AppSpec) -> Arc<AppHandle> {
         inner: Mutex::new(HandleInner {
             state: AppState::Stopped,
             last_access: Instant::now(),
-            notify: None,
         }),
     })
 }
 
 async fn view_of(handle: &Arc<AppHandle>) -> AppView {
-    let snapshot = handle.inner.lock().await.state;
-    let state = match snapshot {
+    let state = match &handle.inner.lock().await.state {
         AppState::Stopped => AppStateView::Stopped,
-        AppState::Starting => AppStateView::Starting,
+        AppState::Starting { .. } => AppStateView::Starting,
         AppState::Running { .. } => AppStateView::Running,
         AppState::Stopping => AppStateView::Stopping,
     };
@@ -1134,11 +1157,11 @@ mod tests {
 
         let alpha_state = {
             let maps = controller.apps.read().await;
-            maps.by_name.get("alpha").unwrap().inner.lock().await.state
+            maps.by_name.get("alpha").unwrap().inner.lock().await.state.clone()
         };
         let beta_state = {
             let maps = controller.apps.read().await;
-            maps.by_name.get("beta").unwrap().inner.lock().await.state
+            maps.by_name.get("beta").unwrap().inner.lock().await.state.clone()
         };
         assert!(
             matches!(alpha_state, AppState::Running { container_ip } if container_ip == Ipv4Addr::new(10, 0, 0, 42)),
@@ -1269,7 +1292,7 @@ mod tests {
 
         controller.sweep().await;
 
-        let state = handle.inner.lock().await.state;
+        let state = handle.inner.lock().await.state.clone();
         assert!(
             matches!(state, AppState::Stopped),
             "expected Stopped after sweep, got {state:?}"

@@ -154,6 +154,18 @@ impl AppSpec {
     /// Called by [`load_apps`] when reading from disk and by the admin
     /// API's `deploy_app` path; either rejects before any side effect.
     pub fn validate(&self) -> Result<(), InvalidSpec> {
+        // First: refuse a spec whose `name` resolves only via the
+        // `"unknown"` fallback in [`Self::name`]. That sentinel can
+        // collide with other unnamed specs in `AppController.apps` —
+        // here we reject early instead of silently letting two apps
+        // share a key.
+        if self.name.is_none() && self.source_path.file_stem().is_none() {
+            return Err(InvalidSpec {
+                field: "name",
+                value: String::new(),
+                reason: "name is required when the spec has no inferrable source path",
+            });
+        }
         validate_dns_label("name", self.name())?;
         // `subdomain()` defaults to `name`, so this also catches the
         // common case. When explicitly set it gets the same check.
@@ -359,6 +371,23 @@ mod tests {
         "#;
         let spec: AppSpec = toml::from_str(body).unwrap();
         let err = spec.validate().expect_err("path traversal name must be rejected");
+        assert_eq!(err.field, "name");
+    }
+
+    #[test]
+    fn appspec_validate_rejects_unresolvable_name() {
+        // No `name` field, no `source_path` → would fall back to the
+        // `"unknown"` sentinel. Must be caught at validate-time so two
+        // such specs can't collide in `AppController.apps`.
+        let body = r#"
+            image = "x:1"
+            port = 8080
+        "#;
+        let spec: AppSpec = toml::from_str(body).unwrap();
+        // `source_path` defaults to `PathBuf::new()`, which has no file_stem.
+        let err = spec
+            .validate()
+            .expect_err("unresolvable name must be rejected");
         assert_eq!(err.field, "name");
     }
 
