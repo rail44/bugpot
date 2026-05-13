@@ -1,0 +1,114 @@
+//! `bugpot` entrypoint.
+//!
+//! Loads `apps/*.toml`, brings up the egress stack (bridge / DNS / nftables),
+//! initialises the runtime, and starts the router. Apps are deployed
+//! lazily by the [`controller::AppController`] on first request, except
+//! those that explicitly opt out of scale-to-zero (`scaling.idle_timeout =
+//! "0"`), which are started eagerly on bring-up.
+//!
+//! On SIGINT, every running app is stopped and its endpoint released. The
+//! bridge / nftables ruleset persist across runs; `Egress::new` re-applies
+//! them atomically.
+
+// `pub` so `unreachable_pub` is satisfied for items defined inside; it has
+// no external effect in a binary crate.
+pub mod controller;
+
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+
+use anyhow::{Context, Result};
+use bugpot_egress::{Egress, EgressConfig};
+use bugpot_router::UpstreamResolver;
+use bugpot_runtime::Runtime;
+use controller::AppController;
+use tracing::{error, info};
+use tracing_subscriber::EnvFilter;
+
+const DEFAULT_LISTEN: &str = "127.0.0.1:8080";
+const DEFAULT_APPS_DIR: &str = "./apps";
+const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(10);
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    init_tracing();
+
+    if !nix::unistd::Uid::effective().is_root() {
+        anyhow::bail!(
+            "bugpot must run as root: bridge/netns/nftables setup requires CAP_NET_ADMIN.\n\
+             Try `sudo -E ./target/debug/bugpot`."
+        );
+    }
+
+    let apps_dir = std::env::var("BUGPOT_APPS_DIR")
+        .map_or_else(|_| PathBuf::from(DEFAULT_APPS_DIR), PathBuf::from);
+
+    let listen: SocketAddr = std::env::var("BUGPOT_LISTEN")
+        .unwrap_or_else(|_| DEFAULT_LISTEN.to_owned())
+        .parse()
+        .context("parse BUGPOT_LISTEN")?;
+
+    let apps = bugpot_config::load_apps(&apps_dir)?;
+    info!(count = apps.len(), dir = %apps_dir.display(), "loaded apps");
+
+    // Egress (bridge + DNS + nftables): idempotent across runs.
+    let egress_cfg = EgressConfig::default();
+    info!(
+        bridge = %egress_cfg.bridge_name,
+        subnet = %egress_cfg.subnet,
+        "bringing up egress"
+    );
+    let egress = Arc::new(
+        Egress::new(egress_cfg)
+            .await
+            .context("init egress (bridge/DNS/nftables)")?,
+    );
+
+    // Runtime (image cache + libcontainer state).
+    let state_dir = Runtime::default_state_dir();
+    info!(state_dir = %state_dir.display(), "init runtime");
+    let runtime = Arc::new(Runtime::new(state_dir).context("init runtime")?);
+
+    // Controller owns per-app lifecycle.
+    let controller = Arc::new(AppController::new(runtime, egress, apps));
+    if let Err(e) = controller.deploy_always_on().await {
+        error!(error = ?e, "eager-start failed; rolling back");
+        controller.teardown().await;
+        return Err(e);
+    }
+
+    // Background idle stopper.
+    let stopper = Arc::clone(&controller);
+    let stopper_task = tokio::spawn(stopper.idle_stopper_loop(IDLE_SWEEP_INTERVAL));
+
+    // Router.
+    let resolver: Arc<dyn UpstreamResolver> = controller.clone();
+    let serve_task = tokio::spawn(async move {
+        if let Err(e) = bugpot_router::serve(listen, resolver).await {
+            error!(error = %e, "router exited with error");
+        }
+    });
+
+    info!(%listen, "bugpot up; press Ctrl+C to shut down");
+    if let Err(e) = tokio::signal::ctrl_c().await {
+        error!(error = %e, "failed to wait for SIGINT");
+    }
+    info!("shutdown signal received; tearing down");
+
+    serve_task.abort();
+    stopper_task.abort();
+    controller.teardown().await;
+
+    Ok(())
+}
+
+fn init_tracing() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                EnvFilter::new(
+                    "bugpot=info,bugpot_router=info,bugpot_runtime=info,bugpot_egress=info",
+                )
+            }),
+        )
+        .init();
+}

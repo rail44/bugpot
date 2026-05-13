@@ -1,0 +1,28 @@
+[package]
+name = "bugpot-egress"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+bugpot-config.workspace = true
+ipnet = "2.12"
+hickory-server = "0.26"
+hickory-proto = "0.26"
+hickory-resolver = "0.26"
+async-trait = "0.1"
+parking_lot = "0.12"
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

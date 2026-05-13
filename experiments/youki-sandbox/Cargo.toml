@@ -1,0 +1,27 @@
+[package]
+name = "youki-sandbox"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "youki-sandbox"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+oci-client = "0.16"
+# Match bugpot-runtime: drop libseccomp default to avoid needing
+# libseccomp-devel on the build host. Re-enable per target later.
+libcontainer = { version = "0.6", default-features = false, features = ["v2", "systemd"] }
+
+[lints]
+workspace = true

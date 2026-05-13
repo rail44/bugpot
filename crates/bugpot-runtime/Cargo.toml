@@ -1,0 +1,41 @@
+[package]
+name = "bugpot-runtime"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+bugpot-config.workspace = true
+serde = { workspace = true }
+serde_json = "1"
+thiserror = "2"
+oci-client = "0.16"
+# Pin oci-spec to the same version libcontainer 0.6 re-exports, so
+# Spec values we build can be consumed by libcontainer without
+# crossing crate versions.
+oci-spec = { version = "0.9", features = ["runtime"] }
+# Disable libseccomp feature: this crate builds and tests on dev machines
+# that may not have libseccomp installed. Seccomp can be re-enabled later
+# behind a feature flag when we ship to hosts with the lib available.
+libcontainer = { version = "0.6", default-features = false, features = ["v2", "systemd"] }
+flate2 = "1"
+tar = "0.4"
+sha2 = "0.10"
+hex = "0.4"
+nix = { version = "0.29", features = ["signal", "fs"] }
+
+[dev-dependencies]
+tempfile = "3"
+toml = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

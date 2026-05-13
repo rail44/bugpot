@@ -1,0 +1,61 @@
+[workspace]
+resolver = "3"
+members = [
+    "cmd/bugpot",
+    "crates/bugpot-config",
+    "crates/bugpot-egress",
+    "crates/bugpot-router",
+    "crates/bugpot-runtime",
+    "experiments/youki-sandbox",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+authors = ["Satoshi Amemiya <amemiya@proton.me>"]
+description = "Internal Heroku-like platform for experimental apps"
+repository = "https://github.com/rail44/bugpot"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+axum = "0.8"
+hyper = "1"
+walkdir = "2"
+async-trait = "0.1"
+
+bugpot-config = { path = "crates/bugpot-config" }
+bugpot-egress = { path = "crates/bugpot-egress" }
+bugpot-router = { path = "crates/bugpot-router" }
+bugpot-runtime = { path = "crates/bugpot-runtime" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+unreachable_pub = "warn"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+# Unavoidable in this workspace
+module_name_repetitions = "allow"
+multiple_crate_versions = "allow"
+# Doc requirements relaxed at this stage; revisit before stabilization
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+# Internal workspace, no plan to publish to crates.io
+cargo_common_metadata = "allow"

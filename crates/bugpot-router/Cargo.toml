@@ -1,0 +1,26 @@
+[package]
+name = "bugpot-router"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+hyper.workspace = true
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+tokio.workspace = true
+tracing.workspace = true
+bugpot-config.workspace = true
+
+[dev-dependencies]
+http-body-util = "0.1"
+
+[lints]
+workspace = true

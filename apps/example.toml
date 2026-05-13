@@ -1,0 +1,16 @@
+# Example app spec. Used by `cargo run -p bugpot` as a default demo.
+image = "ghcr.io/library/hello-world:latest"
+port = 8080
+
+[egress]
+allow = ["api.openai.com", "*.googleapis.com"]
+
+[env]
+LOG_LEVEL = "info"
+
+[scaling]
+idle_timeout = "5m"
+
+[resources]
+memory = "256MB"
+cpu = "0.5"
