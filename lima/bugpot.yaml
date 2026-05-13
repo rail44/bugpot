@@ -1,0 +1,69 @@
+minimumLimaVersion: 2.0.0
+
+# bugpot development VM.
+#
+# bugpot depends on Linux-only kernel features (libcontainer/youki, nftables,
+# netns, bridge) that don't exist on macOS, so all builds and test runs
+# happen inside this VM. Edits land on the macOS side via the writable
+# virtiofs mount; cargo/sudo runs in here.
+#
+# Usage:
+#   limactl create --name=bugpot ./lima/bugpot.yaml
+#   limactl start bugpot
+#   limactl shell bugpot
+#   cd /Users/gam0282/src/github.com/rail44/bugpot
+#   cargo build -p bugpot
+#   sudo -E ./target/debug/bugpot          # or any scripts/smoke-*.sh
+
+base:
+- template:_images/ubuntu-24.04
+
+vmType: vz
+mountType: virtiofs
+vmOpts:
+  vz:
+    rosetta:
+      enabled: true
+      binfmt: true
+
+cpus: 4
+memory: "8GiB"
+disk: "50GiB"
+
+# Only the repo is mounted, writable. Editor/IDE and git stay on the macOS
+# side; the VM is purely a build & run target.
+mounts:
+- location: "/Users/gam0282/src/github.com/rail44/bugpot"
+  writable: true
+
+# bugpot listens on 127.0.0.1:8080 inside the VM. Forward it to the same
+# address on the host so `curl http://alpha.bugpot.ts.net:8080/` works from
+# macOS once /etc/hosts has the demo subdomains pointed at 127.0.0.1.
+portForwards:
+- guestPort: 8080
+  hostPort: 8080
+
+provision:
+- mode: system
+  script: |
+    #!/bin/sh
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y
+    apt-get install -y --no-install-recommends \
+      build-essential pkg-config \
+      nftables iproute2 \
+      ca-certificates curl git
+- mode: user
+  script: |
+    #!/bin/sh
+    set -eux
+    if ! command -v rustup >/dev/null 2>&1; then
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path
+    fi
+    for rc in "$HOME/.bashrc" "$HOME/.profile"; do
+      if [ -f "$rc" ] && ! grep -q 'cargo/env' "$rc"; then
+        echo '. "$HOME/.cargo/env"' >> "$rc"
+      fi
+    done
