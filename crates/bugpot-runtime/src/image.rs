@@ -97,12 +97,15 @@ impl Puller {
     /// Pull and unpack an image. Idempotent: if the same digest already
     /// exists on disk it is reused.
     ///
-    /// Warm-path is fast: a single HEAD-style manifest digest probe
-    /// (`fetch_manifest_digest`) decides whether the local cache covers
-    /// the request before any layer blob is transferred. On cache hit
-    /// we read the config from disk and return; only cache miss falls
-    /// back to the monolithic `Client::pull` (manifest + config + all
-    /// layers).
+    /// Cache-hit fast paths:
+    /// - **sha-pinned ref** (`...@sha256:...`): no upstream round-trip;
+    ///   look up the cache directly by the supplied digest.
+    /// - **tag ref**: a HEAD-style manifest digest probe
+    ///   (`fetch_manifest_digest`) decides whether the local cache
+    ///   covers the request before any layer blob is transferred.
+    ///
+    /// Only a cache miss falls back to the monolithic `Client::pull`
+    /// (manifest + config + all layers).
     pub(crate) async fn pull(&self, image_ref: &str, auth: Auth) -> Result<PulledImage> {
         let reference: Reference = image_ref
             .parse()
@@ -111,40 +114,33 @@ impl Puller {
         let registry_auth: RegistryAuth = auth.into_registry_auth();
         info!(image = %reference, "pulling image");
 
-        // Phase: manifest probe. A single HEAD (falling back to GET in
-        // oci-client) returns the canonical digest. Cheap (~100-200 ms
-        // for a public registry).
-        let probe_start = Instant::now();
-        let probed_digest = self
-            .client
-            .fetch_manifest_digest(&reference, &registry_auth)
-            .await?;
-        histogram!("bugpot_image_pull_seconds", "step" => "manifest_probe")
-            .record(probe_start.elapsed().as_secs_f64());
+        // Determine the expected digest. For sha-pinned refs the
+        // upstream call is unnecessary — the ref is content-addressed.
+        let probed_id = if let Some(digest) = reference.digest() {
+            histogram!("bugpot_image_pull_seconds", "step" => "manifest_probe").record(0.0);
+            ImageId::new(digest.to_owned())
+        } else {
+            let probe_start = Instant::now();
+            let probed_digest = self
+                .client
+                .fetch_manifest_digest(&reference, &registry_auth)
+                .await?;
+            histogram!("bugpot_image_pull_seconds", "step" => "manifest_probe")
+                .record(probe_start.elapsed().as_secs_f64());
+            ImageId::new(probed_digest)
+        };
 
-        let probed_id = ImageId::new(probed_digest);
-        let probed_dir = self.images_root.join(probed_id.fs_component());
-
-        // Cache hit: reuse the on-disk image, no layer transfer.
-        if probed_dir.join(".done").exists() {
-            debug!(id = %probed_id, dir = %probed_dir.display(), "image cache hit");
-            let config_path = probed_dir.join("config.json");
-            let config_body = fs::read(&config_path)
-                .map_err(|e| RuntimeError::io(&config_path, e))?;
-            let config: ConfigFile = serde_json::from_slice(&config_body)
-                .map_err(RuntimeError::DeserializeConfig)?;
+        if let Some(cached) = load_cached_image(&self.images_root, &probed_id)? {
+            debug!(id = %probed_id, "image cache hit");
             histogram!("bugpot_image_pull_seconds", "step" => "registry").record(0.0);
             histogram!("bugpot_image_pull_seconds", "step" => "extract").record(0.0);
-            return Ok(PulledImage {
-                id: probed_id,
-                dir: probed_dir,
-                config,
-            });
+            return Ok(cached);
         }
 
-        // Cache miss: fall back to the full pull. This re-fetches the
-        // manifest one more time inside oci-client, costing a duplicate
-        // round-trip; not worth optimising on the miss path.
+        // Cache miss: fall back to the full pull. For tag refs this
+        // re-fetches the manifest one more time inside oci-client,
+        // costing a duplicate round-trip; not worth optimising on the
+        // miss path.
         let accepted = accepted_media_types();
         let registry_start = Instant::now();
         let data: ImageData = self
@@ -163,17 +159,10 @@ impl Puller {
 
         // Re-check after the full pull: a concurrent pull may have
         // finished while we were downloading layers.
-        let done_marker = image_dir.join(".done");
-        if done_marker.exists() {
-            debug!(%id, dir = %image_dir.display(), "image landed during pull, reusing");
-            let config: ConfigFile = serde_json::from_slice(&data.config.data)
-                .map_err(RuntimeError::DeserializeConfig)?;
+        if let Some(cached) = load_cached_image(&self.images_root, &id)? {
+            debug!(%id, "image landed during pull, reusing");
             histogram!("bugpot_image_pull_seconds", "step" => "extract").record(0.0);
-            return Ok(PulledImage {
-                id,
-                dir: image_dir,
-                config,
-            });
+            return Ok(cached);
         }
 
         // Fresh extract. Use a tmp dir then atomic rename to avoid leaving
@@ -229,6 +218,28 @@ impl Puller {
             config,
         })
     }
+}
+
+/// Reconstruct a [`PulledImage`] from the on-disk cache for `id`,
+/// or return `Ok(None)` if no `.done` marker exists for that digest.
+///
+/// Shared between [`Puller::pull`]'s cache-hit short-circuit and
+/// `Runtime::start_app` so callers that already pulled the image do
+/// not have to round-trip the registry again.
+pub(crate) fn load_cached_image(images_root: &Path, id: &ImageId) -> Result<Option<PulledImage>> {
+    let image_dir = images_root.join(id.fs_component());
+    if !image_dir.join(".done").exists() {
+        return Ok(None);
+    }
+    let config_path = image_dir.join("config.json");
+    let config_body = fs::read(&config_path).map_err(|e| RuntimeError::io(&config_path, e))?;
+    let config: ConfigFile =
+        serde_json::from_slice(&config_body).map_err(RuntimeError::DeserializeConfig)?;
+    Ok(Some(PulledImage {
+        id: id.clone(),
+        dir: image_dir,
+        config,
+    }))
 }
 
 fn accepted_media_types() -> Vec<&'static str> {

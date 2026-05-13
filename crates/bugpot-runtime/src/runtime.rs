@@ -23,7 +23,7 @@ use tracing::{debug, info, warn};
 
 use crate::auth::Auth;
 use crate::error::{Result, RuntimeError};
-use crate::image::{ImageId, Puller};
+use crate::image::{ImageId, Puller, load_cached_image};
 use crate::spec::{SpecInputs, build_spec};
 
 /// A bugpot-managed container that has been started.
@@ -88,15 +88,20 @@ impl Runtime {
 
     /// Prepare a bundle and start a container for `spec`.
     ///
+    /// The image identified by `image_id` must already be on disk —
+    /// callers obtain it from a prior [`Self::pull_image`] call.
+    ///
     /// Steps:
-    ///   1. Pull the image (idempotent: skips if already on disk).
+    ///   1. Load the cached image (no registry round-trip).
     ///   2. Build `<state>/bundles/<app>/rootfs` by symlinking or copying
     ///      from the image cache.
     ///   3. Generate `config.json` from `AppSpec` + image config.
     ///   4. Hand off to `libcontainer::ContainerBuilder` to create/start.
+    #[allow(clippy::unused_async)] // pre-pull moved to caller; kept async for API symmetry
     pub async fn start_app(
         &self,
         spec: &AppSpec,
+        image_id: &ImageId,
         netns_path: Option<&Path>,
     ) -> Result<RunningApp> {
         let name = spec.name().to_owned();
@@ -111,9 +116,14 @@ impl Runtime {
             return Err(RuntimeError::AppAlreadyRunning(name));
         }
 
-        // 1. Image.
-        let puller = Puller::new(self.images_dir.clone());
-        let image = puller.pull(&spec.image, Auth::Anonymous).await?;
+        // 1. Image: must already be in the on-disk cache. Callers do
+        // `pull_image` first; passing the result here avoids a second
+        // registry round-trip on the warm path.
+        let image = load_cached_image(&self.images_dir, image_id)?.ok_or_else(|| {
+            RuntimeError::Other(format!(
+                "image {image_id} not in cache; caller must pull it first"
+            ))
+        })?;
 
         // 2. Bundle.
         let step = Instant::now();
@@ -418,7 +428,14 @@ port = 8080
 name = "hello"
 "#;
         let app: AppSpec = toml::from_str(toml_src).unwrap();
-        let running = rt.start_app(&app, None).await.expect("start_app");
+        let image_id = rt
+            .pull_image(&app.image, Auth::Anonymous)
+            .await
+            .expect("pull_image");
+        let running = rt
+            .start_app(&app, &image_id, None)
+            .await
+            .expect("start_app");
         assert!(running.pid > 1);
         rt.stop_app("hello").await.expect("stop_app");
     }
