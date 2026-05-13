@@ -21,6 +21,7 @@ use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:8080";
+const DEFAULT_ADMIN_LISTEN: &str = "127.0.0.1:8081";
 const DEFAULT_APPS_DIR: &str = "./apps";
 const DEFAULT_AUTH_FILE: &str = "/etc/bugpot/auth.toml";
 const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(10);
@@ -43,6 +44,11 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| DEFAULT_LISTEN.to_owned())
         .parse()
         .context("parse BUGPOT_LISTEN")?;
+
+    let admin_listen: SocketAddr = std::env::var("BUGPOT_ADMIN_LISTEN")
+        .unwrap_or_else(|_| DEFAULT_ADMIN_LISTEN.to_owned())
+        .parse()
+        .context("parse BUGPOT_ADMIN_LISTEN")?;
 
     let apps = bugpot_config::load_apps(&apps_dir)?;
     info!(count = apps.len(), dir = %apps_dir.display(), "loaded apps");
@@ -100,13 +106,22 @@ async fn main() -> Result<()> {
         }
     });
 
-    info!(%listen, "bugpot up; press Ctrl+C to shut down");
+    // Admin HTTP API.
+    let admin_controller = Arc::clone(&controller);
+    let admin_task = tokio::spawn(async move {
+        if let Err(e) = bugpot_admin::serve(admin_listen, admin_controller).await {
+            error!(error = %e, "admin api exited with error");
+        }
+    });
+
+    info!(%listen, %admin_listen, "bugpot up; press Ctrl+C to shut down");
     if let Err(e) = tokio::signal::ctrl_c().await {
         error!(error = %e, "failed to wait for SIGINT");
     }
     info!("shutdown signal received; tearing down");
 
     serve_task.abort();
+    admin_task.abort();
     stopper_task.abort();
     controller.teardown().await;
 
@@ -118,7 +133,7 @@ fn init_tracing() {
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| {
                 EnvFilter::new(
-                    "bugpot=info,bugpot_router=info,bugpot_runtime=info,bugpot_egress=info",
+                    "bugpot=info,bugpot_admin=info,bugpot_router=info,bugpot_runtime=info,bugpot_egress=info,bugpot_controller=info",
                 )
             }),
         )
