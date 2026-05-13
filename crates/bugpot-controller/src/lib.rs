@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
@@ -127,6 +128,12 @@ pub struct AppController<R: RuntimeOps, E: EgressOps> {
     /// Cleared when an app is stopped so the next run starts from 0 —
     /// Prometheus `rate()` handles the apparent reset.
     cpu_baselines: tokio::sync::Mutex<HashMap<String, u64>>,
+    /// One-shot guard for `reattach_running`. The controller is only
+    /// meant to reattach once per bugpot process — the function calls
+    /// `ensure_log_tails` per surviving app, and a second call would
+    /// double up tail tasks on the same files. Set on first entry; any
+    /// further call is a no-op with a warning.
+    reattach_done: AtomicBool,
 }
 
 impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
@@ -153,6 +160,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
             auth,
             apps: RwLock::new(apps),
             cpu_baselines: tokio::sync::Mutex::new(HashMap::new()),
+            reattach_done: AtomicBool::new(false),
         }
     }
 
@@ -192,7 +200,20 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
     /// recovery path: there is no way to safely manufacture the missing
     /// IP, and we would rather rebuild than route traffic to a netns
     /// we do not fully understand.
+    ///
+    /// Idempotent against accidental double-call: a second invocation
+    /// is a no-op with a warning. The body spawns log-tail tasks per
+    /// surviving app, and running it twice would double-tail every
+    /// file — harmless functionally but visible as duplicate lines in
+    /// tracing.
     pub async fn reattach_running(&self) {
+        if self
+            .reattach_done
+            .swap(true, Ordering::SeqCst)
+        {
+            warn!("reattach_running called more than once; ignoring subsequent calls");
+            return;
+        }
         for handle in self.snapshot_handles().await {
             let name = &handle.name;
             if !self.runtime.is_container_running(name) {
@@ -211,6 +232,13 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
                         };
                         inner.last_access = Instant::now();
                     }
+                    // The previous bugpot's tail tasks died with it.
+                    // Spawn fresh ones so the new process's tracing
+                    // pipeline (and `just logs`) keeps showing app
+                    // output. Tails seek to EOF — historical lines
+                    // remain readable in the log file but don't
+                    // replay.
+                    self.runtime.ensure_log_tails(name);
                     info!(app = %name, container_ip = %ep.container_ip, "reattached to running container");
                 }
                 Ok(None) => {
@@ -824,6 +852,10 @@ mod tests {
         fn resource_usage(&self, _id: &str) -> Option<ResourceUsage> {
             None
         }
+
+        fn ensure_log_tails(&self, id: &str) {
+            self.record(format!("ensure_log_tails({id})"));
+        }
     }
 
     #[derive(Debug, Default)]
@@ -1031,6 +1063,43 @@ mod tests {
             !eg_calls.iter().any(|c| c.starts_with("allocate_endpoint")),
             "allocate_endpoint must not be called during reattach; got {eg_calls:?}"
         );
+        // The fresh tail tasks must be spawned for the reattached app
+        // (the previous bugpot's tails died with it).
+        let rt_calls = controller.runtime.calls();
+        assert!(
+            rt_calls.contains(&"ensure_log_tails(alpha)".to_owned()),
+            "expected ensure_log_tails(alpha); got {rt_calls:?}"
+        );
+    }
+
+    /// A second call to `reattach_running` must be a no-op so accidental
+    /// re-invocation does not double the log-tail tasks per app.
+    #[tokio::test]
+    async fn reattach_running_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let controller = make_controller(vec![spec_with_name("alpha")], tmp.path().to_owned());
+        controller.runtime.set_running("alpha", true);
+        controller
+            .egress
+            .set_discovered("alpha", Ipv4Addr::new(10, 0, 0, 7));
+
+        controller.reattach_running().await;
+        controller.reattach_running().await; // should short-circuit
+
+        let eg_reattach_calls = controller
+            .egress
+            .calls()
+            .iter()
+            .filter(|c| c.starts_with("reattach_endpoint"))
+            .count();
+        let rt_tail_calls = controller
+            .runtime
+            .calls()
+            .iter()
+            .filter(|c| c.starts_with("ensure_log_tails"))
+            .count();
+        assert_eq!(eg_reattach_calls, 1, "reattach_endpoint must run once");
+        assert_eq!(rt_tail_calls, 1, "ensure_log_tails must run once");
     }
 
     /// Sweep must detect a container that died under the controller's

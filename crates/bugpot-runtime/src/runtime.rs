@@ -2,13 +2,13 @@
 //! `libcontainer`.
 
 use std::collections::HashMap;
-use std::fs;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::fs::{self, OpenOptions};
+use std::future::Future;
+use std::io::SeekFrom;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::Instant;
-
-use std::future::Future;
+use std::time::{Duration, Instant};
 
 use bugpot_config::AppSpec;
 use libcontainer::container::{Container, ContainerStatus};
@@ -16,11 +16,8 @@ use libcontainer::container::builder::ContainerBuilder;
 use libcontainer::signal::Signal;
 use libcontainer::syscall::syscall::SyscallType;
 use metrics::histogram;
-use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use nix::sys::signal::Signal as NixSignal;
-use nix::unistd::pipe;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::net::unix::pipe::Receiver as PipeReceiver;
+use tokio::io::{AsyncBufReadExt, AsyncSeekExt, BufReader};
 use tracing::{debug, info, warn};
 
 use crate::auth::Auth;
@@ -71,6 +68,10 @@ pub trait RuntimeOps: Send + Sync + std::fmt::Debug + 'static {
     fn stop_app(&self, id: &str) -> impl Future<Output = Result<()>> + Send;
     fn is_container_running(&self, id: &str) -> bool;
     fn resource_usage(&self, id: &str) -> Option<ResourceUsage>;
+    /// (Re)spawn log-tail tasks for `id`. Used by the controller after a
+    /// successful reattach so the new bugpot's tracing pipeline picks
+    /// up the surviving container's stdout/stderr from EOF.
+    fn ensure_log_tails(&self, id: &str);
 }
 
 /// Container lifecycle runtime.
@@ -80,6 +81,7 @@ pub struct Runtime {
     images_dir: PathBuf,
     bundles_dir: PathBuf,
     containers_dir: PathBuf,
+    logs_dir: PathBuf,
     apps: Mutex<HashMap<String, RunningApp>>,
 }
 
@@ -90,7 +92,8 @@ impl Runtime {
         let images_dir = state_dir.join("images");
         let bundles_dir = state_dir.join("bundles");
         let containers_dir = state_dir.join("containers");
-        for p in [&state_dir, &images_dir, &bundles_dir, &containers_dir] {
+        let logs_dir = state_dir.join("logs");
+        for p in [&state_dir, &images_dir, &bundles_dir, &containers_dir, &logs_dir] {
             fs::create_dir_all(p).map_err(|e| RuntimeError::io(p, e))?;
         }
 
@@ -99,6 +102,7 @@ impl Runtime {
             images_dir,
             bundles_dir,
             containers_dir,
+            logs_dir,
             apps: Mutex::new(HashMap::new()),
         })
     }
@@ -213,20 +217,32 @@ impl RuntimeOps for Runtime {
 
         info!(app = %name, bundle = %bundle_dir.display(), "creating container");
 
-        // Capture the container's stdout/stderr by passing pipe write-ends
-        // to libcontainer (which dup2's them onto fd 1/2 in the container
-        // init). We keep the read-ends and forward each line through
-        // tracing with `app` / `stream` fields. Pipes are blocking on the
-        // container side and non-blocking on ours (required by tokio's
-        // pipe Receiver).
-        let (stdout_r, stdout_w) = pipe()
-            .map_err(|e| RuntimeError::Other(format!("stdout pipe for {name}: {e}")))?;
-        let (stderr_r, stderr_w) = pipe()
-            .map_err(|e| RuntimeError::Other(format!("stderr pipe for {name}: {e}")))?;
-        fcntl(stdout_r.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
-            .map_err(|e| RuntimeError::Other(format!("set stdout NONBLOCK: {e}")))?;
-        fcntl(stderr_r.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
-            .map_err(|e| RuntimeError::Other(format!("set stderr NONBLOCK: {e}")))?;
+        // Container stdout/stderr go to append-mode files on the host
+        // (`<state>/logs/<app>/{stdout,stderr}.log`) rather than pipes
+        // owned by bugpot. Reasons:
+        //   - Files survive bugpot's death; a SIGKILL/crash no longer
+        //     leaves the container writing to a closed pipe (SIGPIPE
+        //     would kill the app on its next write — see #38).
+        //   - On `reattach_running`, the new bugpot just tails the
+        //     existing files; the container's fd 1/2 keep working
+        //     through the restart.
+        // Volume bounding (rotation, rate limit) is deferred to #21.
+        let log_dir = self.log_dir_for(&name);
+        fs::create_dir_all(&log_dir).map_err(|e| RuntimeError::io(&log_dir, e))?;
+        let stdout_path = log_dir.join("stdout.log");
+        let stderr_path = log_dir.join("stderr.log");
+        let stdout_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&stdout_path)
+            .map_err(|e| RuntimeError::io(&stdout_path, e))?;
+        let stderr_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&stderr_path)
+            .map_err(|e| RuntimeError::io(&stderr_path, e))?;
+        let stdout_fd: OwnedFd = stdout_file.into();
+        let stderr_fd: OwnedFd = stderr_file.into();
 
         // `with_stdout`/`with_stderr` live on `ContainerBuilder`, so they
         // must be called *before* `.as_init(...)` flips us into the
@@ -234,8 +250,8 @@ impl RuntimeOps for Runtime {
         let step = Instant::now();
         let mut container: Container = ContainerBuilder::new(name.clone(), SyscallType::Linux)
             .with_root_path(&self.containers_dir)?
-            .with_stdout(stdout_w)
-            .with_stderr(stderr_w)
+            .with_stdout(stdout_fd)
+            .with_stderr(stderr_fd)
             .as_init(&bundle_dir)
             .with_systemd(false)
             .with_detach(true)
@@ -250,11 +266,12 @@ impl RuntimeOps for Runtime {
         histogram!("bugpot_container_start_seconds", "step" => "libcontainer_start")
             .record(step.elapsed().as_secs_f64());
 
-        // Forwarders self-terminate on EOF (container exit closes the
-        // write-ends, our read-ends see 0 bytes). Detached on purpose;
-        // tracking JoinHandles isn't worth the bookkeeping at this scale.
-        tokio::spawn(forward_pipe(stdout_r, name.clone(), "stdout"));
-        tokio::spawn(forward_pipe(stderr_r, name.clone(), "stderr"));
+        // Tail tasks read from the same files (read-only) and emit each
+        // new line via tracing so `just logs` still works. Seek to EOF
+        // so a fresh start doesn't replay historical lines; on reattach,
+        // the controller calls `ensure_log_tails` for the same effect.
+        tokio::spawn(forward_log_file(stdout_path, name.clone(), "stdout"));
+        tokio::spawn(forward_log_file(stderr_path, name.clone(), "stderr"));
 
         let raw_pid = container
             .pid()
@@ -340,6 +357,14 @@ impl RuntimeOps for Runtime {
             .remove(id);
         Ok(())
     }
+
+    fn ensure_log_tails(&self, id: &str) {
+        let log_dir = self.log_dir_for(id);
+        let stdout_path = log_dir.join("stdout.log");
+        let stderr_path = log_dir.join("stderr.log");
+        tokio::spawn(forward_log_file(stdout_path, id.to_owned(), "stdout"));
+        tokio::spawn(forward_log_file(stderr_path, id.to_owned(), "stderr"));
+    }
 }
 
 impl Runtime {
@@ -350,25 +375,46 @@ impl Runtime {
         let apps = self.apps.lock().expect("apps mutex poisoned");
         apps.values().cloned().collect()
     }
+
+    fn log_dir_for(&self, app: &str) -> PathBuf {
+        self.logs_dir.join(app)
+    }
 }
 
-/// Forward each line from a container pipe into bugpot's tracing log,
-/// tagged with the app name and stream identifier ("stdout" / "stderr").
-/// Returns when the pipe reaches EOF or hits a read error.
-async fn forward_pipe(fd: OwnedFd, app: String, stream: &'static str) {
-    let recv = match PipeReceiver::from_owned_fd(fd) {
-        Ok(r) => r,
+/// Poll a per-app log file and forward each new line through tracing.
+///
+/// Starts at end-of-file so a freshly-started or reattached bugpot does
+/// not replay historical lines. After every transient `Ok(0)` (no new
+/// data), sleeps briefly and re-reads — the kernel keeps the file's
+/// offset across appends, so subsequent reads pick up new bytes
+/// without seeking. Detached on purpose; cancellation happens when
+/// bugpot itself exits (we abort no `JoinHandle`s).
+async fn forward_log_file(path: PathBuf, app: String, stream: &'static str) {
+    const POLL_INTERVAL: Duration = Duration::from_millis(200);
+    let file = match tokio::fs::OpenOptions::new()
+        .read(true)
+        .open(&path)
+        .await
+    {
+        Ok(f) => f,
         Err(e) => {
-            warn!(app = %app, stream, error = %e, "wrap pipe failed; dropping log stream");
+            warn!(app = %app, stream, path = %path.display(), error = %e, "open log file for tail failed");
             return;
         }
     };
-    let mut reader = BufReader::new(recv);
+    let mut file = file;
+    if let Err(e) = file.seek(SeekFrom::End(0)).await {
+        warn!(app = %app, stream, error = %e, "seek to EOF failed");
+        return;
+    }
+    let mut reader = BufReader::new(file);
     let mut line = String::new();
     loop {
         line.clear();
         match reader.read_line(&mut line).await {
-            Ok(0) => return,
+            Ok(0) => {
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
             Ok(_) => {
                 let trimmed = line.trim_end();
                 if !trimmed.is_empty() {
@@ -376,7 +422,7 @@ async fn forward_pipe(fd: OwnedFd, app: String, stream: &'static str) {
                 }
             }
             Err(e) => {
-                warn!(app = %app, stream, error = %e, "pipe read failed");
+                warn!(app = %app, stream, error = %e, "log file tail read failed");
                 return;
             }
         }
