@@ -6,12 +6,14 @@ use std::fs;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Instant;
 
 use bugpot_config::AppSpec;
 use libcontainer::container::{Container, ContainerStatus};
 use libcontainer::container::builder::ContainerBuilder;
 use libcontainer::signal::Signal;
 use libcontainer::syscall::syscall::SyscallType;
+use metrics::histogram;
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use nix::sys::signal::Signal as NixSignal;
 use nix::unistd::pipe;
@@ -114,8 +116,11 @@ impl Runtime {
         let image = puller.pull(&spec.image, Auth::Anonymous).await?;
 
         // 2. Bundle.
+        let step = Instant::now();
         let bundle_dir = self.bundles_dir.join(&name);
         prepare_bundle_dir(&bundle_dir, &image.rootfs())?;
+        histogram!("bugpot_container_start_seconds", "step" => "bundle")
+            .record(step.elapsed().as_secs_f64());
 
         // 3. Spec.
         //
@@ -124,6 +129,7 @@ impl Runtime {
         // accepts an absolute `root.path`; we also need an absolute path so
         // `build_spec`'s named-user resolver can read
         // `<rootfs>/etc/{passwd,group}` at spec-build time.
+        let step = Instant::now();
         let bundle_rootfs = bundle_dir.join("rootfs");
         let runtime_spec = build_spec(&SpecInputs {
             spec,
@@ -135,6 +141,8 @@ impl Runtime {
         runtime_spec
             .save(&config_path)
             .map_err(RuntimeError::from)?;
+        histogram!("bugpot_container_start_seconds", "step" => "spec")
+            .record(step.elapsed().as_secs_f64());
 
         // 4. Build container.
         //
@@ -172,6 +180,7 @@ impl Runtime {
         // `with_stdout`/`with_stderr` live on `ContainerBuilder`, so they
         // must be called *before* `.as_init(...)` flips us into the
         // init-builder type.
+        let step = Instant::now();
         let mut container: Container = ContainerBuilder::new(name.clone(), SyscallType::Linux)
             .with_root_path(&self.containers_dir)?
             .with_stdout(stdout_w)
@@ -180,10 +189,15 @@ impl Runtime {
             .with_systemd(false)
             .with_detach(true)
             .build()?;
+        histogram!("bugpot_container_start_seconds", "step" => "libcontainer_build")
+            .record(step.elapsed().as_secs_f64());
 
         // libcontainer `as_init().build()` runs the init process up to the
         // "created" state. We then transition it to "running".
+        let step = Instant::now();
         container.start()?;
+        histogram!("bugpot_container_start_seconds", "step" => "libcontainer_start")
+            .record(step.elapsed().as_secs_f64());
 
         // Forwarders self-terminate on EOF (container exit closes the
         // write-ends, our read-ends see 0 bytes). Detached on purpose;

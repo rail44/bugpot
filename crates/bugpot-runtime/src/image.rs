@@ -17,8 +17,10 @@ use std::fmt;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use flate2::read::GzDecoder;
+use metrics::histogram;
 use oci_client::{
     Client, Reference,
     client::{ClientConfig, ImageData},
@@ -103,10 +105,18 @@ impl Puller {
         let accepted = accepted_media_types();
         info!(image = %reference, "pulling image");
 
+        // Phase: registry. Currently this is monolithic — oci-client's
+        // `Client::pull` fetches manifest *and* layer blobs in one shot,
+        // even when our local cache already holds the digest. Splitting
+        // manifest-only first would let warm pulls skip layer download
+        // entirely; not done yet (see TODO).
+        let registry_start = Instant::now();
         let data: ImageData = self
             .client
             .pull(&reference, &registry_auth, accepted)
             .await?;
+        histogram!("bugpot_image_pull_seconds", "step" => "registry")
+            .record(registry_start.elapsed().as_secs_f64());
 
         let digest = data
             .digest
@@ -121,6 +131,9 @@ impl Puller {
             debug!(%id, dir = %image_dir.display(), "image already on disk");
             let config: ConfigFile = serde_json::from_slice(&data.config.data)
                 .map_err(RuntimeError::DeserializeConfig)?;
+            // Record a zero-time "extract" so cache-hit vs miss is
+            // discernible from the histogram count alone.
+            histogram!("bugpot_image_pull_seconds", "step" => "extract").record(0.0);
             return Ok(PulledImage {
                 id,
                 dir: image_dir,
@@ -130,6 +143,7 @@ impl Puller {
 
         // Fresh extract. Use a tmp dir then atomic rename to avoid leaving
         // partials on crash.
+        let extract_start = Instant::now();
         let tmp_dir = self
             .images_root
             .join(format!("{}.tmp.{}", id.fs_component(), std::process::id()));
@@ -170,6 +184,8 @@ impl Puller {
         } else {
             fs::rename(&tmp_dir, &image_dir).map_err(|e| RuntimeError::io(&image_dir, e))?;
         }
+        histogram!("bugpot_image_pull_seconds", "step" => "extract")
+            .record(extract_start.elapsed().as_secs_f64());
 
         info!(%id, dir = %image_dir.display(), "image ready");
         Ok(PulledImage {
