@@ -88,9 +88,10 @@ Env vars (read by bugpot directly):
 - `BUGPOT_STATE_DIR` (default `/var/lib/bugpot`)
 - `BUGPOT_LISTEN` — public HTTP router (default `127.0.0.1:8080`)
 - `BUGPOT_ADMIN_LISTEN` — admin HTTP API (default `127.0.0.1:8081`)
-- `BUGPOT_ADMIN_TOKEN` — bearer token for admin API; if set, all admin routes require `Authorization: Bearer <token>` (constant-time compare). Unset = no auth (trust delegated to listener binding).
+- `BUGPOT_ADMIN_TOKEN` — bearer token for admin API; if set, all admin routes require `Authorization: Bearer <token>` (constant-time compare via `subtle::ConstantTimeEq`, token held in `Zeroizing`). Unset = no auth (trust delegated to listener binding).
 - `BUGPOT_ADMIN_TOKEN_FILE` — path to a file whose trimmed contents are the token. Used when `BUGPOT_ADMIN_TOKEN` is not set. Typical layout: `/etc/bugpot/admin-token` with `root:root 0600` permissions.
 - `BUGPOT_AUTH_FILE` — registry-auth TOML (default `/etc/bugpot/auth.toml`, missing file = anonymous)
+- `BUGPOT_METRICS_LISTEN` — opt-in Prometheus listener (e.g. `127.0.0.1:9090`). Unset = `/metrics` + `/healthz` disabled.
 - `RUST_LOG`
 
 ### Admin HTTP API
@@ -225,15 +226,18 @@ self-access restriction) before they get hidden behind automation.
 
 ## Architecture
 
-Four library crates assembled by a single binary:
+Library crates assembled by a single binary:
 
 ```
-cmd/bugpot (main + controller)
+cmd/bugpot (main: wires everything; no business logic)
    │
-   ├─► bugpot-config  : parses apps/*.toml → AppSpec
-   ├─► bugpot-egress  : bridge + netns + nft + DNS allowlist
-   ├─► bugpot-runtime : OCI pull + libcontainer lifecycle
-   └─► bugpot-router  : axum reverse proxy, resolves by Host subdomain
+   ├─► bugpot-config     : parses apps/*.toml → AppSpec
+   ├─► bugpot-egress     : bridge + netns + nft + DNS allowlist
+   ├─► bugpot-runtime    : OCI pull + libcontainer lifecycle
+   ├─► bugpot-router     : axum reverse proxy, resolves by Host subdomain
+   ├─► bugpot-controller : AppHandle state machine + cold-start orchestration + idle reaper
+   ├─► bugpot-admin      : admin HTTP API (CRUD over AppController), bearer auth
+   └─► bugpot-metrics    : Prometheus recorder + /metrics + /healthz listener
 ```
 
 `experiments/youki-sandbox` is a standalone playground for oci-client/libcontainer experiments; it isn't part of the runtime path.
@@ -252,11 +256,17 @@ The nftables forward chain is **default-drop**. Packets only escape via a `(src_
 
 ### Scale-to-zero
 
-`scaling.idle_timeout` in app TOML: `"0"` / `""` / missing → always-on (eagerly started at bring-up); `"30s"` / `"5m"` / `"2h"` → reclaimed by `idle_stopper_loop` once `last_access` is older than the timeout. Default 5m. The state-transition logic is in `cmd/bugpot/src/controller.rs`.
+`scaling.idle_timeout` in app TOML: `"0"` / `""` / missing → always-on (eagerly started at bring-up); `"30s"` / `"5m"` / `"2h"` → reclaimed by `idle_stopper_loop` once `last_access` is older than the timeout. Default 5m. The state-transition logic lives in `crates/bugpot-controller`.
 
 ### State directory
 
 `/var/lib/bugpot/{images,bundles,containers}`. Images are content-addressed by digest; bundles are per-app (`rootfs` is a symlink into the image cache — read-only, no overlayfs yet). `Runtime::start_app` removes stale `containers/<name>` from a prior crash before letting libcontainer recreate it. Note that libcontainer's `with_root_path` takes the **parent** of the per-container state dir, not the dir itself.
+
+### Observability
+
+- `bugpot-metrics::install_recorder` is called unconditionally at startup so `metrics` macros always emit; the HTTP listener (`/metrics`, `/healthz`) only binds when `BUGPOT_METRICS_LISTEN` is set. No auth — bind to a trusted interface.
+- Cold-start instrumentation: `bugpot_cold_start_seconds{phase=endpoint|pull|start|readiness}` (controller, success-only), `bugpot_image_pull_seconds{step=…}` (runtime), `bugpot_container_start_seconds{step=…}` (runtime).
+- Container stdout/stderr is captured by `bugpot-runtime` and re-emitted through `tracing` under target `bugpot::app` with fields `app` and `stream` — filter with `RUST_LOG=bugpot::app=info`.
 
 ## Conventions
 
