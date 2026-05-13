@@ -124,6 +124,66 @@ as siblings of `bugpot-admin`; the public mutation API on
 `AppController` (`deploy_app` / `remove_app` / `list_apps` / `get_app`)
 is the shared boundary.
 
+## Exposing apps on a tailnet (Tailscale Services)
+
+For dogfooding on a real tailnet, bugpot integrates with **Tailscale
+Services** (the 2026 feature that gives each registered service its own
+`<service>.<tailnet>.ts.net` URL with automatic TLS). bugpot itself
+contains no Tailscale code — exposure is configured externally via the
+`tailscale serve` CLI on the bugpot host. Phase 1 is fully manual;
+automating registration from `deploy_app` is a deferred follow-up.
+
+### One-time host setup
+
+```sh
+# Join the tailnet (operator-supplied auth).
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up --advertise-tags=tag:bugpot
+```
+
+Then enable HTTPS in the Tailscale admin console (DNS → HTTPS
+Certificates → Enable). This authorises `*.ts.net` cert provisioning
+for every device in the tailnet.
+
+### Per-app Service registration
+
+For each app subdomain you want reachable from the tailnet, register a
+Service whose name **matches** the app's subdomain (the part bugpot's
+`subdomain_of` extracts from the `Host` header):
+
+```sh
+# Example: app TOML has subdomain = "alpha" (default = name).
+sudo tailscale serve --service=svc:alpha --bg http://localhost:8080
+sudo tailscale serve --service=svc:beta  --bg http://localhost:8080
+```
+
+Both Services proxy to bugpot's router on `127.0.0.1:8080`. The Host
+header that arrives at bugpot is `<service>.<tailnet>.ts.net`, so
+`subdomain_of` extracts `<service>` and routes to the matching app.
+**Names must align**: `tailscale serve --service=svc:alpha …` ↔ app
+spec `name = "alpha"` (or `subdomain = "alpha"`).
+
+### Verifying
+
+From a *different* tailnet device (a Service host cannot reach the
+Service it hosts):
+
+```sh
+curl https://alpha.<tailnet>.ts.net/
+```
+
+TLS cert is provisioned on first request; the first hit can be slow.
+
+### Phase 2 (deferred): automated Service registration
+
+Eventually `AppController::deploy_app` could shell out to
+`tailscale serve --service=svc:<name> --bg …` after a successful
+deploy, and the inverse on `remove_app`. Gated behind an env
+(e.g. `BUGPOT_TAILSCALE_SERVICES=on`) so non-Tailscale topologies stay
+unchanged. Not in this iteration — the manual path is enough for
+dogfooding and exposes operational gotchas (e.g. Service host
+self-access restriction) before they get hidden behind automation.
+
 ## Architecture
 
 Four library crates assembled by a single binary:
