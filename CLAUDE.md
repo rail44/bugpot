@@ -262,6 +262,15 @@ The nftables forward chain is **default-drop**. Packets only escape via a `(src_
 
 `/var/lib/bugpot/{images,bundles,containers}`. Images are content-addressed by digest; bundles are per-app (`rootfs` is a symlink into the image cache — read-only, no overlayfs yet). `Runtime::start_app` removes stale `containers/<name>` from a prior crash before letting libcontainer recreate it. Note that libcontainer's `with_root_path` takes the **parent** of the per-container state dir, not the dir itself.
 
+### Multi-arch image handling
+
+bugpot delegates image-index resolution to oci-client's default `current_platform_resolver`, which matches the first index entry whose `(os, architecture)` equals `(Os::default(), Arch::default())`. Both defaults are derived from `std::env::consts::{OS, ARCH}` (Rust compile target), with the arch string translated to its Go/OCI name (`x86_64 → amd64`, `aarch64 → arm64`, etc.).
+
+- Verified empirically on aarch64: `docker.io/library/alpine:latest` resolves to `architecture=arm64, variant=v8, os=linux`.
+- **No variant matching** — oci-client documents this explicitly. For `arm/v6` vs `arm/v7` indexes the first match wins; on `aarch64` it's almost always `v8` (or no variant), so this rarely bites.
+- **No cross-architecture pulls** — if the index has no entry for the host arch the pull fails. That's deliberate: bugpot is the host that runs the container.
+- A bugpot binary built for `x86_64` running under Rosetta on an `arm64` host will pull `amd64` images. The compile target wins, which matches the actual execution environment.
+
 ### Observability
 
 - `bugpot-metrics::install_recorder` is called unconditionally at startup so `metrics` macros always emit; the HTTP listener (`/metrics`, `/healthz`) only binds when `BUGPOT_METRICS_LISTEN` is set. No auth — bind to a trusted interface.
