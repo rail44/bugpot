@@ -266,6 +266,7 @@ dependencies = [
  "flate2",
  "hex",
  "libcontainer",
+ "metrics",
  "nix 0.29.0",
  "oci-client",
  "oci-spec",
