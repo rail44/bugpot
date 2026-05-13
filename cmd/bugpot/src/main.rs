@@ -85,6 +85,18 @@ async fn main() -> Result<()> {
     info!(state_dir = %state_dir.display(), "init runtime");
     let runtime = Arc::new(Runtime::new(state_dir).context("init runtime")?);
 
+    // Reclaim image cache dirs whose digest no bundle references and
+    // any orphan `.tmp.*` / incomplete-pull dirs. Safe before pulls
+    // because nothing else has started yet.
+    match runtime.gc_unused_images() {
+        Ok(removed) if removed > 0 => {
+            info!(removed, "image cache GC");
+            metrics::counter!("bugpot_images_gc_total").increment(removed as u64);
+        }
+        Ok(_) => {}
+        Err(e) => warn!(error = ?e, "image cache GC failed (continuing)"),
+    }
+
     // Controller owns per-app lifecycle.
     let controller = Arc::new(AppController::new(
         runtime,

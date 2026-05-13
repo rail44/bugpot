@@ -1,7 +1,7 @@
 //! Public `Runtime` API: container lifecycle on top of `oci-client` and
 //! `libcontainer`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::future::Future;
 use std::io::SeekFrom;
@@ -31,7 +31,7 @@ const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024; // 10 MiB
 
 use crate::auth::Auth;
 use crate::error::{Result, RuntimeError};
-use crate::image::{ImageId, Puller, load_cached_image};
+use crate::image::{ImageId, Puller, gc_unused_images, load_cached_image};
 use crate::spec::{SpecInputs, build_spec};
 
 /// A bugpot-managed container that has been started.
@@ -423,6 +423,57 @@ impl Runtime {
     fn log_dir_for(&self, app: &str) -> PathBuf {
         self.logs_dir.join(app)
     }
+
+    /// Reference set for image-cache GC: every digest currently bound
+    /// to a bundle's `rootfs` symlink. Apps that have at least started
+    /// once have their image protected; apps registered but never
+    /// started fall outside this set and will re-pull on first start.
+    ///
+    /// The set is keyed by [`ImageId`] (= manifest digest) on purpose:
+    /// when overlayfs / layer-keyed storage lands, the same caller
+    /// pattern works — the inner expansion to live layers is internal
+    /// to `gc_unused_images`.
+    pub fn live_image_digests(&self) -> Result<HashSet<ImageId>> {
+        let mut out = HashSet::new();
+        if !self.bundles_dir.exists() {
+            return Ok(out);
+        }
+        let entries =
+            fs::read_dir(&self.bundles_dir).map_err(|e| RuntimeError::io(&self.bundles_dir, e))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| RuntimeError::io(&self.bundles_dir, e))?;
+            let bundle = entry.path();
+            if !bundle.is_dir() {
+                continue;
+            }
+            let rootfs = bundle.join("rootfs");
+            let Ok(target) = fs::read_link(&rootfs) else {
+                continue;
+            };
+            // target = <state>/images/<digest>/rootfs → take the
+            // parent's file name as the fs_component, then turn it
+            // back into an ImageId (digest form).
+            let Some(image_dir) = target.parent() else {
+                continue;
+            };
+            let Some(name) = image_dir.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            // `ImageId::fs_component` replaces the first `:` with `_`,
+            // so undo just the first one.
+            out.insert(ImageId::new(name.replacen('_', ":", 1)));
+        }
+        Ok(out)
+    }
+
+    /// Reclaim image cache dirs whose digest is not currently
+    /// referenced by a bundle, plus any orphan `.tmp.*` / incomplete-
+    /// pull dirs without `.done`. Returns the count of dirs removed.
+    /// Safe to run at startup before any pull can race.
+    pub fn gc_unused_images(&self) -> Result<usize> {
+        let live = self.live_image_digests()?;
+        gc_unused_images(&self.images_dir, &live)
+    }
 }
 
 async fn truncate_in_place(path: &Path) -> std::io::Result<()> {
@@ -755,5 +806,33 @@ name = "hello"
             .expect("start_app");
         assert!(running.pid > 1);
         rt.stop_app("hello").await.expect("stop_app");
+    }
+
+    #[test]
+    fn live_image_digests_follows_bundle_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = Runtime::new(tmp.path().to_path_buf()).unwrap();
+
+        // Set up two cached images + two bundles pointing at them.
+        let image_a = rt.images_dir.join("sha256_aaa");
+        let image_b = rt.images_dir.join("sha256_bbb");
+        let image_unref = rt.images_dir.join("sha256_orphan");
+        for d in [&image_a, &image_b, &image_unref] {
+            fs::create_dir_all(d.join("rootfs")).unwrap();
+        }
+
+        for (app, image) in [("alpha", &image_a), ("beta", &image_b)] {
+            let bundle = rt.bundles_dir.join(app);
+            fs::create_dir_all(&bundle).unwrap();
+            std::os::unix::fs::symlink(image.join("rootfs"), bundle.join("rootfs")).unwrap();
+        }
+
+        let live = rt.live_image_digests().unwrap();
+        assert!(live.contains(&ImageId::new("sha256:aaa")));
+        assert!(live.contains(&ImageId::new("sha256:bbb")));
+        assert!(
+            !live.contains(&ImageId::new("sha256:orphan")),
+            "orphan image must NOT appear in live set"
+        );
     }
 }
