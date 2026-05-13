@@ -96,20 +96,56 @@ impl Puller {
 
     /// Pull and unpack an image. Idempotent: if the same digest already
     /// exists on disk it is reused.
+    ///
+    /// Warm-path is fast: a single HEAD-style manifest digest probe
+    /// (`fetch_manifest_digest`) decides whether the local cache covers
+    /// the request before any layer blob is transferred. On cache hit
+    /// we read the config from disk and return; only cache miss falls
+    /// back to the monolithic `Client::pull` (manifest + config + all
+    /// layers).
     pub(crate) async fn pull(&self, image_ref: &str, auth: Auth) -> Result<PulledImage> {
         let reference: Reference = image_ref
             .parse()
             .map_err(|e: oci_client::ParseError| RuntimeError::InvalidImageRef(image_ref.to_owned(), e.to_string()))?;
 
         let registry_auth: RegistryAuth = auth.into_registry_auth();
-        let accepted = accepted_media_types();
         info!(image = %reference, "pulling image");
 
-        // Phase: registry. Currently this is monolithic — oci-client's
-        // `Client::pull` fetches manifest *and* layer blobs in one shot,
-        // even when our local cache already holds the digest. Splitting
-        // manifest-only first would let warm pulls skip layer download
-        // entirely; not done yet (see TODO).
+        // Phase: manifest probe. A single HEAD (falling back to GET in
+        // oci-client) returns the canonical digest. Cheap (~100-200 ms
+        // for a public registry).
+        let probe_start = Instant::now();
+        let probed_digest = self
+            .client
+            .fetch_manifest_digest(&reference, &registry_auth)
+            .await?;
+        histogram!("bugpot_image_pull_seconds", "step" => "manifest_probe")
+            .record(probe_start.elapsed().as_secs_f64());
+
+        let probed_id = ImageId::new(probed_digest);
+        let probed_dir = self.images_root.join(probed_id.fs_component());
+
+        // Cache hit: reuse the on-disk image, no layer transfer.
+        if probed_dir.join(".done").exists() {
+            debug!(id = %probed_id, dir = %probed_dir.display(), "image cache hit");
+            let config_path = probed_dir.join("config.json");
+            let config_body = fs::read(&config_path)
+                .map_err(|e| RuntimeError::io(&config_path, e))?;
+            let config: ConfigFile = serde_json::from_slice(&config_body)
+                .map_err(RuntimeError::DeserializeConfig)?;
+            histogram!("bugpot_image_pull_seconds", "step" => "registry").record(0.0);
+            histogram!("bugpot_image_pull_seconds", "step" => "extract").record(0.0);
+            return Ok(PulledImage {
+                id: probed_id,
+                dir: probed_dir,
+                config,
+            });
+        }
+
+        // Cache miss: fall back to the full pull. This re-fetches the
+        // manifest one more time inside oci-client, costing a duplicate
+        // round-trip; not worth optimising on the miss path.
+        let accepted = accepted_media_types();
         let registry_start = Instant::now();
         let data: ImageData = self
             .client
@@ -125,14 +161,13 @@ impl Puller {
         let id = ImageId::new(digest);
         let image_dir = self.images_root.join(id.fs_component());
 
-        // Idempotency: if `done` marker exists, reuse.
+        // Re-check after the full pull: a concurrent pull may have
+        // finished while we were downloading layers.
         let done_marker = image_dir.join(".done");
         if done_marker.exists() {
-            debug!(%id, dir = %image_dir.display(), "image already on disk");
+            debug!(%id, dir = %image_dir.display(), "image landed during pull, reusing");
             let config: ConfigFile = serde_json::from_slice(&data.config.data)
                 .map_err(RuntimeError::DeserializeConfig)?;
-            // Record a zero-time "extract" so cache-hit vs miss is
-            // discernible from the histogram count alone.
             histogram!("bugpot_image_pull_seconds", "step" => "extract").record(0.0);
             return Ok(PulledImage {
                 id,
