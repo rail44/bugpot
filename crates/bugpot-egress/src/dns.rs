@@ -75,19 +75,6 @@ impl AppRegistry {
         self.entries.write().remove(&src_ip)
     }
 
-    /// Replace an existing allowlist; returns `false` if no app is registered
-    /// at `src_ip`.
-    pub fn update_allowlist(&self, src_ip: Ipv4Addr, allowlist: Allowlist) -> bool {
-        let mut g = self.entries.write();
-        match g.get_mut(&src_ip) {
-            Some(e) => {
-                e.allowlist = allowlist;
-                true
-            }
-            None => false,
-        }
-    }
-
     #[must_use]
     pub fn lookup(&self, src_ip: Ipv4Addr) -> Option<AppEntry> {
         self.entries.read().get(&src_ip).cloned()
@@ -325,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn update_and_remove() {
+    fn insert_and_remove() {
         let src: Ipv4Addr = "172.20.0.10".parse().unwrap();
         let reg = AppRegistry::new();
         reg.insert(
@@ -335,14 +322,8 @@ mod tests {
                 allowlist: Allowlist::parse(["a.com"]).unwrap(),
             },
         );
-        assert!(reg.update_allowlist(src, Allowlist::parse(["b.com"]).unwrap()));
         let e = reg.lookup(src).unwrap();
-        assert!(e.allowlist.matches_domain("b.com"));
-        assert!(!e.allowlist.matches_domain("a.com"));
-
-        // Updating an unknown src returns false.
-        assert!(!reg.update_allowlist("9.9.9.9".parse().unwrap(), Allowlist::default()));
-
+        assert!(e.allowlist.matches_domain("a.com"));
         assert!(reg.remove(src).is_some());
         assert!(reg.lookup(src).is_none());
     }

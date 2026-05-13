@@ -409,28 +409,6 @@ impl EgressOps for Egress {
     }
 }
 
-impl Egress {
-    #[allow(clippy::unused_async)] // matches the public spec; future versions may push to nft.
-    pub async fn update_allowlist(
-        &self,
-        name: &str,
-        allowlist: Vec<String>,
-    ) -> anyhow::Result<()> {
-        let parsed = Allowlist::parse(allowlist)?;
-        let ip = self
-            .apps
-            .lock()
-            .get(name)
-            .map(|a| a.container_ip)
-            .ok_or_else(|| anyhow::anyhow!("unknown app {name}"))?;
-        anyhow::ensure!(
-            self.registry.update_allowlist(ip, parsed),
-            "registry desync for {name}"
-        );
-        Ok(())
-    }
-}
-
 /// Scan `bugpot-*` netns left over from a prior bugpot instance and
 /// recover the IP of each one's `eth0`. Failures (missing `ip`,
 /// half-deleted netns, no inet on eth0) are logged and skipped — they
