@@ -164,8 +164,23 @@ impl AppController {
     }
 
     /// Eagerly start apps whose `idle_timeout` resolves to "always on".
+    ///
+    /// Concurrent: all qualifying apps' `ensure_running` futures are
+    /// driven in parallel via [`futures::future::join_all`]. With N
+    /// always-on apps that share an image, the first puller fills the
+    /// cache and the rest hit it — startup is dominated by the slowest
+    /// single cold-start instead of summing across all of them.
+    ///
+    /// **Error policy:** on per-app failure the future returns the
+    /// error, but other futures continue. After all futures resolve, the
+    /// **first** error is returned to the caller; successfully-started
+    /// apps stay running. The caller (`cmd/bugpot::main`) rolls back via
+    /// `teardown()` if it wants an all-or-nothing semantic.
     pub async fn deploy_always_on(&self) -> Result<()> {
+        // Resolve idle_timeout up-front so a bad value fails fast before
+        // any container is started.
         let handles = self.snapshot_handles().await;
+        let mut always_on = Vec::new();
         for handle in handles {
             let timeout = handle
                 .spec
@@ -173,9 +188,29 @@ impl AppController {
                 .resolve_idle_timeout()
                 .map_err(|e| anyhow!("{}: {e}", handle.name))?;
             if timeout.is_none() {
-                info!(app = %handle.name, "eager start (idle_timeout = 0)");
-                self.ensure_running(&handle).await?;
+                always_on.push(handle);
             }
+        }
+        if always_on.is_empty() {
+            return Ok(());
+        }
+
+        let starts = always_on.into_iter().map(|handle| {
+            let name = handle.name.clone();
+            async move {
+                info!(app = %name, "eager start (idle_timeout = 0)");
+                match self.ensure_running(&handle).await {
+                    Ok(_) => Ok(()),
+                    Err(e) => {
+                        warn!(app = %name, error = ?e, "eager start failed");
+                        Err(anyhow!("{name}: {e:#}"))
+                    }
+                }
+            }
+        });
+        let results = futures::future::join_all(starts).await;
+        for r in results {
+            r?;
         }
         Ok(())
     }
