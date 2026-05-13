@@ -112,7 +112,7 @@ impl Puller {
             .map_err(|e: oci_client::ParseError| RuntimeError::InvalidImageRef(image_ref.to_owned(), e.to_string()))?;
 
         let registry_auth: RegistryAuth = auth.into_registry_auth();
-        info!(image = %reference, "pulling image");
+        debug!(image = %reference, "resolving image");
 
         // Determine the expected digest. For sha-pinned refs the
         // upstream call is unnecessary — the ref is content-addressed.
@@ -131,7 +131,7 @@ impl Puller {
         };
 
         if let Some(cached) = load_cached_image(&self.images_root, &probed_id)? {
-            debug!(id = %probed_id, "image cache hit");
+            info!(id = %probed_id, "image cache hit");
             histogram!("bugpot_image_pull_seconds", "step" => "registry").record(0.0);
             histogram!("bugpot_image_pull_seconds", "step" => "extract").record(0.0);
             return Ok(cached);
@@ -142,6 +142,7 @@ impl Puller {
         // costing a duplicate round-trip; not worth optimising on the
         // miss path.
         let accepted = accepted_media_types();
+        info!(image = %reference, "cache miss, pulling layers from registry");
         let registry_start = Instant::now();
         let data: ImageData = self
             .client
@@ -160,7 +161,7 @@ impl Puller {
         // Re-check after the full pull: a concurrent pull may have
         // finished while we were downloading layers.
         if let Some(cached) = load_cached_image(&self.images_root, &id)? {
-            debug!(%id, "image landed during pull, reusing");
+            info!(%id, "image cache hit");
             histogram!("bugpot_image_pull_seconds", "step" => "extract").record(0.0);
             return Ok(cached);
         }
