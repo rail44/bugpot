@@ -258,7 +258,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
     /// Reap state left behind by apps whose `AppSpec` no longer exists.
     ///
     /// After `reattach_running` consumes endpoints for known apps, any
-    /// `(app_id, ip)` still in egress's discovered set is an orphan:
+    /// `(name, ip)` still in egress's discovered set is an orphan:
     /// the TOML was deleted while bugpot was down, so the netns +
     /// container + IP allocation no longer have an owner. This call
     /// stops the container (if libcontainer state still exists), tears
@@ -866,22 +866,22 @@ mod tests {
                 .unwrap_or_else(|| Err(RuntimeError::Other("mock: no start response queued".into())))
         }
 
-        async fn stop_app(&self, id: &str) -> std::result::Result<(), RuntimeError> {
-            self.record(format!("stop_app({id})"));
-            self.running.lock().unwrap().remove(id);
+        async fn stop_app(&self, name: &str) -> std::result::Result<(), RuntimeError> {
+            self.record(format!("stop_app({name})"));
+            self.running.lock().unwrap().remove(name);
             Ok(())
         }
 
-        fn is_container_running(&self, id: &str) -> bool {
-            *self.running.lock().unwrap().get(id).unwrap_or(&false)
+        fn is_container_running(&self, name: &str) -> bool {
+            *self.running.lock().unwrap().get(name).unwrap_or(&false)
         }
 
-        fn resource_usage(&self, _id: &str) -> Option<ResourceUsage> {
+        fn resource_usage(&self, _name: &str) -> Option<ResourceUsage> {
             None
         }
 
-        fn ensure_log_tails(&self, id: &str) {
-            self.record(format!("ensure_log_tails({id})"));
+        fn ensure_log_tails(&self, name: &str) {
+            self.record(format!("ensure_log_tails({name})"));
         }
 
         async fn cleanup_orphan_container(
@@ -907,64 +907,64 @@ mod tests {
         fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
         }
-        fn set_discovered(&self, app_id: &str, ip: Ipv4Addr) {
-            self.discovered.lock().unwrap().insert(app_id.to_owned(), ip);
+        fn set_discovered(&self, name: &str, ip: Ipv4Addr) {
+            self.discovered.lock().unwrap().insert(name.to_owned(), ip);
         }
     }
 
     impl EgressOps for MockEgress {
         async fn allocate_endpoint(
             &self,
-            app_id: &str,
+            name: &str,
             _allowlist: Vec<String>,
         ) -> anyhow::Result<Endpoint> {
             self.calls
                 .lock()
                 .unwrap()
-                .push(format!("allocate_endpoint({app_id})"));
+                .push(format!("allocate_endpoint({name})"));
             if *self.allocate_fail.lock().unwrap() {
                 anyhow::bail!("mock: allocate_endpoint failed");
             }
             let ep = Endpoint {
                 container_ip: Ipv4Addr::LOCALHOST,
-                netns_path: PathBuf::from(format!("/run/netns/mock-{app_id}")),
+                netns_path: PathBuf::from(format!("/run/netns/mock-{name}")),
             };
             self.endpoints
                 .lock()
                 .unwrap()
-                .insert(app_id.to_owned(), ep.clone());
+                .insert(name.to_owned(), ep.clone());
             Ok(ep)
         }
 
-        async fn release_endpoint(&self, app_id: &str) -> anyhow::Result<()> {
+        async fn release_endpoint(&self, name: &str) -> anyhow::Result<()> {
             self.calls
                 .lock()
                 .unwrap()
-                .push(format!("release_endpoint({app_id})"));
-            self.endpoints.lock().unwrap().remove(app_id);
+                .push(format!("release_endpoint({name})"));
+            self.endpoints.lock().unwrap().remove(name);
             Ok(())
         }
 
         async fn reattach_endpoint(
             &self,
-            app_id: &str,
+            name: &str,
             _allowlist: Vec<String>,
         ) -> anyhow::Result<Option<Endpoint>> {
             self.calls
                 .lock()
                 .unwrap()
-                .push(format!("reattach_endpoint({app_id})"));
-            let Some(container_ip) = self.discovered.lock().unwrap().remove(app_id) else {
+                .push(format!("reattach_endpoint({name})"));
+            let Some(container_ip) = self.discovered.lock().unwrap().remove(name) else {
                 return Ok(None);
             };
             let ep = Endpoint {
                 container_ip,
-                netns_path: PathBuf::from(format!("/run/netns/mock-{app_id}")),
+                netns_path: PathBuf::from(format!("/run/netns/mock-{name}")),
             };
             self.endpoints
                 .lock()
                 .unwrap()
-                .insert(app_id.to_owned(), ep.clone());
+                .insert(name.to_owned(), ep.clone());
             Ok(Some(ep))
         }
 
@@ -982,13 +982,13 @@ mod tests {
 
         async fn cleanup_orphan_endpoint(
             &self,
-            app_id: &str,
+            name: &str,
             container_ip: Ipv4Addr,
         ) -> anyhow::Result<()> {
             self.calls
                 .lock()
                 .unwrap()
-                .push(format!("cleanup_orphan_endpoint({app_id},{container_ip})"));
+                .push(format!("cleanup_orphan_endpoint({name},{container_ip})"));
             Ok(())
         }
     }

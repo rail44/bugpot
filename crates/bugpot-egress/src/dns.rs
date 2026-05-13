@@ -47,7 +47,7 @@ pub trait AllowSet: Send + Sync + 'static {
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
 }
 
-/// Shared registry of `src_ip → (app_id, allowlist)`. Mutated by `Egress`
+/// Shared registry of `src_ip → (name, allowlist)`. Mutated by `Egress`
 /// when allocating / releasing endpoints, read by the DNS handler on every
 /// query.
 #[derive(Debug, Default)]
@@ -57,7 +57,7 @@ pub struct AppRegistry {
 
 #[derive(Debug, Clone)]
 pub struct AppEntry {
-    pub app_id: String,
+    pub name: String,
     pub allowlist: Allowlist,
 }
 
@@ -98,17 +98,17 @@ impl AppRegistry {
 ///
 /// Kept separate from the `RequestHandler` impl so unit tests can exercise
 /// the lookup logic without a `Request` or a `ResponseHandler`. Returns the
-/// decision and (for tests / logs) the app id that owned the source IP, if
-/// any.
+/// decision and (for tests / logs) the app name that owned the source IP,
+/// if any.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Decision {
     /// No app is registered at this src IP. Treat as Refused (the query came
     /// from somewhere we don't trust).
     UnknownSource,
     /// App known, name not allowed. Return NXDOMAIN.
-    Denied { app_id: String },
+    Denied { name: String },
     /// App known, name allowed, resolve upstream.
-    Allowed { app_id: String },
+    Allowed { name: String },
 }
 
 #[must_use]
@@ -117,13 +117,9 @@ pub fn decide(registry: &AppRegistry, src: Ipv4Addr, query_name: &str) -> Decisi
         return Decision::UnknownSource;
     };
     if entry.allowlist.matches_domain(query_name) {
-        Decision::Allowed {
-            app_id: entry.app_id,
-        }
+        Decision::Allowed { name: entry.name }
     } else {
-        Decision::Denied {
-            app_id: entry.app_id,
-        }
+        Decision::Denied { name: entry.name }
     }
 }
 
@@ -187,12 +183,12 @@ impl<U: Upstream, A: AllowSet> RequestHandler for EgressDnsHandler<U, A> {
                 tracing::warn!(%src, %qname, "dns query from unknown source");
                 reply_code(request, &mut response_handle, ResponseCode::Refused).await
             }
-            Decision::Denied { app_id } => {
-                tracing::info!(%src, app=%app_id, %qname, "dns deny");
+            Decision::Denied { name } => {
+                tracing::info!(%src, app=%name, %qname, "dns deny");
                 reply_code(request, &mut response_handle, ResponseCode::NXDomain).await
             }
-            Decision::Allowed { app_id } => {
-                tracing::debug!(%src, app=%app_id, %qname, "dns allow");
+            Decision::Allowed { name } => {
+                tracing::debug!(%src, app=%name, %qname, "dns allow");
                 let ips = match self.upstream.resolve_a(&qname_stripped).await {
                     Ok(ips) => ips,
                     Err(e) => {
@@ -302,7 +298,7 @@ mod tests {
         r.insert(
             src,
             AppEntry {
-                app_id: app.to_string(),
+                name: app.to_string(),
                 allowlist: Allowlist::parse(allow.iter().copied()).unwrap(),
             },
         );
@@ -335,7 +331,7 @@ mod tests {
         reg.insert(
             src,
             AppEntry {
-                app_id: "a".into(),
+                name: "a".into(),
                 allowlist: Allowlist::parse(["a.com"]).unwrap(),
             },
         );

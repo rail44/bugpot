@@ -15,8 +15,8 @@
 //!     `eth0`); renamed to `eth0` only after being moved into the
 //!     container's netns.
 //!   - veth container side (final): `eth0` (inside the netns)
-//!   - netns name: `bugpot-<app_id>` → bind-mounted at
-//!     `/var/run/netns/bugpot-<app_id>` by `ip netns add`.
+//!   - netns name: `bugpot-<name>` → bind-mounted at
+//!     `/var/run/netns/bugpot-<name>` by `ip netns add`.
 
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
@@ -49,9 +49,9 @@ pub struct EndpointPlan {
 
 impl EndpointPlan {
     #[must_use]
-    pub fn new(app_id: &str, container_ip: Ipv4Addr, subnet: Ipv4Net) -> Self {
-        let short = short_id(app_id);
-        let ns_name = format!("{NS_PREFIX}{app_id}");
+    pub fn new(name: &str, container_ip: Ipv4Addr, subnet: Ipv4Net) -> Self {
+        let short = short_name(name);
+        let ns_name = format!("{NS_PREFIX}{name}");
         Self {
             host_veth: format!("vh-{short}"),
             tmp_ns_veth: format!("vc-{short}"),
@@ -64,16 +64,16 @@ impl EndpointPlan {
     }
 }
 
-/// 12-char-max stable shortening of an app id for use in interface names
-/// (IFNAMSIZ = 16 incl. NUL → host iface `vh-` + 12 = 15 bytes).
-fn short_id(app_id: &str) -> String {
+/// 12-char-max stable shortening of an app name for use in interface
+/// names (IFNAMSIZ = 16 incl. NUL → host iface `vh-` + 12 = 15 bytes).
+fn short_name(name: &str) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset
-    for b in app_id.bytes() {
+    for b in name.bytes() {
         h ^= u64::from(b);
         h = h.wrapping_mul(0x0100_0000_01b3);
     }
-    // Truncate to 12 hex chars (48 bits — collision is acceptable; app_ids
-    // are short-lived per-host names, and a clash will surface as `ip link
+    // Truncate to 12 hex chars (48 bits — collision is acceptable; names
+    // are short-lived per-host, and a clash will surface as `ip link
     // add` failure on the second app rather than as silent corruption).
     let s = format!("{h:016x}");
     s[..12].to_string()
@@ -176,11 +176,11 @@ fn parse_app_namespaces(s: &str) -> Vec<String> {
         .collect()
 }
 
-/// Read the IPv4 address of `eth0` inside the netns `bugpot-<app_id>`.
+/// Read the IPv4 address of `eth0` inside the netns `bugpot-<name>`.
 /// `Ok(None)` when the interface exists but carries no inet address; an
 /// error when the netns or interface itself is gone.
-pub async fn read_eth0_ipv4(app_id: &str) -> anyhow::Result<Option<Ipv4Addr>> {
-    let ns = format!("{NS_PREFIX}{app_id}");
+pub async fn read_eth0_ipv4(name: &str) -> anyhow::Result<Option<Ipv4Addr>> {
+    let ns = format!("{NS_PREFIX}{name}");
     let output = Command::new("ip")
         .args(["-n", &ns, "-4", "addr", "show", "eth0"])
         .stdin(Stdio::null())
@@ -256,7 +256,7 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_plan_is_stable_per_app_id() {
+    fn endpoint_plan_is_stable_per_name() {
         let p1 = EndpointPlan::new(
             "myapp",
             "172.20.0.10".parse().unwrap(),
