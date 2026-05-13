@@ -15,6 +15,7 @@ async-trait.workspace = true
 axum.workspace = true
 hyper.workspace = true
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+metrics.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 bugpot-config.workspace = true

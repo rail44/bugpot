@@ -22,6 +22,7 @@ bugpot-admin.workspace = true
 bugpot-config.workspace = true
 bugpot-controller.workspace = true
 bugpot-egress.workspace = true
+bugpot-metrics.workspace = true
 bugpot-router.workspace = true
 bugpot-runtime.workspace = true
 nix = { version = "0.29", features = ["user"] }
