@@ -22,6 +22,14 @@ vm-stop:
 shell:
     limactl shell bugpot
 
+# Authenticate the dev VM into your tailnet (interactive on first run).
+tailscale-up *args="--advertise-tags=tag:bugpot --hostname=bugpot-dev":
+    limactl shell bugpot -- sudo tailscale up {{args}}
+
+# Tailscale status as seen by the dev VM.
+tailscale-status:
+    limactl shell bugpot -- tailscale status
+
 # --- Build / test (inside the VM) ---
 
 # Build the bugpot binary.

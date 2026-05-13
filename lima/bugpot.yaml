@@ -54,6 +54,16 @@ provision:
       build-essential pkg-config \
       nftables iproute2 \
       ca-certificates curl git
+- mode: system
+  # Install tailscale (tailscaled service is started but the node is not
+  # yet authenticated). Run `sudo tailscale up …` interactively after
+  # `limactl start` to join your tailnet.
+  script: |
+    #!/bin/sh
+    set -eux
+    if ! command -v tailscale >/dev/null 2>&1; then
+      curl -fsSL https://tailscale.com/install.sh | sh
+    fi
 - mode: user
   script: |
     #!/bin/sh
