@@ -25,10 +25,10 @@ oci-client = "0.16"
 # Spec values we build can be consumed by libcontainer without
 # crossing crate versions.
 oci-spec = { version = "0.9", features = ["runtime"] }
-# Disable libseccomp feature: this crate builds and tests on dev machines
-# that may not have libseccomp installed. Seccomp can be re-enabled later
-# behind a feature flag when we ship to hosts with the lib available.
-libcontainer = { version = "0.6", default-features = false, features = ["v2", "systemd"] }
+# seccomp + v2 cgroup + systemd. Requires `libseccomp-dev` on the build
+# host (Ubuntu: `apt install libseccomp-dev`; the Lima provisioning in
+# `lima/bugpot.yaml` installs it). Runtime needs `libseccomp2`.
+libcontainer = { version = "0.6", default-features = false, features = ["v2", "systemd", "libseccomp"] }
 flate2 = "1"
 tar = "0.4"
 sha2 = "0.10"

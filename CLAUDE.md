@@ -260,6 +260,17 @@ cmd/bugpot (main: wires everything; no business logic)
 
 The nftables forward chain is **default-drop**. Packets only escape via a `(src_ip, dst_ip)` allow-set populated by the bugpot DNS resolver bound on the bridge IP. When a container resolves a domain on its app's allowlist, every answer is inserted into the set with a 60s TTL — that is the only path out. Direct-IP egress, DoH, DoT, and queries to external resolvers are all blocked. Allowlist semantics (in `bugpot-egress/src/allowlist.rs`): bare `example.com` matches `example.com` and subdomains; `*.example.com` matches subdomains only.
 
+### Container hardening
+
+Every container runs with the **moby (Docker) default seccomp profile** vendored verbatim at `crates/bugpot-runtime/src/seccomp_default.json` and translated to an OCI `LinuxSeccomp` in `seccomp::runc_default`. The profile is the de-facto industry standard (~33 rules, ~440 syscall names; default action `SCMP_ACT_ERRNO`) and is attached to every spec by `build_spec`. Two intentional deviations from runc:
+
+- The profile's `archMap`, `includes`, `excludes`, and `comment` extensions are **ignored**. Cap-conditional rules collapse to unconditional allow because the kernel's capability check fires after seccomp anyway — a container without `CAP_SYS_PTRACE` cannot call `ptrace` regardless of the seccomp verdict, so the two layers stay independent.
+- Architectures are hard-coded to `x86_64 + aarch64` (bugpot's supported hosts).
+
+Build dependency: libseccomp dev headers (`apt install libseccomp-dev`; pre-installed by `lima/bugpot.yaml`). Runtime needs only `libseccomp2`.
+
+A user namespace was investigated and **deferred**: libcontainer creates the user namespace before processing any other namespace, so subsequent `setns` of an externally-prepared netns (created in bugpot's initial user_ns by `bugpot-egress`) fails with `EPERM` from the nested user_ns. Re-enabling it requires reworking egress to create the netns inside the container's user_ns.
+
 ### Scale-to-zero
 
 `scaling.idle_timeout` in app TOML: `"0"` / `""` / missing → always-on (eagerly started at bring-up); `"30s"` / `"5m"` / `"2h"` → reclaimed by `idle_stopper_loop` once `last_access` is older than the timeout. Default 5m. The state-transition logic lives in `crates/bugpot-controller`.

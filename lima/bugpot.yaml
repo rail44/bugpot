@@ -52,6 +52,7 @@ provision:
     apt-get update -y
     apt-get install -y --no-install-recommends \
       build-essential pkg-config \
+      libseccomp-dev \
       nftables iproute2 \
       ca-certificates curl git
 - mode: system
