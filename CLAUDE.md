@@ -104,6 +104,13 @@ eager-started demo apps. Critical design points:
 Logs go through journalctl; `just logs` is equivalent to
 `journalctl -u bugpot-dev.service`.
 
+The dev-server **always** publishes Prometheus metrics on
+`127.0.0.1:9090` (loopback inside the VM, never forwarded out). Use
+`just metrics` for a full scrape or `just metrics-grep <prefix>` to
+filter, e.g. `just metrics-grep bugpot_cold_start` for the cold-start
+phase histograms. The endpoint is unauthenticated by design and
+relies on the loopback bind plus the dev-VM trust boundary.
+
 ### Smoke scripts
 
 For one-shot verification rather than iterative work, the smoke scripts

@@ -143,3 +143,14 @@ logs *args="-n 50":
 # curl an app via *.localhost. e.g. `just hit beta /healthz`.
 hit host="alpha" path="/":
     curl -sS -i --max-time 30 "http://{{host}}.localhost:8080{{path}}"
+
+# Scrape the dev-server's Prometheus endpoint (always bound at
+# 127.0.0.1:9090 by `scripts/dev-server.sh`; loopback-only).
+metrics:
+    @limactl shell bugpot -- curl -sS http://127.0.0.1:9090/metrics
+
+# Filter the metrics scrape to lines starting with `prefix`.
+# Example: `just metrics-grep bugpot_cold_start` for cold-start
+# histograms only.
+metrics-grep prefix:
+    @limactl shell bugpot -- curl -sS http://127.0.0.1:9090/metrics | grep -E '^{{prefix}}'
