@@ -63,6 +63,21 @@ impl RuntimeError {
             source,
         }
     }
+
+    /// `true` when this error is a registry-side authentication
+    /// rejection (401 / explicit auth failure). Used by callers that
+    /// want to surface a clearer "fix your credentials" message rather
+    /// than a generic "image pull failed".
+    #[must_use]
+    pub const fn is_registry_auth_error(&self) -> bool {
+        matches!(
+            self,
+            Self::Registry(
+                oci_client::errors::OciDistributionError::AuthenticationFailure(_)
+                    | oci_client::errors::OciDistributionError::UnauthorizedError { .. },
+            )
+        )
+    }
 }
 
 // Auto-box variants so the `Result` stays small (clippy::result_large_err).
@@ -79,3 +94,35 @@ impl From<libcontainer::error::LibcontainerError> for RuntimeError {
 }
 
 pub(crate) type Result<T> = std::result::Result<T, RuntimeError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_registry_auth_error_matches_auth_variants() {
+        let auth_failure = RuntimeError::Registry(
+            oci_client::errors::OciDistributionError::AuthenticationFailure("bad creds".into()),
+        );
+        assert!(auth_failure.is_registry_auth_error());
+
+        let unauthorized = RuntimeError::Registry(
+            oci_client::errors::OciDistributionError::UnauthorizedError {
+                url: "https://ghcr.io/v2/x/y/manifests/latest".to_owned(),
+            },
+        );
+        assert!(unauthorized.is_registry_auth_error());
+
+        // Other registry errors are not classified as auth.
+        let not_found = RuntimeError::Registry(
+            oci_client::errors::OciDistributionError::ImageManifestNotFoundError(
+                "x:y not found".into(),
+            ),
+        );
+        assert!(!not_found.is_registry_auth_error());
+
+        // Non-registry errors are not auth either.
+        let other = RuntimeError::Other("unrelated".into());
+        assert!(!other.is_registry_auth_error());
+    }
+}

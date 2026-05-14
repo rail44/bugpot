@@ -25,7 +25,7 @@ use async_trait::async_trait;
 use bugpot_config::{AppIdentity, AppSpec, AuthConfig, RegistryCredential, registry_host};
 use bugpot_egress::EgressOps;
 use bugpot_router::{UpstreamResolver, subdomain_of};
-use bugpot_runtime::{Auth, ResourceUsage, RuntimeOps};
+use bugpot_runtime::{Auth, ResourceUsage, RuntimeError, RuntimeOps};
 use metrics::{counter, gauge, histogram};
 use serde::Serialize;
 use thiserror::Error;
@@ -45,6 +45,13 @@ pub enum DeployError {
     AlreadyExists(String),
     #[error("subdomain '{0}' already in use")]
     SubdomainTaken(String),
+    /// The registry rejected bugpot's credentials (or the image
+    /// requires credentials and none were configured). Distinct from
+    /// the general `ImagePull` so operators can grep audit logs for
+    /// auth-side failures specifically — the message conveys
+    /// "fix bugpot's auth.toml" rather than "retry later".
+    #[error("registry authentication failed: {0:#}")]
+    ImageAuth(#[source] anyhow::Error),
     #[error("image pull failed: {0:#}")]
     ImagePull(#[source] anyhow::Error),
     #[error("eager start failed: {0:#}")]
@@ -490,11 +497,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         self.runtime
             .pull_image(&spec.image, self.resolve_auth(&spec.image))
             .await
-            .map_err(|e| {
-                DeployError::ImagePull(
-                    anyhow::Error::from(e).context(format!("pull {} for {name}", spec.image)),
-                )
-            })?;
+            .map_err(|e| classify_pull_error(e, &name, &spec.image))?;
 
         let toml_path = self.apps_dir.join(format!("{name}.toml"));
         let toml_body = toml::to_string_pretty(&spec)
@@ -788,6 +791,21 @@ fn make_handle(spec: AppSpec) -> Result<Arc<AppHandle>, bugpot_config::InvalidSp
     }))
 }
 
+/// Classify a `pull_image` failure into the deploy-level error
+/// variant. Auth-side failures (registry rejected bugpot's
+/// credentials, or none were configured for a private image) become
+/// [`DeployError::ImageAuth`]; everything else (network, manifest
+/// parsing, missing image) stays in the generic [`DeployError::ImagePull`].
+fn classify_pull_error(err: RuntimeError, name: &str, image_ref: &str) -> DeployError {
+    let is_auth = err.is_registry_auth_error();
+    let context = anyhow::Error::from(err).context(format!("pull {image_ref} for {name}"));
+    if is_auth {
+        DeployError::ImageAuth(context)
+    } else {
+        DeployError::ImagePull(context)
+    }
+}
+
 async fn view_of(handle: &Arc<AppHandle>) -> AppView {
     let state = match &handle.inner.lock().await.state {
         AppState::Stopped => AppStateView::Stopped,
@@ -884,7 +902,7 @@ mod tests {
 
     use bugpot_config::{AppSpec, EgressSpec, Readiness, Resources, RuntimeSpec, Scaling};
     use bugpot_egress::{Endpoint, EgressOps};
-    use bugpot_runtime::{Auth, ImageId, ResourceUsage, RunningApp, RuntimeError, RuntimeOps};
+    use bugpot_runtime::{Auth, ImageId, ResourceUsage, RunningApp, RuntimeOps};
 
     #[derive(Debug, Default)]
     struct MockRuntime {
