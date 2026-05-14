@@ -322,20 +322,12 @@ fn read_admin_token() -> Result<String> {
     );
 }
 
-/// Read the admin token from `path` and reject permissive permissions
-/// (group / other readable, writable, or executable). Mirrors what
-/// `ssh` does for private keys: any of `0o077` set → refuse to start.
+/// Read the admin token from `path` after asserting it (and all of
+/// its ancestor directories) is accessible only by the bugpot owner.
+/// Delegates the permissions check to `bugpot_config::require_owner_only`
+/// so both the admin token and `auth.toml` share one enforcement path.
 fn read_admin_token_from_file(path: &str) -> Result<String> {
-    use std::os::unix::fs::PermissionsExt;
-    let metadata = std::fs::metadata(path)
-        .with_context(|| format!("stat admin token file {path}"))?;
-    let mode = metadata.permissions().mode() & 0o777;
-    if mode & 0o077 != 0 {
-        anyhow::bail!(
-            "admin token file {path} has permissive mode {mode:#o}; \
-             refusing to start (run `chmod 600 {path}` so only its owner can read it)"
-        );
-    }
+    bugpot_config::require_owner_only(std::path::Path::new(path))?;
     let body = std::fs::read_to_string(path)
         .with_context(|| format!("read admin token from {path}"))?;
     let trimmed = body.trim();
