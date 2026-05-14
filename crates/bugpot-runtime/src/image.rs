@@ -382,7 +382,15 @@ fn extract_layer_inner(
         }
         IMAGE_LAYER_GZIP_MEDIA_TYPE | IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE => {
             let mut decoder = GzDecoder::new(data).take(max_decompressed + 1);
-            let mut buf = Vec::with_capacity(data.len() * 4);
+            // Cap the up-front capacity hint at the decompressed
+            // ceiling so a malicious blob padded to a large size
+            // can't trick us into reserving multi-GiB before the
+            // `.take()` even has a chance to fire. `read_to_end`
+            // will grow the buffer geometrically as needed.
+            let initial_cap = data.len().saturating_mul(4).min(
+                usize::try_from(max_decompressed).unwrap_or(usize::MAX),
+            );
+            let mut buf = Vec::with_capacity(initial_cap);
             decoder
                 .read_to_end(&mut buf)
                 .map_err(|e| RuntimeError::io(rootfs, e))?;
