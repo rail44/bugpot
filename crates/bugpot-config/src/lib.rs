@@ -133,6 +133,34 @@ impl RuntimeSpec {
     }
 }
 
+/// Immutable identity of a registered app.
+///
+/// The pair `(name, subdomain)` pins an app to a filesystem path, a
+/// netns, a cgroup, and a routing key. Computed once from an
+/// `AppSpec` (typically at deploy / load time) and never mutated.
+///
+/// Consumers that hold an `AppIdentity` can safely treat the values
+/// as the *authoritative* identifiers, regardless of whether a
+/// later spec update tries to change them: PUT-style adapters
+/// compare against this identity and reject mismatched updates.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AppIdentity {
+    pub name: String,
+    pub subdomain: String,
+}
+
+impl AppIdentity {
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub fn subdomain(&self) -> &str {
+        &self.subdomain
+    }
+}
+
 impl AppSpec {
     #[must_use]
     pub fn name(&self) -> &str {
@@ -147,6 +175,18 @@ impl AppSpec {
     #[must_use]
     pub fn subdomain(&self) -> &str {
         self.subdomain.as_deref().unwrap_or_else(|| self.name())
+    }
+
+    /// Resolve the spec's mutable `name` / `subdomain` fields into an
+    /// owned, immutable [`AppIdentity`]. Returns the resolved identity
+    /// only after `validate()` would succeed, so callers can rely on
+    /// the strings being valid DNS labels.
+    pub fn identity(&self) -> Result<AppIdentity, InvalidSpec> {
+        self.validate()?;
+        Ok(AppIdentity {
+            name: self.name().to_owned(),
+            subdomain: self.subdomain().to_owned(),
+        })
     }
 
     /// Reject specs that would put user-controlled strings on paths or
