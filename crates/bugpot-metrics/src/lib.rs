@@ -128,8 +128,7 @@ fn emit_runtime_metrics(m: &tokio_metrics::RuntimeMetrics) {
         gauge!("bugpot_tokio_blocking_threads").set(m.blocking_threads_count as f64);
         gauge!("bugpot_tokio_idle_blocking_threads").set(m.idle_blocking_threads_count as f64);
         gauge!("bugpot_tokio_blocking_queue_depth").set(m.blocking_queue_depth as f64);
-        gauge!("bugpot_tokio_mean_poll_duration_seconds")
-            .set(m.mean_poll_duration.as_secs_f64());
+        gauge!("bugpot_tokio_mean_poll_duration_seconds").set(m.mean_poll_duration.as_secs_f64());
 
         counter!("bugpot_tokio_noop_total").increment(m.total_noop_count);
         counter!("bugpot_tokio_steal_total").increment(m.total_steal_count);
@@ -138,8 +137,7 @@ fn emit_runtime_metrics(m: &tokio_metrics::RuntimeMetrics) {
         counter!("bugpot_tokio_remote_schedules_total").increment(m.num_remote_schedules);
         counter!("bugpot_tokio_local_schedules_total").increment(m.total_local_schedule_count);
         counter!("bugpot_tokio_local_overflow_total").increment(m.total_overflow_count);
-        counter!("bugpot_tokio_budget_forced_yields_total")
-            .increment(m.budget_forced_yield_count);
+        counter!("bugpot_tokio_budget_forced_yields_total").increment(m.budget_forced_yield_count);
         counter!("bugpot_tokio_io_driver_ready_total").increment(m.io_driver_ready_count);
     }
 }
