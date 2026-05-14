@@ -37,6 +37,7 @@ metrics = "0.24"
 humantime = "2"
 futures = "0.3"
 inotify = { version = "0.11", default-features = false, features = ["stream"] }
+divan = "0.1"
 
 bugpot-admin = { path = "crates/bugpot-admin" }
 bugpot-config = { path = "crates/bugpot-config" }
