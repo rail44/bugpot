@@ -319,7 +319,7 @@ impl From<DeployError> for AdminError {
         let status = match &err {
             DeployError::MissingName | DeployError::InvalidSpec(_) => StatusCode::BAD_REQUEST,
             DeployError::AlreadyExists(_) | DeployError::SubdomainTaken(_) => StatusCode::CONFLICT,
-            DeployError::ImagePull(_) => StatusCode::BAD_GATEWAY,
+            DeployError::ImageAuth(_) | DeployError::ImagePull(_) => StatusCode::BAD_GATEWAY,
             DeployError::StartFailed(_) | DeployError::Internal(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
@@ -425,6 +425,10 @@ mod tests {
             ),
             (
                 DeployError::ImagePull(anyhow!("registry 503")),
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                DeployError::ImageAuth(anyhow!("401 from ghcr")),
                 StatusCode::BAD_GATEWAY,
             ),
             (
