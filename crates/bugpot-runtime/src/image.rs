@@ -13,16 +13,17 @@
 //! `digest` is the manifest digest (e.g. `sha256:abc...`) with the `:`
 //! replaced by `_` so it is a valid path component.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use flate2::read::GzDecoder;
-use metrics::histogram;
+use metrics::{counter, histogram};
 use oci_client::{
     Client, Reference,
     client::{ClientConfig, ImageData},
@@ -34,6 +35,7 @@ use oci_client::{
     secrets::RegistryAuth,
 };
 use sha2::{Digest, Sha256};
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, info};
 
 use crate::auth::Auth;
@@ -87,9 +89,27 @@ impl PulledImage {
 }
 
 /// Image puller.
+///
+/// One instance per [`crate::Runtime`]; the inflight map needs to be
+/// shared across every concurrent `pull` call so eager-started apps
+/// that point at the same image can coalesce.
 pub(crate) struct Puller {
     client: Client,
     images_root: PathBuf,
+    /// Per-digest barriers used to dedupe concurrent pulls of the
+    /// same image. The leader holds the inner `AsyncMutex<()>` for
+    /// the duration of its `Client::pull` + extract; waiters block
+    /// on the same mutex, then re-read the on-disk cache after the
+    /// leader releases. See [`Puller::pull`] for the full protocol.
+    inflight: std::sync::Mutex<HashMap<ImageId, Arc<AsyncMutex<()>>>>,
+}
+
+impl std::fmt::Debug for Puller {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Puller")
+            .field("images_root", &self.images_root)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Puller {
@@ -97,6 +117,7 @@ impl Puller {
         Self {
             client: Client::new(ClientConfig::default()),
             images_root,
+            inflight: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -110,8 +131,10 @@ impl Puller {
     ///   (`fetch_manifest_digest`) decides whether the local cache
     ///   covers the request before any layer blob is transferred.
     ///
-    /// Only a cache miss falls back to the monolithic `Client::pull`
-    /// (manifest + config + all layers).
+    /// Cache misses for the same digest from concurrent callers are
+    /// deduped via the per-digest `inflight` barrier — only one
+    /// `Client::pull` + extract runs, and the rest re-read from the
+    /// on-disk cache after the leader publishes the `.done` marker.
     pub(crate) async fn pull(&self, image_ref: &str, auth: Auth) -> Result<PulledImage> {
         let reference: Reference = image_ref.parse().map_err(|e: oci_client::ParseError| {
             RuntimeError::InvalidImageRef(image_ref.to_owned(), e.to_string())
@@ -143,17 +166,85 @@ impl Puller {
             return Ok(cached);
         }
 
-        // Cache miss: fall back to the full pull. For tag refs this
-        // re-fetches the manifest one more time inside oci-client,
-        // costing a duplicate round-trip; not worth optimising on the
-        // miss path.
+        // Cache miss. Coalesce with any concurrent pull of the same
+        // digest so only one task runs the full registry pull +
+        // extract; the rest block on the per-digest barrier and
+        // re-read from disk after `.done` is published.
+        loop {
+            let role = self.claim_inflight(&probed_id);
+            match role {
+                InflightRole::Leader(_guard) => {
+                    let result = self.do_full_pull(&reference, &registry_auth).await;
+                    self.release_inflight(&probed_id);
+                    return result;
+                }
+                InflightRole::Waiter(barrier) => {
+                    counter!("bugpot_image_pull_coalesced_total").increment(1);
+                    info!(id = %probed_id, "awaiting in-flight pull");
+                    drop(barrier.lock().await);
+                    if let Some(cached) = load_cached_image(&self.images_root, &probed_id)? {
+                        // Same accounting as the cache-hit fast path
+                        // above: the waiter paid neither cost.
+                        histogram!("bugpot_image_pull_seconds", "step" => "registry").record(0.0);
+                        histogram!("bugpot_image_pull_seconds", "step" => "extract").record(0.0);
+                        info!(id = %probed_id, "in-flight pull completed; using cache");
+                        return Ok(cached);
+                    }
+                    // Cache miss after wake: the leader failed. Loop
+                    // and try to claim leadership ourselves.
+                    debug!(id = %probed_id, "in-flight pull failed; retrying");
+                }
+            }
+        }
+    }
+
+    /// Try to become leader for `id`. If another task already inserted
+    /// a barrier, return [`InflightRole::Waiter`] holding a clone of
+    /// it. Otherwise insert a fresh barrier, lock it, and return
+    /// [`InflightRole::Leader`] holding the guard.
+    fn claim_inflight(&self, id: &ImageId) -> InflightRole {
+        use std::collections::hash_map::Entry;
+        let mut map = self.inflight.lock().expect("inflight map mutex poisoned");
+        match map.entry(id.clone()) {
+            Entry::Occupied(e) => InflightRole::Waiter(e.get().clone()),
+            Entry::Vacant(v) => {
+                let barrier = Arc::new(AsyncMutex::new(()));
+                // Fresh mutex, never handed out — `try_lock_owned`
+                // cannot fail. Holding this guard while the leader
+                // works is what blocks waiters on their
+                // `barrier.lock().await`.
+                let guard = Arc::clone(&barrier)
+                    .try_lock_owned()
+                    .expect("fresh barrier mutex");
+                v.insert(barrier);
+                InflightRole::Leader(guard)
+            }
+        }
+    }
+
+    /// Remove the barrier for `id`. The leader's guard drop after
+    /// this call unblocks every queued waiter. Removing the entry
+    /// first means a brand-new caller arriving after the removal
+    /// won't try to wait on a barrier whose leader has already
+    /// finished.
+    fn release_inflight(&self, id: &ImageId) {
+        let mut map = self.inflight.lock().expect("inflight map mutex poisoned");
+        map.remove(id);
+    }
+
+    /// Full registry pull + extract. Called only by the singleflight
+    /// leader. Re-checks the on-disk cache after the network round-trip
+    /// because a different bugpot process (e.g. a parallel test run
+    /// against the same state dir) may have populated it.
+    async fn do_full_pull(
+        &self,
+        reference: &Reference,
+        registry_auth: &RegistryAuth,
+    ) -> Result<PulledImage> {
         let accepted = accepted_media_types();
         info!(image = %reference, "cache miss, pulling layers from registry");
         let registry_start = Instant::now();
-        let data: ImageData = self
-            .client
-            .pull(&reference, &registry_auth, accepted)
-            .await?;
+        let data: ImageData = self.client.pull(reference, registry_auth, accepted).await?;
         histogram!("bugpot_image_pull_seconds", "step" => "registry")
             .record(registry_start.elapsed().as_secs_f64());
 
@@ -164,8 +255,10 @@ impl Puller {
         let id = ImageId::new(digest);
         let image_dir = self.images_root.join(id.fs_component());
 
-        // Re-check after the full pull: a concurrent pull may have
-        // finished while we were downloading layers.
+        // Re-check after the full pull: a *different process* (not a
+        // task in this Puller's singleflight; that's already ruled
+        // out by the inflight map) may have finished an extract while
+        // we were downloading layers.
         if let Some(cached) = load_cached_image(&self.images_root, &id)? {
             info!(%id, "image cache hit");
             histogram!("bugpot_image_pull_seconds", "step" => "extract").record(0.0);
@@ -178,7 +271,7 @@ impl Puller {
         // blocking thread to keep the tokio worker free for router /
         // controller traffic. Caller still awaits the same future.
         // Per-pull-call suffix so concurrent in-process pulls of the
-        // same digest (eager-start of two apps that share an image)
+        // same digest (e.g. the cross-process re-extract race above)
         // don't collide on the tmp dir.
         let extract_start = Instant::now();
         let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -204,6 +297,14 @@ impl Puller {
             config,
         })
     }
+}
+
+/// Outcome of [`Puller::claim_inflight`]: either we own the barrier
+/// (and must drive the pull) or we hold a clone of someone else's
+/// barrier (and must wait for them to finish).
+enum InflightRole {
+    Leader(tokio::sync::OwnedMutexGuard<()>),
+    Waiter(Arc<AsyncMutex<()>>),
 }
 
 /// Reconstruct a [`PulledImage`] from the on-disk cache for `id`,
@@ -574,5 +675,88 @@ mod tests {
         let missing = tmp.path().join("does-not-exist");
         let removed = gc_unused_images(&missing, &HashSet::new()).unwrap();
         assert_eq!(removed, 0);
+    }
+
+    /// First claim becomes leader; second claim for the same id while
+    /// the leader still holds its guard becomes a waiter. After
+    /// release, a new claim becomes leader again.
+    #[tokio::test]
+    async fn inflight_roles_leader_then_waiter_then_leader_again() {
+        let puller = Puller::new(tempfile::tempdir().unwrap().keep());
+        let id = ImageId::new("sha256:abc");
+
+        let leader_guard = match puller.claim_inflight(&id) {
+            InflightRole::Leader(g) => g,
+            InflightRole::Waiter(_) => panic!("first claim must be leader"),
+        };
+        let waiter_barrier = match puller.claim_inflight(&id) {
+            InflightRole::Leader(_) => panic!("second claim must be waiter"),
+            InflightRole::Waiter(b) => b,
+        };
+
+        // While the leader holds its guard, the waiter's barrier is
+        // locked from the same Arc<Mutex>, so a non-blocking try_lock
+        // must fail.
+        assert!(
+            waiter_barrier.try_lock().is_err(),
+            "waiter must be blocked while leader holds the guard"
+        );
+
+        drop(leader_guard);
+        puller.release_inflight(&id);
+
+        // After release, the waiter's barrier is free.
+        assert!(
+            waiter_barrier.try_lock().is_ok(),
+            "waiter must unblock once leader releases"
+        );
+
+        // And a brand-new claim becomes leader again — the entry has
+        // been removed from the inflight map.
+        let _next = match puller.claim_inflight(&id) {
+            InflightRole::Leader(g) => g,
+            InflightRole::Waiter(_) => panic!("post-release claim must be leader"),
+        };
+    }
+
+    /// Two concurrent waiters on the same digest both unblock once the
+    /// leader releases. Verifies that the per-digest barrier is shared
+    /// (not held exclusively by the first waiter to wake).
+    #[tokio::test]
+    async fn inflight_two_waiters_both_unblock() {
+        let puller = Arc::new(Puller::new(tempfile::tempdir().unwrap().keep()));
+        let id = ImageId::new("sha256:def");
+
+        let leader_guard = match puller.claim_inflight(&id) {
+            InflightRole::Leader(g) => g,
+            InflightRole::Waiter(_) => panic!("first claim must be leader"),
+        };
+
+        // Two waiters whose .lock().await must complete after release.
+        let mut waiters = Vec::new();
+        for _ in 0..2 {
+            let barrier = match puller.claim_inflight(&id) {
+                InflightRole::Leader(_) => panic!("must be waiter"),
+                InflightRole::Waiter(b) => b,
+            };
+            waiters.push(tokio::spawn(async move {
+                drop(barrier.lock().await);
+            }));
+        }
+
+        // Briefly yield so the waiter tasks have a chance to park on
+        // the barrier. They must still be unfinished — leader hasn't
+        // released yet.
+        tokio::task::yield_now().await;
+        for w in &waiters {
+            assert!(!w.is_finished(), "waiter must not finish before release");
+        }
+
+        drop(leader_guard);
+        puller.release_inflight(&id);
+
+        for w in waiters {
+            w.await.expect("waiter task panicked");
+        }
     }
 }
