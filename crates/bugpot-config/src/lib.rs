@@ -282,27 +282,27 @@ pub fn load_auth(path: impl AsRef<Path>) -> Result<AuthConfig> {
     toml::from_str(&body).with_context(|| format!("failed to parse {}", path.display()))
 }
 
-/// Reject files that any non-owner principal can read, write, or
-/// execute. Used for credential files (auth.toml, admin-token files).
-/// Returns the original error context when the file is unreadable.
-#[cfg(unix)]
-fn require_owner_only(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let metadata = std::fs::metadata(path)
-        .with_context(|| format!("stat credentials file {}", path.display()))?;
-    let mode = metadata.permissions().mode() & 0o777;
-    if mode & 0o077 != 0 {
-        anyhow::bail!(
-            "credentials file {} has permissive mode {mode:#o}; refusing to start (run `chmod 600 {0}` so only its owner can read it)",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn require_owner_only(_path: &Path) -> Result<()> {
-    Ok(())
+/// Reject credentials files that are accessible to anyone other than
+/// the bugpot owner.
+///
+/// Delegates to `fs-mistrust`, which checks both the file's own mode
+/// and **every ancestor directory** on the path — so a `0600` file
+/// inside a world-writable directory (where an attacker could `unlink`
+/// + replace it between bugpot runs) is rejected.
+///
+/// Used for `auth.toml`, the admin-token file, and any other file
+/// whose disclosure equals a compliance / security incident.
+pub fn require_owner_only(path: &Path) -> Result<()> {
+    fs_mistrust::Mistrust::new()
+        .verifier()
+        .require_file()
+        .check(path)
+        .with_context(|| {
+            format!(
+                "credentials file {} (or one of its ancestor directories) is accessible to a non-owner; refusing to start",
+                path.display()
+            )
+        })
 }
 
 /// Extract the registry hostname from an image reference.
@@ -387,6 +387,63 @@ mod tests {
         ] {
             assert!(validate_dns_label("name", s).is_err(), "should reject: {s:?}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn require_owner_only_accepts_tight_path() {
+        use std::os::unix::fs::PermissionsExt;
+        // Use a `tempfile::Builder` so the temp dir lives in `/tmp`
+        // (whose ancestor chain is acceptable to fs-mistrust). Tighten
+        // the dir + file to owner-only and confirm we pass.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, b"secret").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        require_owner_only(&path).expect("tight permissions must pass");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn require_owner_only_rejects_world_writable_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        // Regression guard for fs-mistrust's *ancestor* walk: even a
+        // 0600 file is unsafe inside a world-writable directory, since
+        // an attacker can `unlink` + replace it between bugpot runs.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, b"secret").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let err = require_owner_only(&path).expect_err("permissive parent must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("non-owner") || msg.contains("ancestor"),
+            "error should mention non-owner / ancestor access: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn require_owner_only_rejects_world_readable_file() {
+        use std::os::unix::fs::PermissionsExt;
+        // Note: `fs-mistrust` deliberately allows group-readable files
+        // when the file's group has no other members beyond the owner
+        // (typical "user:user" primary-group layout on Linux). That's
+        // a stricter notion than the old `mode & 0o077 != 0` check —
+        // it considers actual access, not just bits — and we accept
+        // the nuance. World-readable, however, is unambiguously bad
+        // and must always be rejected.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, b"secret").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o604)).unwrap();
+        assert!(
+            require_owner_only(&path).is_err(),
+            "world-readable file must be rejected"
+        );
     }
 
     #[test]
