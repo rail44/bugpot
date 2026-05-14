@@ -41,7 +41,7 @@ pub enum RuntimeError {
     },
 
     #[error("oci-spec error: {0}")]
-    OciSpec(#[from] Box<oci_spec::OciSpecError>),
+    OciSpec(#[from] Box<libcontainer::oci_spec::OciSpecError>),
 
     #[error("libcontainer error: {0}")]
     Libcontainer(#[from] Box<libcontainer::error::LibcontainerError>),
@@ -81,8 +81,8 @@ impl RuntimeError {
 }
 
 // Auto-box variants so the `Result` stays small (clippy::result_large_err).
-impl From<oci_spec::OciSpecError> for RuntimeError {
-    fn from(e: oci_spec::OciSpecError) -> Self {
+impl From<libcontainer::oci_spec::OciSpecError> for RuntimeError {
+    fn from(e: libcontainer::oci_spec::OciSpecError) -> Self {
         Self::OciSpec(Box::new(e))
     }
 }

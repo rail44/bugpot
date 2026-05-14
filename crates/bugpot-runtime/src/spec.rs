@@ -5,12 +5,12 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use bugpot_config::AppSpec;
-use oci_client::config::ConfigFile as ImageConfigFile;
-use oci_spec::runtime::{
+use libcontainer::oci_spec::runtime::{
     Capability, LinuxBuilder, LinuxCapabilitiesBuilder, LinuxCpuBuilder, LinuxMemoryBuilder,
     LinuxNamespace, LinuxNamespaceBuilder, LinuxNamespaceType, LinuxResourcesBuilder, Mount,
     MountBuilder, ProcessBuilder, RootBuilder, Spec, SpecBuilder, UserBuilder, get_default_mounts,
 };
+use oci_client::config::ConfigFile as ImageConfigFile;
 
 use crate::error::{Result, RuntimeError};
 use crate::resources;
@@ -171,7 +171,7 @@ fn push_env(env: &mut Vec<String>, key: &str, value: &str) {
     env.push(format!("{key}={value}"));
 }
 
-fn parse_user(raw: Option<&str>, rootfs: &Path) -> Result<oci_spec::runtime::User> {
+fn parse_user(raw: Option<&str>, rootfs: &Path) -> Result<libcontainer::oci_spec::runtime::User> {
     let trimmed = raw.unwrap_or("").trim();
     if matches!(trimmed, "" | "root" | "0" | "0:0") {
         return Ok(UserBuilder::default().uid(0_u32).gid(0_u32).build()?);
@@ -291,7 +291,7 @@ fn build_namespaces(netns_path: Option<&Path>) -> Result<Vec<LinuxNamespace>> {
     Ok(vec![pid, ipc, uts, mount, cgroup, net.build()?])
 }
 
-fn build_resources(spec: &AppSpec) -> Result<oci_spec::runtime::LinuxResources> {
+fn build_resources(spec: &AppSpec) -> Result<libcontainer::oci_spec::runtime::LinuxResources> {
     let mut builder = LinuxResourcesBuilder::default();
 
     if let Some(mem) = &spec.resources.memory {
@@ -505,7 +505,7 @@ cpu = "0.5"
         let profile = linux.seccomp().as_ref().expect("seccomp attached");
         assert_eq!(
             profile.default_action(),
-            oci_spec::runtime::LinuxSeccompAction::ScmpActErrno
+            libcontainer::oci_spec::runtime::LinuxSeccompAction::ScmpActErrno
         );
         // Sanity: rules are non-empty (full profile-shape coverage lives
         // in `seccomp::tests`).

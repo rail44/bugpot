@@ -9,7 +9,7 @@
 //! seccomp schema (`archMap`, per-rule `includes`/`excludes` for
 //! capability-conditional rules, `comment` fields). [`runc_default`]
 //! parses the file, ignores the extensions, and produces an
-//! `oci_spec::runtime::LinuxSeccomp` that libcontainer can apply
+//! `libcontainer::oci_spec::runtime::LinuxSeccomp` that libcontainer can apply
 //! directly.
 //!
 //! **Conditional `includes` / `excludes` are ignored — all rules
@@ -27,7 +27,7 @@
 
 use std::sync::OnceLock;
 
-use oci_spec::runtime::{
+use libcontainer::oci_spec::runtime::{
     Arch, LinuxSeccomp, LinuxSeccompAction, LinuxSeccompBuilder, LinuxSyscallBuilder,
 };
 use serde::Deserialize;
