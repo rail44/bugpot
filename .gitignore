@@ -2,3 +2,15 @@
 **/*.rs.bk
 .DS_Store
 .envrc
+
+# Claude Code: ignore everything under .claude/ by default. Claude
+# Code is an evolving product that can drop new per-user / runtime
+# files (session locks, scheduled-task state, agent worktrees) at
+# any time without warning, so a whitelist is safer than chasing
+# new files as they appear. Re-add explicit exceptions below as the
+# team decides which configs should be shared.
+.claude/*
+!.claude/settings.json
+!.claude/agents/
+!.claude/skills/
+!.claude/commands/
