@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use bugpot_config::{AppSpec, AuthConfig, RegistryCredential, registry_host};
+use bugpot_config::{AppIdentity, AppSpec, AuthConfig, RegistryCredential, registry_host};
 use bugpot_egress::EgressOps;
 use bugpot_router::{UpstreamResolver, subdomain_of};
 use bugpot_runtime::{Auth, ResourceUsage, RuntimeOps};
@@ -70,16 +70,18 @@ const READINESS_POLL: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
 struct AppHandle {
-    /// Immutable identity: the TOML stem (or `AppSpec.name` field).
-    /// Used as the primary key in `AppMaps.by_name`.
-    name: String,
-    /// Cached subdomain at construction time. Subdomain is treated as
-    /// part of identity (changes go through delete + re-add) so it
-    /// doesn't need to be re-derived on every routing lookup.
-    subdomain: String,
+    /// Immutable identity (name + subdomain). Set once at construction
+    /// from the validating `AppSpec::identity`, never updated — a
+    /// future PUT-style update path will compare against this and
+    /// reject mismatches rather than mutating it. `name` is the primary
+    /// key in `AppMaps.by_name`; `subdomain` is the reverse-lookup key
+    /// used by `UpstreamResolver::resolve`.
+    identity: AppIdentity,
     /// Mutable spec fields (image, port, env, etc.). Wrapped in
     /// `RwLock` so future PUT-style updates can mutate in place
-    /// without rebuilding the handle.
+    /// without rebuilding the handle. The spec's own `name` /
+    /// `subdomain` fields exist for TOML / JSON serialisation shape
+    /// only — `identity` is the authoritative pair.
     spec: RwLock<AppSpec>,
     inner: Mutex<HandleInner>,
 }
@@ -172,11 +174,13 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
     ) -> Self {
         let mut maps = AppMaps::default();
         for spec in specs {
-            let name = spec.name().to_owned();
-            let subdomain = spec.subdomain().to_owned();
-            let handle = make_handle(spec);
-            maps.by_subdomain.insert(subdomain, name.clone());
-            maps.by_name.insert(name, handle);
+            // `load_apps` already validated each spec; an `InvalidSpec`
+            // here would indicate a caller bypassed that, which is a
+            // bug — `expect` is the right reaction.
+            let handle = make_handle(spec).expect("controller::new received unvalidated AppSpec");
+            maps.by_subdomain
+                .insert(handle.identity.subdomain.clone(), handle.identity.name.clone());
+            maps.by_name.insert(handle.identity.name.clone(), handle);
         }
         #[allow(clippy::cast_precision_loss)]
         gauge!("bugpot_apps_active").set(maps.by_name.len() as f64);
@@ -241,7 +245,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
             return;
         }
         for handle in self.snapshot_handles().await {
-            let name = &handle.name;
+            let name = &handle.identity.name;
             if !self.runtime.is_container_running(name) {
                 continue;
             }
@@ -331,7 +335,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
                 .await
                 .scaling
                 .resolve_idle_timeout()
-                .map_err(|e| anyhow!("{}: {e}", handle.name))?;
+                .map_err(|e| anyhow!("{}: {e}", handle.identity.name))?;
             if timeout.is_none() {
                 always_on.push(handle);
             }
@@ -341,7 +345,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         }
 
         let starts = always_on.into_iter().map(|handle| {
-            let name = handle.name.clone();
+            let name = handle.identity.name.clone();
             async move {
                 info!(app = %name, "eager start (idle_timeout = 0)");
                 match self.ensure_running(&handle).await {
@@ -401,15 +405,15 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         }
 
         // 1. Liveness: did the container die under us?
-        if !self.runtime.is_container_running(&handle.name) {
-            info!(app = %handle.name, "container exited unexpectedly, cleaning up");
+        if !self.runtime.is_container_running(&handle.identity.name) {
+            info!(app = %handle.identity.name, "container exited unexpectedly, cleaning up");
             counter!(
                 "bugpot_container_crashes_total",
-                "app" => handle.name.clone(),
+                "app" => handle.identity.name.clone(),
             )
             .increment(1);
             if let Err(e) = self.stop(&handle).await {
-                warn!(app = %handle.name, error = ?e, "cleanup of dead container failed");
+                warn!(app = %handle.identity.name, error = ?e, "cleanup of dead container failed");
             }
             return;
         }
@@ -418,7 +422,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         // resolve to nothing (cgroup v1 host or transient /proc
         // races) — the gauge stops updating, the counter doesn't
         // move.
-        if let Some(usage) = self.runtime.resource_usage(&handle.name) {
+        if let Some(usage) = self.runtime.resource_usage(&handle.identity.name) {
             emit_resource_metrics(&handle, usage).await;
         }
 
@@ -428,7 +432,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
             Ok(Some(t)) => t,
             Ok(None) => return,
             Err(e) => {
-                warn!(app = %handle.name, "bad idle_timeout: {e}");
+                warn!(app = %handle.identity.name, "bad idle_timeout: {e}");
                 return;
             }
         };
@@ -437,9 +441,9 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
             inner.last_access
         };
         if last_access.elapsed() >= timeout {
-            info!(app = %handle.name, "idle timeout reached, stopping");
+            info!(app = %handle.identity.name, "idle timeout reached, stopping");
             if let Err(e) = self.stop(&handle).await {
-                warn!(app = %handle.name, error = ?e, "stop on idle failed");
+                warn!(app = %handle.identity.name, error = ?e, "stop on idle failed");
             }
         }
     }
@@ -455,7 +459,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
                 )
             };
             if should_stop && let Err(e) = self.stop(&handle).await {
-                warn!(app = %handle.name, error = ?e, "stop failed during teardown");
+                warn!(app = %handle.identity.name, error = ?e, "stop failed during teardown");
             }
         }
     }
@@ -500,7 +504,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
             .with_context(|| format!("write {}", toml_path.display()))?;
         spec.source_path.clone_from(&toml_path);
 
-        let handle = make_handle(spec.clone());
+        let handle = make_handle(spec.clone())?;
 
         {
             let mut maps = self.apps.write().await;
@@ -553,14 +557,14 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
                 .by_name
                 .remove(name)
                 .ok_or_else(|| anyhow!("app '{name}' not found"))?;
-            maps.by_subdomain.remove(&handle.subdomain);
+            maps.by_subdomain.remove(&handle.identity.subdomain);
             handle
         };
         gauge!("bugpot_apps_active").decrement(1.0);
         if let Err(e) = self.stop(&handle).await {
-            warn!(app = %handle.name, error = ?e, "stop failed during remove");
+            warn!(app = %handle.identity.name, error = ?e, "stop failed during remove");
         }
-        let toml_path = self.apps_dir.join(format!("{}.toml", handle.name));
+        let toml_path = self.apps_dir.join(format!("{}.toml", handle.identity.name));
         if toml_path.exists()
             && let Err(e) = tokio::fs::remove_file(&toml_path).await
         {
@@ -603,7 +607,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
                     AppState::Starting { notify } => {
                         let n = notify.clone();
                         drop(inner);
-                        debug!(app = %handle.name, "awaiting concurrent start");
+                        debug!(app = %handle.identity.name, "awaiting concurrent start");
                         n.notified().await;
                         continue;
                     }
@@ -639,7 +643,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
     }
 
     async fn do_start(&self, handle: &AppHandle) -> Result<Ipv4Addr> {
-        let name = &handle.name;
+        let name = &handle.identity.name;
         // Snapshot the spec once: a cold start interleaves several
         // awaits with reads of image / port / egress.allow / readiness,
         // so cloning the small `AppSpec` is cheaper than holding the
@@ -740,7 +744,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
     }
 
     async fn do_stop(&self, handle: &AppHandle) -> Result<()> {
-        let name = &handle.name;
+        let name = &handle.identity.name;
         info!(app = %name, "stopping");
         if let Err(e) = self.runtime.stop_app(name).await {
             warn!(app = %name, error = %e, "stop_app failed");
@@ -767,19 +771,21 @@ async fn discard_failed_toml(path: &Path) {
     }
 }
 
-fn make_handle(spec: AppSpec) -> Arc<AppHandle> {
-    let name = spec.name().to_owned();
-    let subdomain = spec.subdomain().to_owned();
-    Arc::new(AppHandle {
-        name,
-        subdomain,
+/// Construct a handle from a validated spec. Returns `Err` if
+/// `spec.identity()` fails (the spec's name / subdomain weren't valid
+/// DNS labels). Callers in the deploy path are expected to have run
+/// `spec.validate()` earlier; this is the belt-and-braces version.
+fn make_handle(spec: AppSpec) -> Result<Arc<AppHandle>, bugpot_config::InvalidSpec> {
+    let identity = spec.identity()?;
+    Ok(Arc::new(AppHandle {
+        identity,
         spec: RwLock::new(spec),
         inner: Mutex::new(HandleInner {
             state: AppState::Stopped,
             last_access: Instant::now(),
             cpu_baseline: 0,
         }),
-    })
+    }))
 }
 
 async fn view_of(handle: &Arc<AppHandle>) -> AppView {
@@ -791,8 +797,8 @@ async fn view_of(handle: &Arc<AppHandle>) -> AppView {
     };
     let spec = handle.spec.read().await;
     AppView {
-        name: handle.name.clone(),
-        subdomain: handle.subdomain.clone(),
+        name: handle.identity.name.clone(),
+        subdomain: handle.identity.subdomain.clone(),
         image: spec.image.clone(),
         port: spec.port,
         state,
@@ -829,7 +835,7 @@ impl<R: RuntimeOps, E: EgressOps> UpstreamResolver for AppController<R, E> {
 /// divide by 1e6: `rate(bugpot_app_cpu_microseconds_total[5m]) / 1000000`.
 async fn emit_resource_metrics(handle: &Arc<AppHandle>, usage: ResourceUsage) {
     #[allow(clippy::cast_precision_loss)]
-    gauge!("bugpot_app_memory_bytes", "app" => handle.name.clone())
+    gauge!("bugpot_app_memory_bytes", "app" => handle.identity.name.clone())
         .set(usage.memory_bytes as f64);
 
     let mut inner = handle.inner.lock().await;
@@ -847,7 +853,7 @@ async fn emit_resource_metrics(handle: &Arc<AppHandle>, usage: ResourceUsage) {
         usage.cpu_usec
     };
     if delta_usec > 0 {
-        counter!("bugpot_app_cpu_microseconds_total", "app" => handle.name.clone())
+        counter!("bugpot_app_cpu_microseconds_total", "app" => handle.identity.name.clone())
             .increment(delta_usec);
     }
 }
