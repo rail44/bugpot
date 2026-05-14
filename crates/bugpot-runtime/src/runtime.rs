@@ -524,19 +524,30 @@ async fn forward_log_file(path: PathBuf, app: String, stream: &'static str) {
         }
     };
     let mut reader = BufReader::new(file);
+    // `line` accumulates bytes across iterations. `read_line` appends
+    // to it, and we only emit + clear once we've actually seen a
+    // newline — so a container that writes "Hello, w" before flushing
+    // doesn't get split into two log entries on the bugpot side.
     let mut line = String::new();
 
     loop {
         // Drain everything currently in the file.
         loop {
-            line.clear();
             match reader.read_line(&mut line).await {
                 Ok(0) => break,
                 Ok(_) => {
-                    let trimmed = line.trim_end();
-                    if !trimmed.is_empty() {
-                        info!(target: "bugpot::app", app = %app, stream, "{trimmed}");
+                    if line.ends_with('\n') {
+                        let trimmed = line.trim_end();
+                        if !trimmed.is_empty() {
+                            info!(target: "bugpot::app", app = %app, stream, "{trimmed}");
+                        }
+                        line.clear();
                     }
+                    // Otherwise: EOF hit mid-line. Keep what we have
+                    // in `line` and loop — the next iteration will
+                    // either pick up more bytes (if the container
+                    // wrote while we were reading) or fall through to
+                    // the inotify wait below.
                 }
                 Err(e) => {
                     warn!(app = %app, stream, error = %e, "log file tail read failed");
@@ -558,6 +569,10 @@ async fn forward_log_file(path: PathBuf, app: String, stream: &'static str) {
                         warn!(app = %app, stream, error = %e, "seek after truncate failed");
                         return;
                     }
+                    // The bytes we accumulated belong to the pre-
+                    // truncate file; concatenating them onto the
+                    // first post-truncate line would corrupt it.
+                    line.clear();
                 }
             }
             Ok(_) => {}

@@ -378,59 +378,67 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
     }
 
     async fn sweep(&self) {
-        for handle in self.snapshot_handles().await {
-            // Only look at apps we believe are running. Starting /
-            // Stopping / Stopped handles are already in motion or
-            // already-cleaned.
-            let is_running = matches!(
-                handle.inner.lock().await.state,
-                AppState::Running { .. }
-            );
-            if !is_running {
-                continue;
-            }
+        // Per-app sweep work is independent (each handle has its own
+        // lock + spec + runtime entry), so run all apps concurrently.
+        // A slow `stop()` on one app no longer blocks metric emission
+        // or idle-timeout enforcement for the others in the same tick.
+        let handles = self.snapshot_handles().await;
+        let tasks = handles.into_iter().map(|h| self.sweep_one(h));
+        futures::future::join_all(tasks).await;
+    }
 
-            // 1. Liveness: did the container die under us?
-            if !self.runtime.is_container_running(&handle.name) {
-                info!(app = %handle.name, "container exited unexpectedly, cleaning up");
-                counter!(
-                    "bugpot_container_crashes_total",
-                    "app" => handle.name.clone(),
-                )
-                .increment(1);
-                if let Err(e) = self.stop(&handle).await {
-                    warn!(app = %handle.name, error = ?e, "cleanup of dead container failed");
-                }
-                continue;
-            }
+    async fn sweep_one(&self, handle: Arc<AppHandle>) {
+        // Only look at apps we believe are running. Starting /
+        // Stopping / Stopped handles are already in motion or
+        // already-cleaned.
+        let is_running = matches!(
+            handle.inner.lock().await.state,
+            AppState::Running { .. }
+        );
+        if !is_running {
+            return;
+        }
 
-            // 2. Resource sampling. Skip silently when cgroup paths
-            // resolve to nothing (cgroup v1 host or transient /proc
-            // races) — the gauge stops updating, the counter doesn't
-            // move.
-            if let Some(usage) = self.runtime.resource_usage(&handle.name) {
-                self.emit_resource_metrics(&handle.name, usage).await;
+        // 1. Liveness: did the container die under us?
+        if !self.runtime.is_container_running(&handle.name) {
+            info!(app = %handle.name, "container exited unexpectedly, cleaning up");
+            counter!(
+                "bugpot_container_crashes_total",
+                "app" => handle.name.clone(),
+            )
+            .increment(1);
+            if let Err(e) = self.stop(&handle).await {
+                warn!(app = %handle.name, error = ?e, "cleanup of dead container failed");
             }
+            return;
+        }
 
-            // 3. Idle timeout (scale-to-zero). always-on apps skip.
-            let idle_resolved = handle.spec.read().await.scaling.resolve_idle_timeout();
-            let timeout = match idle_resolved {
-                Ok(Some(t)) => t,
-                Ok(None) => continue,
-                Err(e) => {
-                    warn!(app = %handle.name, "bad idle_timeout: {e}");
-                    continue;
-                }
-            };
-            let last_access = {
-                let inner = handle.inner.lock().await;
-                inner.last_access
-            };
-            if last_access.elapsed() >= timeout {
-                info!(app = %handle.name, "idle timeout reached, stopping");
-                if let Err(e) = self.stop(&handle).await {
-                    warn!(app = %handle.name, error = ?e, "stop on idle failed");
-                }
+        // 2. Resource sampling. Skip silently when cgroup paths
+        // resolve to nothing (cgroup v1 host or transient /proc
+        // races) — the gauge stops updating, the counter doesn't
+        // move.
+        if let Some(usage) = self.runtime.resource_usage(&handle.name) {
+            self.emit_resource_metrics(&handle.name, usage).await;
+        }
+
+        // 3. Idle timeout (scale-to-zero). always-on apps skip.
+        let idle_resolved = handle.spec.read().await.scaling.resolve_idle_timeout();
+        let timeout = match idle_resolved {
+            Ok(Some(t)) => t,
+            Ok(None) => return,
+            Err(e) => {
+                warn!(app = %handle.name, "bad idle_timeout: {e}");
+                return;
+            }
+        };
+        let last_access = {
+            let inner = handle.inner.lock().await;
+            inner.last_access
+        };
+        if last_access.elapsed() >= timeout {
+            info!(app = %handle.name, "idle timeout reached, stopping");
+            if let Err(e) = self.stop(&handle).await {
+                warn!(app = %handle.name, error = ?e, "stop on idle failed");
             }
         }
     }

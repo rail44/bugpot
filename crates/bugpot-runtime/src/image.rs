@@ -167,49 +167,21 @@ impl Puller {
             return Ok(cached);
         }
 
-        // Fresh extract. Use a tmp dir then atomic rename to avoid leaving
-        // partials on crash.
+        // Fresh extract. Use a tmp dir then atomic rename to avoid
+        // leaving partials on crash. Tar extraction is CPU + sync I/O
+        // heavy (multi-second for typical images), so run it on a
+        // blocking thread to keep the tokio worker free for router /
+        // controller traffic. Caller still awaits the same future.
         let extract_start = Instant::now();
         let tmp_dir = self
             .images_root
             .join(format!("{}.tmp.{}", id.fs_component(), std::process::id()));
-        if tmp_dir.exists() {
-            fs::remove_dir_all(&tmp_dir).map_err(|e| RuntimeError::io(&tmp_dir, e))?;
-        }
-        let rootfs = tmp_dir.join("rootfs");
-        fs::create_dir_all(&rootfs).map_err(|e| RuntimeError::io(&rootfs, e))?;
-
-        // Write manifest + config alongside.
-        if let Some(manifest) = &data.manifest {
-            let manifest_path = tmp_dir.join("manifest.json");
-            let body = serde_json::to_vec_pretty(manifest).map_err(RuntimeError::SerializeSpec)?;
-            fs::write(&manifest_path, body).map_err(|e| RuntimeError::io(&manifest_path, e))?;
-        }
-        let config_path = tmp_dir.join("config.json");
-        fs::write(&config_path, data.config.data.as_ref())
-            .map_err(|e| RuntimeError::io(&config_path, e))?;
-
-        // Unpack layers in order.
-        for (idx, layer) in data.layers.iter().enumerate() {
-            debug!(idx, media_type = %layer.media_type, "unpacking layer");
-            // Optional: verify each layer's sha256 against its annotation
-            // when present. The manifest's layer digests are checked by
-            // oci-client during pull, so we don't repeat that here.
-            extract_layer(&rootfs, &layer.data, &layer.media_type)?;
-        }
-
-        let config: ConfigFile = serde_json::from_slice(&data.config.data)
-            .map_err(RuntimeError::DeserializeConfig)?;
-
-        // Mark done, then atomically swap into place.
-        fs::write(tmp_dir.join(".done"), b"").map_err(|e| RuntimeError::io(&tmp_dir, e))?;
-
-        if image_dir.exists() {
-            // Another concurrent pull won the race; discard ours.
-            fs::remove_dir_all(&tmp_dir).map_err(|e| RuntimeError::io(&tmp_dir, e))?;
-        } else {
-            fs::rename(&tmp_dir, &image_dir).map_err(|e| RuntimeError::io(&image_dir, e))?;
-        }
+        let image_dir_for_blocking = image_dir.clone();
+        let config = tokio::task::spawn_blocking(move || -> Result<ConfigFile> {
+            extract_to_image_dir(tmp_dir, image_dir_for_blocking, data)
+        })
+        .await
+        .map_err(|e| RuntimeError::Other(format!("image extract task panicked: {e}")))??;
         histogram!("bugpot_image_pull_seconds", "step" => "extract")
             .record(extract_start.elapsed().as_secs_f64());
 
@@ -223,6 +195,56 @@ impl Puller {
 }
 
 /// Reconstruct a [`PulledImage`] from the on-disk cache for `id`,
+/// Synchronous extract worker. Runs the tar unpack + small writes
+/// inside `spawn_blocking`. Returns the parsed image config so the
+/// async caller doesn't have to re-read the file off disk.
+///
+/// Args are by value because the caller hands ownership to
+/// `spawn_blocking`'s `FnOnce`; clippy's by-value warning here is
+/// not actionable.
+#[allow(clippy::needless_pass_by_value)]
+fn extract_to_image_dir(
+    tmp_dir: PathBuf,
+    image_dir: PathBuf,
+    data: ImageData,
+) -> Result<ConfigFile> {
+    if tmp_dir.exists() {
+        fs::remove_dir_all(&tmp_dir).map_err(|e| RuntimeError::io(&tmp_dir, e))?;
+    }
+    let rootfs = tmp_dir.join("rootfs");
+    fs::create_dir_all(&rootfs).map_err(|e| RuntimeError::io(&rootfs, e))?;
+
+    if let Some(manifest) = &data.manifest {
+        let manifest_path = tmp_dir.join("manifest.json");
+        let body = serde_json::to_vec_pretty(manifest).map_err(RuntimeError::SerializeSpec)?;
+        fs::write(&manifest_path, body).map_err(|e| RuntimeError::io(&manifest_path, e))?;
+    }
+    let config_path = tmp_dir.join("config.json");
+    fs::write(&config_path, data.config.data.as_ref())
+        .map_err(|e| RuntimeError::io(&config_path, e))?;
+
+    for (idx, layer) in data.layers.iter().enumerate() {
+        debug!(idx, media_type = %layer.media_type, "unpacking layer");
+        // Optional: verify each layer's sha256 against its annotation
+        // when present. The manifest's layer digests are checked by
+        // oci-client during pull, so we don't repeat that here.
+        extract_layer(&rootfs, &layer.data, &layer.media_type)?;
+    }
+
+    let config: ConfigFile =
+        serde_json::from_slice(&data.config.data).map_err(RuntimeError::DeserializeConfig)?;
+
+    fs::write(tmp_dir.join(".done"), b"").map_err(|e| RuntimeError::io(&tmp_dir, e))?;
+
+    if image_dir.exists() {
+        // Another concurrent pull won the race; discard ours.
+        fs::remove_dir_all(&tmp_dir).map_err(|e| RuntimeError::io(&tmp_dir, e))?;
+    } else {
+        fs::rename(&tmp_dir, &image_dir).map_err(|e| RuntimeError::io(&image_dir, e))?;
+    }
+    Ok(config)
+}
+
 /// or return `Ok(None)` if no `.done` marker exists for that digest.
 ///
 /// Shared between [`Puller::pull`]'s cache-hit short-circuit and
