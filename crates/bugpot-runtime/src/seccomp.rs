@@ -68,6 +68,12 @@ struct MobyProfile {
 struct MobySyscall {
     names: Vec<String>,
     action: String,
+    /// Per-rule errno override. Critical for entries like `clone3` →
+    /// `ENOSYS (38)`: glibc's `clone3` wrapper falls back to `clone`
+    /// only when it sees `ENOSYS`; any other errno turns the rule into
+    /// a hard failure that breaks `pthread_create` in modern images.
+    #[serde(rename = "errnoRet", default)]
+    errno_ret: Option<u32>,
     // `includes`/`excludes`/`comment` fields are tolerated but ignored
     // (see module-level rationale).
 }
@@ -82,9 +88,13 @@ fn translate(p: &MobyProfile) -> Result<LinuxSeccomp> {
     let mut syscalls = Vec::new();
     for rule in &p.syscalls {
         let action = parse_action(&rule.action)?;
-        let syscall = LinuxSyscallBuilder::default()
+        let mut sb = LinuxSyscallBuilder::default()
             .names(rule.names.clone())
-            .action(action)
+            .action(action);
+        if let Some(ret) = rule.errno_ret {
+            sb = sb.errno_ret(ret);
+        }
+        let syscall = sb
             .build()
             .map_err(|e| RuntimeError::Other(format!("build seccomp syscall: {e}")))?;
         syscalls.push(syscall);
@@ -141,6 +151,29 @@ mod tests {
         let arches = p.architectures().as_ref().unwrap();
         assert!(arches.contains(&Arch::ScmpArchX86_64));
         assert!(arches.contains(&Arch::ScmpArchAarch64));
+    }
+
+    #[test]
+    fn errno_ret_is_preserved_on_clone3_deny_rule() {
+        // The moby profile carries a `clone3 → SCMP_ACT_ERRNO,
+        // errnoRet: 38` rule (line ~720 of the JSON) so glibc's
+        // `clone3 → clone` fallback sees `ENOSYS` and works. With
+        // libseccomp's first-match semantics, the **earlier** rule
+        // that allows `clone3` under `CAP_SYS_ADMIN` (with `includes`)
+        // currently wins because we strip cap conditions — so this
+        // deny rule is unreachable today. We still want the field to
+        // round-trip correctly so it behaves the moment cap-gated
+        // rules are reintroduced.
+        let p = runc_default().expect("profile parses");
+        let syscalls = p.syscalls().as_ref().expect("rules attached");
+        let deny = syscalls
+            .iter()
+            .find(|s| {
+                s.action() == LinuxSeccompAction::ScmpActErrno
+                    && s.names().iter().any(|n| n == "clone3")
+            })
+            .expect("clone3 deny rule present");
+        assert_eq!(deny.errno_ret(), Some(38));
     }
 
     #[test]
