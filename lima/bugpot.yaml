@@ -54,7 +54,25 @@ provision:
       build-essential pkg-config \
       libseccomp-dev \
       nftables iproute2 \
-      ca-certificates curl git
+      ca-certificates curl git \
+      bpftrace
+# Open up the kernel's perf-event surface for the unprivileged user.
+# Both knobs lower a security boundary — `perf_event_paranoid=-1`
+# allows CPU profiling without `CAP_SYS_ADMIN`, and `kptr_restrict=0`
+# unblurs kernel symbols so samply / flamegraphs name them. The
+# trade-off is acceptable here because this VM is dev-only and the
+# host is the trust boundary; do NOT carry these settings into any
+# production image.
+- mode: system
+  script: |
+    #!/bin/sh
+    set -eux
+    cat > /etc/sysctl.d/99-bugpot-perf.conf <<'EOF'
+    # bugpot dev VM only — enables `samply` / `perf` without root.
+    kernel.perf_event_paranoid = -1
+    kernel.kptr_restrict = 0
+    EOF
+    sysctl -p /etc/sysctl.d/99-bugpot-perf.conf
 - mode: system
   # Install tailscale (tailscaled service is started but the node is not
   # yet authenticated). Run `sudo tailscale up …` interactively after
@@ -78,3 +96,15 @@ provision:
         echo '. "$HOME/.cargo/env"' >> "$rc"
       fi
     done
+- mode: user
+  # CPU profiler. Sampling tool that uploads to Firefox Profiler. Used
+  # via `samply record -- ./target/release/bugpot ...` then opens the
+  # browser. `--locked` keeps the install reproducible. ~2 min compile
+  # at first provision; idempotent thereafter.
+  script: |
+    #!/bin/sh
+    set -eux
+    . "$HOME/.cargo/env"
+    if ! command -v samply >/dev/null 2>&1; then
+      cargo install --locked samply
+    fi
