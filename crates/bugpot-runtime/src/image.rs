@@ -351,17 +351,46 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(h.finalize())
 }
 
+/// Hard cap on the **decompressed** bytes of a single image layer. A
+/// malicious or compromised registry can serve a gzip layer that is
+/// tiny on the wire but expands to terabytes — bug-class "tar bomb".
+/// 2 GiB is well above any sane base image (debian-slim ~80 MB,
+/// node:20 ~1.1 GB, full python:3.12 ~1.2 GB) while still being
+/// orders of magnitude smaller than a successful exhaustion attack.
+const MAX_LAYER_DECOMPRESSED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 fn extract_layer(rootfs: &Path, data: &[u8], media_type: &str) -> Result<()> {
+    extract_layer_inner(rootfs, data, media_type, MAX_LAYER_DECOMPRESSED_BYTES)
+}
+
+fn extract_layer_inner(
+    rootfs: &Path,
+    data: &[u8],
+    media_type: &str,
+    max_decompressed: u64,
+) -> Result<()> {
     match media_type {
         IMAGE_LAYER_MEDIA_TYPE | IMAGE_DOCKER_LAYER_TAR_MEDIA_TYPE => {
+            if data.len() as u64 > max_decompressed {
+                return Err(RuntimeError::Other(format!(
+                    "image layer exceeds decompressed size cap ({} bytes > {} bytes)",
+                    data.len(),
+                    max_decompressed
+                )));
+            }
             unpack_tar(rootfs, data)
         }
         IMAGE_LAYER_GZIP_MEDIA_TYPE | IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE => {
-            let mut decoder = GzDecoder::new(data);
+            let mut decoder = GzDecoder::new(data).take(max_decompressed + 1);
             let mut buf = Vec::with_capacity(data.len() * 4);
             decoder
                 .read_to_end(&mut buf)
                 .map_err(|e| RuntimeError::io(rootfs, e))?;
+            if buf.len() as u64 > max_decompressed {
+                return Err(RuntimeError::Other(format!(
+                    "gzipped image layer decompressed past size cap (> {max_decompressed} bytes)"
+                )));
+            }
             unpack_tar(rootfs, &buf)
         }
         other => Err(RuntimeError::UnsupportedMediaType(other.to_owned())),
@@ -418,6 +447,46 @@ mod tests {
         let err = extract_layer(tmp.path(), b"", "application/octet-stream").unwrap_err();
         match err {
             RuntimeError::UnsupportedMediaType(m) => assert_eq!(m, "application/octet-stream"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// A small uncompressed layer that exceeds the cap is rejected
+    /// before extraction, so the bytes never reach the filesystem.
+    #[test]
+    fn extract_layer_rejects_oversize_tar() {
+        let data = vec![0u8; 200];
+        let tmp = tempfile::tempdir().unwrap();
+        let err = extract_layer_inner(tmp.path(), &data, IMAGE_LAYER_MEDIA_TYPE, 100).unwrap_err();
+        match err {
+            RuntimeError::Other(msg) => assert!(msg.contains("decompressed size cap"), "{msg}"),
+            other => panic!("unexpected: {other:?}"),
+        }
+        // Nothing was extracted.
+        assert!(std::fs::read_dir(tmp.path()).unwrap().next().is_none());
+    }
+
+    /// A gzip stream whose expansion exceeds the cap is rejected
+    /// before the inner tar is even parsed.
+    #[test]
+    fn extract_layer_rejects_oversize_gzip() {
+        // Highly compressible: 1 KiB of zeros compresses to ~30 bytes.
+        let payload = vec![0u8; 1024];
+        let mut gz = Vec::new();
+        {
+            use std::io::Write;
+            let mut enc = flate2::write::GzEncoder::new(&mut gz, flate2::Compression::best());
+            enc.write_all(&payload).unwrap();
+            enc.finish().unwrap();
+        }
+        // Cap at 200 bytes — well under the 1 KiB the gzip would
+        // produce — and confirm we surface the size error rather than
+        // an opaque tar parse error.
+        let tmp = tempfile::tempdir().unwrap();
+        let err =
+            extract_layer_inner(tmp.path(), &gz, IMAGE_LAYER_GZIP_MEDIA_TYPE, 200).unwrap_err();
+        match err {
+            RuntimeError::Other(msg) => assert!(msg.contains("size cap"), "{msg}"),
             other => panic!("unexpected: {other:?}"),
         }
     }

@@ -39,7 +39,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use axum::{
     BoxError, Json, Router,
     error_handling::HandleErrorLayer,
-    extract::{Path, Request, State},
+    extract::{ConnectInfo, Path, Request, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -127,7 +127,15 @@ where
     let app = router(controller, auth);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!(%addr, "bugpot-admin listening");
-    axum::serve(listener, app).await?;
+    // `into_make_service_with_connect_info` exposes the peer's
+    // `SocketAddr` to handlers via `axum::extract::ConnectInfo`. We
+    // use that to attach the peer's IP to every mutating action's
+    // audit-log entry.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -174,6 +182,7 @@ async fn handle_rate_limit_error(err: BoxError) -> Response {
 }
 
 async fn deploy<R, E>(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(controller): State<Arc<AppController<R, E>>>,
     Json(spec): Json<AppSpec>,
 ) -> Result<(StatusCode, Json<AppView>), AdminError>
@@ -181,11 +190,46 @@ where
     R: RuntimeOps,
     E: EgressOps,
 {
-    let view = controller.deploy_app(spec).await?;
-    Ok((StatusCode::CREATED, Json(view)))
+    // Capture what we know up-front so the audit entry stays useful
+    // even when validation rejects the spec before a name lands in
+    // the controller's maps.
+    let audit_name = spec
+        .name
+        .clone()
+        .unwrap_or_else(|| "<unnamed>".to_owned());
+    let audit_image = spec.image.clone();
+    match controller.deploy_app(spec).await {
+        Ok(view) => {
+            info!(
+                target: "bugpot::audit",
+                action = "deploy",
+                peer = %peer.ip(),
+                app = %audit_name,
+                image = %audit_image,
+                status = "ok",
+            );
+            Ok((StatusCode::CREATED, Json(view)))
+        }
+        Err(e) => {
+            // `warn!` (not `error!`): admin errors are routinely user-
+            // driven (collisions, bad image refs) and shouldn't fire
+            // pager rules. The mapped HTTP status carries severity.
+            warn!(
+                target: "bugpot::audit",
+                action = "deploy",
+                peer = %peer.ip(),
+                app = %audit_name,
+                image = %audit_image,
+                status = "error",
+                error = %e,
+            );
+            Err(e.into())
+        }
+    }
 }
 
 async fn remove<R, E>(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(controller): State<Arc<AppController<R, E>>>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, AdminError>
@@ -193,8 +237,29 @@ where
     R: RuntimeOps,
     E: EgressOps,
 {
-    controller.remove_app(&name).await?;
-    Ok(StatusCode::NO_CONTENT)
+    match controller.remove_app(&name).await {
+        Ok(()) => {
+            info!(
+                target: "bugpot::audit",
+                action = "remove",
+                peer = %peer.ip(),
+                app = %name,
+                status = "ok",
+            );
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Err(e) => {
+            warn!(
+                target: "bugpot::audit",
+                action = "remove",
+                peer = %peer.ip(),
+                app = %name,
+                status = "error",
+                error = %e,
+            );
+            Err(e.into())
+        }
+    }
 }
 
 async fn list<R, E>(State(controller): State<Arc<AppController<R, E>>>) -> Json<Vec<AppView>>

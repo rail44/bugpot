@@ -273,9 +273,36 @@ pub fn load_auth(path: impl AsRef<Path>) -> Result<AuthConfig> {
     if !path.exists() {
         return Ok(AuthConfig::default());
     }
+    // Auth.toml holds registry passwords; mirror what
+    // `BUGPOT_ADMIN_TOKEN_FILE` enforces. Any group / other access bit
+    // set (mask `0o077`) makes us refuse to start, ssh-key style.
+    require_owner_only(path)?;
     let body = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
     toml::from_str(&body).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+/// Reject files that any non-owner principal can read, write, or
+/// execute. Used for credential files (auth.toml, admin-token files).
+/// Returns the original error context when the file is unreadable.
+#[cfg(unix)]
+fn require_owner_only(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("stat credentials file {}", path.display()))?;
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        anyhow::bail!(
+            "credentials file {} has permissive mode {mode:#o}; refusing to start (run `chmod 600 {0}` so only its owner can read it)",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn require_owner_only(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 /// Extract the registry hostname from an image reference.
