@@ -348,7 +348,7 @@ bugpot delegates image-index resolution to oci-client's default `current_platfor
 
 ### Performance profiling (development)
 
-The Lima VM provisioning sets `kernel.perf_event_paranoid = -1` and `kernel.kptr_restrict = 0` and installs `bpftrace` + `samply`. These are dev-only choices — do **not** carry them into any production image.
+The Lima VM provisioning sets `kernel.perf_event_paranoid = -1` and `kernel.kptr_restrict = 0` and installs `bpftrace`, `samply`, and `tokio-console`. These are dev-only choices — do **not** carry them into any production image.
 
 **CPU profile a release build (samply):**
 
@@ -368,6 +368,18 @@ sudo bpftrace -e 'kprobe:do_unlinkat /comm == "bugpot"/ { @ = count(); }'
 ```
 
 Useful for nftables / netns / libcontainer `clone` cost questions that the in-process profilers can't see.
+
+**Live task / runtime debugger (tokio-console):**
+
+Bugpot has an opt-in `tokio-console` cargo feature on `cmd/bugpot`. The feature gates `console-subscriber` and also unblocks the `tokio_unstable`-only portion of the `bugpot_tokio_*` Prometheus metric set in `bugpot-metrics`. The `tokio_unstable` cfg has to be set at build time — both `just build-console` and `just run-console` set `RUSTFLAGS="--cfg tokio_unstable"` for you:
+
+```sh
+just run-console                                    # foreground bugpot with the console layer enabled
+just shell                                          # in a separate terminal, inside the VM
+tokio-console http://127.0.0.1:6669                 # attach to the running bugpot
+```
+
+The console UI lists every tokio task with its busy / idle ratio and the longest `.await` poll. Useful when cold-start latency is dominated by a single stall and you don't know which one. The default build does **not** include the console layer or its overhead — only the on-demand `--features tokio-console` build does.
 
 ## Conventions
 

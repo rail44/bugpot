@@ -108,3 +108,15 @@ provision:
     if ! command -v samply >/dev/null 2>&1; then
       cargo install --locked samply
     fi
+- mode: user
+  # tokio-console: interactive task / resource debugger. Used after
+  # `just build-console` / `just run-console` — attach with
+  # `tokio-console http://127.0.0.1:6669` from another shell. Same
+  # caveats as samply: ~2 min compile, idempotent.
+  script: |
+    #!/bin/sh
+    set -eux
+    . "$HOME/.cargo/env"
+    if ! command -v tokio-console >/dev/null 2>&1; then
+      cargo install --locked tokio-console
+    fi
