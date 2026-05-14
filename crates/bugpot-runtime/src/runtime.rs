@@ -107,6 +107,10 @@ pub struct Runtime {
     bundles_dir: PathBuf,
     containers_dir: PathBuf,
     logs_dir: PathBuf,
+    /// One puller shared across every `pull_image` call: its
+    /// per-digest inflight map is what makes concurrent pulls of the
+    /// same image coalesce on a single registry round-trip + extract.
+    puller: Puller,
 }
 
 impl Runtime {
@@ -127,12 +131,14 @@ impl Runtime {
             fs::create_dir_all(p).map_err(|e| RuntimeError::io(p, e))?;
         }
 
+        let puller = Puller::new(images_dir.clone());
         Ok(Self {
             state_dir,
             images_dir,
             bundles_dir,
             containers_dir,
             logs_dir,
+            puller,
         })
     }
 
@@ -155,8 +161,7 @@ impl RuntimeOps for Runtime {
     /// Pull `image_ref` from its registry and extract its layers into
     /// `<state>/images/<digest>/rootfs`.
     async fn pull_image(&self, image_ref: &str, auth: Auth) -> Result<ImageId> {
-        let puller = Puller::new(self.images_dir.clone());
-        let image = puller.pull(image_ref, auth).await?;
+        let image = self.puller.pull(image_ref, auth).await?;
         Ok(image.id)
     }
 
