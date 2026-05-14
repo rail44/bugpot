@@ -18,6 +18,7 @@ use std::fmt;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use flate2::read::GzDecoder;
@@ -37,6 +38,10 @@ use tracing::{debug, info};
 
 use crate::auth::Auth;
 use crate::error::{Result, RuntimeError};
+
+/// Per-pull sequence counter; combined with the pid into the tmp dir
+/// name to distinguish concurrent in-process pulls of the same digest.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Stable identifier for a pulled image. Wraps the manifest digest
 /// (`sha256:...`).
@@ -172,10 +177,17 @@ impl Puller {
         // heavy (multi-second for typical images), so run it on a
         // blocking thread to keep the tokio worker free for router /
         // controller traffic. Caller still awaits the same future.
+        // Per-pull-call suffix so concurrent in-process pulls of the
+        // same digest (eager-start of two apps that share an image)
+        // don't collide on the tmp dir.
         let extract_start = Instant::now();
-        let tmp_dir = self
-            .images_root
-            .join(format!("{}.tmp.{}", id.fs_component(), std::process::id()));
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp_dir = self.images_root.join(format!(
+            "{}.tmp.{}.{}",
+            id.fs_component(),
+            std::process::id(),
+            seq
+        ));
         let image_dir_for_blocking = image_dir.clone();
         let config = tokio::task::spawn_blocking(move || -> Result<ConfigFile> {
             extract_to_image_dir(tmp_dir, image_dir_for_blocking, data)
