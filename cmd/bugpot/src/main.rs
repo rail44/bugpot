@@ -125,6 +125,14 @@ async fn main() -> Result<()> {
     let sweep_task = spawn_sweep(&controller);
     let serve_task = spawn_router(cfg.listen, &controller)?;
 
+    // Sample the tokio runtime every 10s and emit `bugpot_tokio_*`
+    // gauges / counters. Unconditional — the cost is negligible
+    // (a single background task with one `Handle::current()`
+    // snapshot per tick) and the metrics are no-op when the
+    // recorder's listener is disabled, just like every other
+    // emission point.
+    bugpot_metrics::spawn_runtime_monitor(std::time::Duration::from_secs(10));
+
     // Metrics HTTP listener (optional). The recorder is installed
     // unconditionally above so emission paths stay no-op-safe even when
     // the listener is disabled.

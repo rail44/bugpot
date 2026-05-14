@@ -56,6 +56,12 @@ unsafe_code = "deny"
 unused_must_use = "deny"
 unreachable_pub = "warn"
 missing_debug_implementations = "warn"
+# `tokio_unstable` is an opt-in cfg gating tokio's unstable APIs
+# (used by `tokio-metrics` for richer RuntimeMetrics fields and by
+# `console-subscriber` in the planned P3 follow-up). Declared here
+# so rustc's check-cfg doesn't warn when the cfg is absent from the
+# default build.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
