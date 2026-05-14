@@ -11,8 +11,8 @@ pub struct AppSpec {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subdomain: Option<String>,
-    #[serde(default, skip_serializing_if = "Egress::is_empty")]
-    pub egress: Egress,
+    #[serde(default, skip_serializing_if = "EgressSpec::is_empty")]
+    pub egress: EgressSpec,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub env: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Scaling::is_empty")]
@@ -21,19 +21,21 @@ pub struct AppSpec {
     pub readiness: Readiness,
     #[serde(default, skip_serializing_if = "Resources::is_empty")]
     pub resources: Resources,
-    #[serde(default, skip_serializing_if = "Runtime::is_empty")]
-    pub runtime: Runtime,
+    #[serde(default, skip_serializing_if = "RuntimeSpec::is_empty")]
+    pub runtime: RuntimeSpec,
     #[serde(skip)]
     pub source_path: PathBuf,
 }
 
+/// `[egress]` section of an app TOML. The name distinguishes the
+/// configuration shape from the engine struct in `bugpot-egress`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct Egress {
+pub struct EgressSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow: Vec<String>,
 }
 
-impl Egress {
+impl EgressSpec {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.allow.is_empty()
@@ -116,13 +118,15 @@ impl Resources {
     }
 }
 
+/// `[runtime]` section of an app TOML. The name distinguishes the
+/// configuration shape from the engine struct in `bugpot-runtime`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct Runtime {
+pub struct RuntimeSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub isolation: Option<String>,
 }
 
-impl Runtime {
+impl RuntimeSpec {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.isolation.is_none()

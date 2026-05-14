@@ -88,6 +88,13 @@ struct AppHandle {
 struct HandleInner {
     state: AppState,
     last_access: Instant,
+    /// Last-seen cgroup `cpu_usec` for the running container, used to
+    /// compute deltas for the `bugpot_app_cpu_microseconds_total`
+    /// counter across sweeps. Lifetime matches the handle's running
+    /// lifetime (only valid while `state` is `Running`); resetting it
+    /// on stop keeps the next run starting from zero, which Prometheus
+    /// `rate()` tolerates as a reset.
+    cpu_baseline: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -146,11 +153,6 @@ pub struct AppController<R: RuntimeOps, E: EgressOps> {
     apps_dir: PathBuf,
     auth: AuthConfig,
     apps: RwLock<AppMaps>,
-    /// Last-seen cgroup `cpu_usec` per app, used to compute deltas for
-    /// the `bugpot_app_cpu_microseconds_total` counter across sweeps.
-    /// Cleared when an app is stopped so the next run starts from 0 —
-    /// Prometheus `rate()` handles the apparent reset.
-    cpu_baselines: tokio::sync::Mutex<HashMap<String, u64>>,
     /// One-shot guard for `reattach_running`. The controller is only
     /// meant to reattach once per bugpot process — the function calls
     /// `ensure_log_tails` per surviving app, and a second call would
@@ -184,7 +186,6 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
             apps_dir,
             auth,
             apps: RwLock::new(maps),
-            cpu_baselines: tokio::sync::Mutex::new(HashMap::new()),
             reattach_done: AtomicBool::new(false),
         }
     }
@@ -418,7 +419,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         // races) — the gauge stops updating, the counter doesn't
         // move.
         if let Some(usage) = self.runtime.resource_usage(&handle.name) {
-            self.emit_resource_metrics(&handle.name, usage).await;
+            emit_resource_metrics(&handle, usage).await;
         }
 
         // 3. Idle timeout (scale-to-zero). always-on apps skip.
@@ -441,41 +442,6 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
                 warn!(app = %handle.name, error = ?e, "stop on idle failed");
             }
         }
-    }
-
-    /// Update memory gauge and CPU counter (via delta vs the per-app
-    /// baseline) for `app` from a fresh cgroup sample.
-    ///
-    /// CPU is exposed in microseconds, the cgroup-v2 native unit, to
-    /// preserve full precision through the integer-only counter API.
-    /// Operators querying via Prometheus divide by 1e6 for seconds:
-    /// `rate(bugpot_app_cpu_microseconds_total[5m]) / 1000000`.
-    async fn emit_resource_metrics(&self, app: &str, usage: ResourceUsage) {
-        #[allow(clippy::cast_precision_loss)]
-        gauge!("bugpot_app_memory_bytes", "app" => app.to_owned())
-            .set(usage.memory_bytes as f64);
-
-        let last = {
-            let mut baselines = self.cpu_baselines.lock().await;
-            baselines.insert(app.to_owned(), usage.cpu_usec).unwrap_or(0)
-        };
-        // A container restart resets the cgroup counter under us;
-        // treat any backwards step as a 0-baseline and increment by
-        // the new absolute value. Prometheus `rate()` tolerates the
-        // apparent reset.
-        let delta_usec = if usage.cpu_usec >= last {
-            usage.cpu_usec - last
-        } else {
-            usage.cpu_usec
-        };
-        if delta_usec > 0 {
-            counter!("bugpot_app_cpu_microseconds_total", "app" => app.to_owned())
-                .increment(delta_usec);
-        }
-    }
-
-    async fn clear_cpu_baseline(&self, app: &str) {
-        self.cpu_baselines.lock().await.remove(app);
     }
 
     /// Stop every app that's currently running. Used on shutdown.
@@ -541,11 +507,11 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
             // Re-check under the write lock — a concurrent deploy may have
             // raced into the same keys.
             if maps.by_name.contains_key(&name) {
-                cleanup_orphan_toml(&toml_path).await;
+                discard_failed_toml(&toml_path).await;
                 return Err(DeployError::AlreadyExists(name));
             }
             if maps.by_subdomain.contains_key(&subdomain) {
-                cleanup_orphan_toml(&toml_path).await;
+                discard_failed_toml(&toml_path).await;
                 return Err(DeployError::SubdomainTaken(subdomain));
             }
             maps.by_subdomain.insert(subdomain.clone(), name.clone());
@@ -765,11 +731,11 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
             inner.state = AppState::Stopping;
         }
         let res = self.do_stop(handle).await;
-        // Drop the CPU baseline so the next start of this app begins
-        // from 0 rather than the (now-stale) last sample.
-        self.clear_cpu_baseline(&handle.name).await;
         let mut inner = handle.inner.lock().await;
         inner.state = AppState::Stopped;
+        // Drop the CPU baseline so the next start of this app begins
+        // from 0 rather than the (now-stale) last sample.
+        inner.cpu_baseline = 0;
         res
     }
 
@@ -790,7 +756,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
 /// subsequent collision-check rejected. The error is non-fatal — the
 /// stale file will be picked up by orphan cleanup at the next bugpot
 /// restart — but we log it so operators see leak when it happens.
-async fn cleanup_orphan_toml(path: &Path) {
+async fn discard_failed_toml(path: &Path) {
     if let Err(e) = tokio::fs::remove_file(path).await {
         warn!(
             path = %path.display(),
@@ -811,6 +777,7 @@ fn make_handle(spec: AppSpec) -> Arc<AppHandle> {
         inner: Mutex::new(HandleInner {
             state: AppState::Stopped,
             last_access: Instant::now(),
+            cpu_baseline: 0,
         }),
     })
 }
@@ -852,6 +819,39 @@ impl<R: RuntimeOps, E: EgressOps> UpstreamResolver for AppController<R, E> {
     }
 }
 
+/// Emit `bugpot_app_memory_bytes` (gauge) and
+/// `bugpot_app_cpu_microseconds_total` (counter) from a fresh cgroup
+/// sample. The CPU delta is computed against the per-handle baseline
+/// stored in `HandleInner.cpu_baseline`, which is updated in place.
+///
+/// CPU is exposed in microseconds (cgroup-v2's native unit) so the
+/// counter keeps full precision. Operators querying via Prometheus
+/// divide by 1e6: `rate(bugpot_app_cpu_microseconds_total[5m]) / 1000000`.
+async fn emit_resource_metrics(handle: &Arc<AppHandle>, usage: ResourceUsage) {
+    #[allow(clippy::cast_precision_loss)]
+    gauge!("bugpot_app_memory_bytes", "app" => handle.name.clone())
+        .set(usage.memory_bytes as f64);
+
+    let mut inner = handle.inner.lock().await;
+    let last = inner.cpu_baseline;
+    inner.cpu_baseline = usage.cpu_usec;
+    drop(inner);
+
+    // A container restart resets the cgroup counter under us; treat
+    // any backwards step as a 0-baseline and increment by the new
+    // absolute value. Prometheus `rate()` tolerates the apparent
+    // reset.
+    let delta_usec = if usage.cpu_usec >= last {
+        usage.cpu_usec - last
+    } else {
+        usage.cpu_usec
+    };
+    if delta_usec > 0 {
+        counter!("bugpot_app_cpu_microseconds_total", "app" => handle.name.clone())
+            .increment(delta_usec);
+    }
+}
+
 async fn wait_for_port(addr: SocketAddr, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     let mut last_err: Option<std::io::Error> = None;
@@ -876,9 +876,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Mutex as StdMutex;
 
-    use bugpot_config::{
-        AppSpec, Egress as EgressSpec, Readiness, Resources, Runtime as RuntimeCfg, Scaling,
-    };
+    use bugpot_config::{AppSpec, EgressSpec, Readiness, Resources, RuntimeSpec, Scaling};
     use bugpot_egress::{Endpoint, EgressOps};
     use bugpot_runtime::{Auth, ImageId, ResourceUsage, RunningApp, RuntimeError, RuntimeOps};
 
@@ -1072,7 +1070,7 @@ mod tests {
             scaling: Scaling::default(),
             readiness: Readiness::default(),
             resources: Resources::default(),
-            runtime: RuntimeCfg::default(),
+            runtime: RuntimeSpec::default(),
             source_path: PathBuf::new(),
         }
     }

@@ -132,16 +132,22 @@ impl RouterConfig {
 
 /// One registered app paired with the concrete upstream to forward to.
 ///
-/// Production deployments point this at the app's container IP (allocated by
-/// `bugpot-egress`). Tests and host-network setups can use
-/// [`Deployment::localhost`] to keep things on `127.0.0.1`.
+/// Used by `AppRouter`, the simple static resolver that backs the
+/// integration tests and host-network setups. The production path
+/// goes through `UpstreamResolver` so the controller can cold-start
+/// containers on demand. The struct is *not* a deployment — the
+/// actual deploy lifecycle lives in `bugpot-controller` — it's just
+/// the (spec, upstream) routing entry.
+///
+/// Tests can use [`RouteEntry::localhost`] to point at
+/// `127.0.0.1:<spec.port>`.
 #[derive(Debug, Clone)]
-pub struct Deployment {
+pub struct RouteEntry {
     pub spec: AppSpec,
     pub upstream: SocketAddr,
 }
 
-impl Deployment {
+impl RouteEntry {
     #[must_use]
     pub const fn new(spec: AppSpec, upstream: SocketAddr) -> Self {
         Self { spec, upstream }
@@ -190,22 +196,22 @@ pub fn subdomain_of(host: &str) -> Option<&str> {
 
 #[derive(Debug)]
 pub struct AppRouter {
-    deployments: Vec<Deployment>,
+    routes: Vec<RouteEntry>,
 }
 
 impl AppRouter {
     #[must_use]
-    pub const fn new(deployments: Vec<Deployment>) -> Self {
-        Self { deployments }
+    pub const fn new(routes: Vec<RouteEntry>) -> Self {
+        Self { routes }
     }
 
     /// Resolve a host header (e.g. `myapp.bugpot.ts.net` or `myapp.bugpot.ts.net:443`)
-    /// to a registered deployment by matching the first DNS label against the
+    /// to a registered route by matching the first DNS label against the
     /// app's subdomain.
     #[must_use]
-    pub fn resolve(&self, host: &str) -> Option<&Deployment> {
+    pub fn resolve(&self, host: &str) -> Option<&RouteEntry> {
         let subdomain = subdomain_of(host)?;
-        self.deployments
+        self.routes
             .iter()
             .find(|d| d.spec.subdomain() == subdomain)
     }
@@ -696,12 +702,12 @@ mod tests {
             port: 3000,
             name: None,
             subdomain: None,
-            egress: bugpot_config::Egress::default(),
+            egress: bugpot_config::EgressSpec::default(),
             env: std::collections::HashMap::default(),
             scaling: bugpot_config::Scaling::default(),
             readiness: bugpot_config::Readiness::default(),
             resources: bugpot_config::Resources::default(),
-            runtime: bugpot_config::Runtime::default(),
+            runtime: bugpot_config::RuntimeSpec::default(),
             source_path: PathBuf::from(format!("/apps/{name}.toml")),
         }
     }
@@ -709,8 +715,8 @@ mod tests {
     #[test]
     fn resolves_by_subdomain() {
         let router = AppRouter::new(vec![
-            Deployment::localhost(fake_app("alpha")),
-            Deployment::localhost(fake_app("beta")),
+            RouteEntry::localhost(fake_app("alpha")),
+            RouteEntry::localhost(fake_app("beta")),
         ]);
         assert_eq!(
             router
