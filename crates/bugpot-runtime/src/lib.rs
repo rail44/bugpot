@@ -27,6 +27,7 @@ mod error;
 mod image;
 mod resources;
 mod runtime;
+mod seccomp;
 mod spec;
 
 pub use auth::Auth;

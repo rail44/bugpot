@@ -86,9 +86,11 @@ pub(crate) fn build_spec(inputs: &SpecInputs<'_>) -> Result<Spec> {
     // ---- Linux: namespaces + resources ----
     let namespaces = build_namespaces(netns_path)?;
     let resources = build_resources(spec)?;
+    let seccomp = crate::seccomp::runc_default()?.clone();
     let linux = LinuxBuilder::default()
         .namespaces(namespaces)
         .resources(resources)
+        .seccomp(seccomp)
         .cgroups_path(PathBuf::from(format!("/bugpot/{}", spec.name())))
         .build()?;
 
@@ -283,7 +285,6 @@ fn build_namespaces(netns_path: Option<&Path>) -> Result<Vec<LinuxNamespace>> {
     let cgroup = LinuxNamespaceBuilder::default()
         .typ(LinuxNamespaceType::Cgroup)
         .build()?;
-
     let mut net = LinuxNamespaceBuilder::default().typ(LinuxNamespaceType::Network);
     if let Some(path) = netns_path {
         net = net.path(path.to_path_buf());
@@ -488,6 +489,30 @@ cpu = "0.5"
             .find(|n| n.typ() == LinuxNamespaceType::Network)
             .unwrap();
         assert_eq!(network.path().as_deref(), Some(netns.as_path()));
+    }
+
+    #[test]
+    fn spec_attaches_default_seccomp_profile() {
+        let app = make_app_spec("ghcr.io/x/y:tag", 8080);
+        let image = make_image_config(vec!["/bin/run"], vec![]);
+        let spec = build_spec(&SpecInputs {
+            spec: &app,
+            image_config: &image,
+            rootfs: Path::new("/tmp/rootfs"),
+            netns_path: None,
+        })
+        .unwrap();
+
+        let linux = spec.linux().as_ref().unwrap();
+        let profile = linux.seccomp().as_ref().expect("seccomp attached");
+        assert_eq!(
+            profile.default_action(),
+            oci_spec::runtime::LinuxSeccompAction::ScmpActErrno
+        );
+        // Sanity: rules are non-empty (full profile-shape coverage lives
+        // in `seccomp::tests`).
+        let rules = profile.syscalls().as_ref().expect("rules present");
+        assert!(!rules.is_empty());
     }
 
     #[test]
