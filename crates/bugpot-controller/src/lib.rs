@@ -90,6 +90,23 @@ struct AppHandle {
     /// `subdomain` fields exist for TOML / JSON serialisation shape
     /// only — `identity` is the authoritative pair.
     spec: RwLock<AppSpec>,
+    /// Resolved image digest from the first successful pull. Pinning
+    /// at the handle level means subsequent cold-starts for this app
+    /// skip the `manifest_probe` round-trip (~1s on a remote registry)
+    /// and go straight to the cache-hit path inside `Puller::pull`.
+    ///
+    /// Invalidation is **deterministic** by construction:
+    ///
+    /// - `DELETE /apps/<name>` followed by `POST /apps` drops the
+    ///   handle entirely; the replacement starts at `None`.
+    /// - A bugpot process restart drops the in-memory map; the next
+    ///   start of each app re-probes once.
+    ///
+    /// Mutable tags (`:latest` etc.) therefore behave the same way
+    /// Kubernetes' `imagePullPolicy: IfNotPresent` does — an
+    /// operator-side redeploy is required to pick up an upstream
+    /// retag. No TTL.
+    image_digest: Mutex<Option<bugpot_runtime::ImageId>>,
     inner: Mutex<HandleInner>,
 }
 
@@ -494,7 +511,8 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
             }
         }
 
-        self.runtime
+        let resolved_digest = self
+            .runtime
             .pull_image(&spec.image, self.resolve_auth(&spec.image))
             .await
             .map_err(|e| classify_pull_error(e, &name, &spec.image))?;
@@ -508,6 +526,9 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         spec.source_path.clone_from(&toml_path);
 
         let handle = make_handle(spec.clone())?;
+        // Pre-populate the digest cache from the pull we just did so
+        // the eager-start (or first request) below doesn't re-probe.
+        *handle.image_digest.lock().await = Some(resolved_digest);
 
         {
             let mut maps = self.apps.write().await;
@@ -673,9 +694,15 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
             .record(phase_start.elapsed().as_secs_f64());
 
         let phase_start = Instant::now();
+        // If a prior pull on this handle resolved the tag to a
+        // digest, pin to it for this pull so the registry-side
+        // manifest probe is skipped (`Puller::pull` short-circuits on
+        // digest references). The cache invalidates only when the
+        // handle is destroyed (operator redeploy or bugpot restart).
+        let image_ref = digest_pinned_ref(&spec.image, handle.image_digest.lock().await.as_ref());
         let image_id = match self
             .runtime
-            .pull_image(&spec.image, self.resolve_auth(&spec.image))
+            .pull_image(&image_ref, self.resolve_auth(&spec.image))
             .await
         {
             Ok(id) => id,
@@ -684,6 +711,15 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
                 return Err(e).with_context(|| format!("pull image for {name}"));
             }
         };
+        // Persist the resolved digest the first time we see it.
+        // Subsequent cold-starts (within this process) will skip the
+        // probe via the branch above.
+        {
+            let mut slot = handle.image_digest.lock().await;
+            if slot.is_none() {
+                *slot = Some(image_id.clone());
+            }
+        }
         histogram!("bugpot_cold_start_seconds", "phase" => "pull")
             .record(phase_start.elapsed().as_secs_f64());
 
@@ -787,12 +823,26 @@ fn make_handle(spec: AppSpec) -> Result<Arc<AppHandle>, bugpot_config::InvalidSp
     Ok(Arc::new(AppHandle {
         identity,
         spec: RwLock::new(spec),
+        image_digest: Mutex::new(None),
         inner: Mutex::new(HandleInner {
             state: AppState::Stopped,
             last_access: Instant::now(),
             cpu_baseline: 0,
         }),
     }))
+}
+
+/// If `digest` is `Some`, return an OCI reference pinned to that
+/// digest so a subsequent pull skips the registry-side
+/// `manifest_probe`. Returns the original reference unchanged when
+/// `digest` is `None`, or when the reference already carries its
+/// own `@sha256:…` suffix (constructing `repo:tag@d@d` would be
+/// malformed and the existing reference is already digest-pinned).
+fn digest_pinned_ref(image: &str, digest: Option<&bugpot_runtime::ImageId>) -> String {
+    match digest {
+        Some(d) if !image.contains('@') => format!("{image}@{d}", d = d.as_str()),
+        _ => image.to_owned(),
+    }
 }
 
 /// Classify a `pull_image` failure into the deploy-level error
@@ -1083,6 +1133,31 @@ mod tests {
                 .push(format!("cleanup_orphan_endpoint({name},{container_ip})"));
             Ok(())
         }
+    }
+
+    #[test]
+    fn digest_pinned_ref_appends_digest_when_absent() {
+        let digest = bugpot_runtime::ImageId::new("sha256:abc123");
+        assert_eq!(
+            digest_pinned_ref("gcr.io/x/y:1.0", Some(&digest)),
+            "gcr.io/x/y:1.0@sha256:abc123"
+        );
+        assert_eq!(
+            digest_pinned_ref("gcr.io/x/y", Some(&digest)),
+            "gcr.io/x/y@sha256:abc123"
+        );
+    }
+
+    #[test]
+    fn digest_pinned_ref_passthrough_when_no_digest_or_already_pinned() {
+        let digest = bugpot_runtime::ImageId::new("sha256:abc");
+        // No cached digest → original ref.
+        assert_eq!(digest_pinned_ref("gcr.io/x/y:1.0", None), "gcr.io/x/y:1.0");
+        // Already digest-pinned → don't double-stamp.
+        assert_eq!(
+            digest_pinned_ref("gcr.io/x/y@sha256:def", Some(&digest)),
+            "gcr.io/x/y@sha256:def"
+        );
     }
 
     fn spec_with_name(name: &str) -> AppSpec {
