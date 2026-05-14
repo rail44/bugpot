@@ -256,6 +256,17 @@ cmd/bugpot (main: wires everything; no business logic)
 4. On cold start: `Egress::allocate_endpoint` (netns + veth + IP + DNS registry) → `Runtime::pull_image` → `Runtime::start_app` (passes the netns path to libcontainer) → TCP readiness probe on the app's declared port.
 5. Router proxies via `hyper_util` legacy client; HTTP/1.1 Upgrade (e.g. WebSocket) is spliced bidirectionally.
 
+### Router defences
+
+Sized against a public-internet client, not the tailnet — Tailscale is a deployment convenience, never a trust boundary. The router applies (constants in `crates/bugpot-router/src/lib.rs`):
+
+- Request-side: `MAX_BODY_BYTES` (10 MiB inbound cap), `HEADER_READ_TIMEOUT` (10 s slowloris guard), `REQUEST_TIMEOUT` (30 s time-to-headers cap), `MAX_CONCURRENT_REQUESTS` (1024 in-flight via `tower::ConcurrencyLimitLayer`).
+- Response-side: every response body is wrapped in `GuardedBody`, which enforces `RESPONSE_FRAME_TIMEOUT` (1 min per-frame idle — closes slow-reading clients) and `MAX_RESPONSE_BODY_BYTES` (1 GiB total — stops runaway upstream payloads from monopolising a connection or host bandwidth).
+- Upgrades (WebSocket): `MAX_CONCURRENT_UPGRADES` (256 simultaneous spliced sockets, enforced via `Arc<Semaphore>`; saturation returns `503`) and `UPGRADE_IDLE_TIMEOUT` (5 min of silence in **both** directions tears the splice down via `splice_with_idle`).
+- HTTP/2: `H2_MAX_CONCURRENT_STREAMS = 64` so a single h2 client cannot exhaust `MAX_CONCURRENT_REQUESTS` with one connection.
+- Hop-by-hop headers (RFC 7230 §6.1 + Connection-listed extras) are stripped both ways. The Upgrade path is exempt for the request because `Connection: Upgrade` must reach the upstream; the response is no-op here because hyper has already consumed it for the upgrade.
+- `X-Forwarded-For` is rewritten per `RouterConfig::trusted_proxies`: untrusted peers see their chain discarded; the empty default list preserves the historical "trust everyone" behaviour, but real deployments should populate it.
+
 ### Egress model (critical)
 
 The nftables forward chain is **default-drop**. Packets only escape via a `(src_ip, dst_ip)` allow-set populated by the bugpot DNS resolver bound on the bridge IP. When a container resolves a domain on its app's allowlist, every answer is inserted into the set with a 60s TTL — that is the only path out. Direct-IP egress, DoH, DoT, and queries to external resolvers are all blocked. Allowlist semantics (in `bugpot-egress/src/allowlist.rs`): bare `example.com` matches `example.com` and subdomains; `*.example.com` matches subdomains only.
