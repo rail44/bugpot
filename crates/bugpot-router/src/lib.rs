@@ -478,8 +478,13 @@ async fn forward_upgrade(state: &ProxyState, mut req: Request) -> Response {
     };
 
     if upstream_res.status() != StatusCode::SWITCHING_PROTOCOLS {
-        // Upstream refused to upgrade — just forward whatever response it sent
-        // (including its body). The client never sees an upgrade.
+        // Upstream refused to upgrade — forward whatever response it
+        // sent (including its body). The client never sees an upgrade,
+        // so this is a normal HTTP/1.1 response: strip hop-by-hop
+        // headers like the non-upgrade path does, otherwise an
+        // upstream `Connection: close` or `Transfer-Encoding: chunked`
+        // leaks to the client.
+        strip_hop_by_hop_headers(upstream_res.headers_mut());
         return upstream_res.map(Body::new);
     }
 
@@ -509,10 +514,13 @@ async fn forward_upgrade(state: &ProxyState, mut req: Request) -> Response {
     upstream_res.map(Body::new)
 }
 
-/// Bidirectional copy with shared idle timeout. Equivalent to
-/// `tokio::io::copy_bidirectional` but tears the splice down when no
-/// bytes have moved in either direction for `idle`. Activity in either
-/// half resets the shared timer.
+/// Bidirectional copy with shared idle timeout and proper half-close
+/// semantics. Equivalent to `tokio::io::copy_bidirectional` but tears
+/// the splice down when no bytes have moved in either direction for
+/// `idle`. When one direction reaches EOF, that side's write half is
+/// shut down explicitly so the peer observes a clean half-close; the
+/// other direction is allowed to drain. Both must finish (or the
+/// watchdog must fire) before the splice task returns.
 async fn splice_with_idle<C, S>(client: C, server: S, idle: Duration) -> std::io::Result<()>
 where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -524,6 +532,9 @@ where
 
     let last_c = Arc::clone(&last);
     let c_to_s = async move {
+        // Read from the client until EOF, write to the server, then
+        // shut down the server-side write half so the upstream sees a
+        // clean close on its read side. Errors propagate up.
         let mut buf = vec![0u8; 8192];
         loop {
             let n = cr.read(&mut buf).await?;
@@ -533,6 +544,7 @@ where
             *last_c.lock().expect("splice activity lock poisoned") = StdInstant::now();
             sw.write_all(&buf[..n]).await?;
         }
+        sw.shutdown().await?;
         Ok::<(), std::io::Error>(())
     };
 
@@ -547,6 +559,7 @@ where
             *last_s.lock().expect("splice activity lock poisoned") = StdInstant::now();
             cw.write_all(&buf[..n]).await?;
         }
+        cw.shutdown().await?;
         Ok::<(), std::io::Error>(())
     };
 
@@ -565,9 +578,11 @@ where
         }
     };
 
+    // Wait for both directions to complete (proper half-close) or the
+    // idle watchdog to fire. `try_join` cancels the still-running
+    // direction on error so we don't keep a corrupt half alive.
     tokio::select! {
-        r = c_to_s => r,
-        r = s_to_c => r,
+        r = futures::future::try_join(c_to_s, s_to_c) => r.map(|_| ()),
         () = watchdog => {
             debug!(?idle, "upgraded stream idle, closing");
             Ok(())
@@ -585,6 +600,12 @@ pin_project! {
         inner: B,
         #[pin]
         sleep: Sleep,
+        // `armed` is false until the first `poll_frame`; the field
+        // arms the sleep on first poll so the timer doesn't burn
+        // through `frame_timeout` in the gap between `GuardedBody::new`
+        // (right after upstream headers arrive) and the first poll
+        // from the connection writer.
+        armed: bool,
         frame_timeout: Duration,
         bytes_seen: u64,
         max_bytes: u64,
@@ -595,7 +616,11 @@ impl<B> GuardedBody<B> {
     fn new(inner: B, frame_timeout: Duration, max_bytes: u64) -> Self {
         Self {
             inner,
-            sleep: tokio::time::sleep(frame_timeout),
+            // Placeholder deadline; `poll_frame` arms the real one on
+            // first entry. We can't construct an `!Unpin` `Sleep`
+            // lazily, so park it far in the future for now.
+            sleep: tokio::time::sleep(Duration::from_secs(u64::from(u32::MAX))),
+            armed: false,
             frame_timeout,
             bytes_seen: 0,
             max_bytes,
@@ -616,6 +641,16 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let mut this = self.project();
+        // Arm the idle timer the first time we're actually polled —
+        // not at construction. This makes "idle" mean "no progress
+        // since the last poll attempted to read a frame", which is
+        // the intuitive contract.
+        if !*this.armed {
+            this.sleep
+                .as_mut()
+                .reset(TokioInstant::now() + *this.frame_timeout);
+            *this.armed = true;
+        }
         match this.inner.as_mut().poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
@@ -638,14 +673,19 @@ where
             }
             Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e.into()))),
             Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => match this.sleep.as_mut().poll(cx) {
-                Poll::Ready(()) => Poll::Ready(Some(Err(format!(
-                    "response body idle for {:?}",
-                    *this.frame_timeout
-                )
-                .into()))),
-                Poll::Pending => Poll::Pending,
-            },
+            Poll::Pending => {
+                // Both `inner` and `sleep` register their own wakers
+                // on `cx` — they each hold internal queues, not a
+                // shared slot, so either source can wake the task.
+                match this.sleep.as_mut().poll(cx) {
+                    Poll::Ready(()) => Poll::Ready(Some(Err(format!(
+                        "response body idle for {:?}",
+                        *this.frame_timeout
+                    )
+                    .into()))),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
         }
     }
 
