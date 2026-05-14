@@ -214,11 +214,8 @@ impl Egress {
     /// server. Requires root.
     pub async fn new(config: EgressConfig) -> anyhow::Result<Self> {
         // 1. bridge + sysctl
-        let bridge_cmds = netns::render_setup_bridge(
-            &config.bridge_name,
-            config.bridge_ip,
-            config.subnet,
-        );
+        let bridge_cmds =
+            netns::render_setup_bridge(&config.bridge_name, config.bridge_ip, config.subnet);
         // Best-effort: ignore "already exists" by re-running individually.
         for cmd in bridge_cmds {
             let _ = netns::run_cmds(vec![cmd]).await;
@@ -243,21 +240,17 @@ impl Egress {
         let allow_set = Arc::new(NftAllowSet {
             table: config.nft_table.clone(),
         });
-        let handler = EgressDnsHandler::new(
-            registry.clone(),
-            upstream,
-            allow_set,
-            config.allow_ttl_secs,
-        );
+        let handler =
+            EgressDnsHandler::new(registry.clone(), upstream, allow_set, config.allow_ttl_secs);
         let mut server = DnsServer::new(handler);
         let bind_addr = SocketAddr::from((config.bridge_ip, config.dns_port));
-        let udp = UdpSocket::bind(bind_addr).await.with_context(|| {
-            format!("bind DNS UDP {bind_addr}")
-        })?;
+        let udp = UdpSocket::bind(bind_addr)
+            .await
+            .with_context(|| format!("bind DNS UDP {bind_addr}"))?;
         server.register_socket(udp);
-        let tcp = TcpListener::bind(bind_addr).await.with_context(|| {
-            format!("bind DNS TCP {bind_addr}")
-        })?;
+        let tcp = TcpListener::bind(bind_addr)
+            .await
+            .with_context(|| format!("bind DNS TCP {bind_addr}"))?;
         server.register_listener(tcp, std::time::Duration::from_secs(5), 4096);
 
         let mut allocator = IpAllocator::new(config.subnet, config.bridge_ip)?;
@@ -286,7 +279,6 @@ impl Egress {
             _dns_server: Some(server),
         })
     }
-
 }
 
 impl EgressOps for Egress {
@@ -331,10 +323,9 @@ impl EgressOps for Egress {
             container_ip,
             netns_path: plan.ns_path.clone(),
         };
-        self.apps.lock().insert(
-            name.to_string(),
-            AllocatedApp { container_ip, plan },
-        );
+        self.apps
+            .lock()
+            .insert(name.to_string(), AllocatedApp { container_ip, plan });
         Ok(ep)
     }
 
@@ -359,18 +350,14 @@ impl EgressOps for Egress {
                 allowlist: parsed,
             },
         );
-        self.apps.lock().insert(
-            name.to_string(),
-            AllocatedApp { container_ip, plan },
-        );
+        self.apps
+            .lock()
+            .insert(name.to_string(), AllocatedApp { container_ip, plan });
         Ok(Some(ep))
     }
 
     fn drain_unreclaimed_endpoints(&self) -> Vec<(String, Ipv4Addr)> {
-        self.discovered_endpoints
-            .lock()
-            .drain()
-            .collect()
+        self.discovered_endpoints.lock().drain().collect()
     }
 
     async fn cleanup_orphan_endpoint(
@@ -553,10 +540,16 @@ mod tests {
     #[test]
     fn derive_bridge_ip_picks_first_host() {
         let subnet: Ipv4Net = "10.0.0.0/24".parse().unwrap();
-        assert_eq!(derive_bridge_ip(subnet), "10.0.0.1".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(
+            derive_bridge_ip(subnet),
+            "10.0.0.1".parse::<Ipv4Addr>().unwrap()
+        );
 
         let subnet: Ipv4Net = "192.168.5.0/22".parse().unwrap();
         // /22 starts at 192.168.4.0, first host is 192.168.4.1
-        assert_eq!(derive_bridge_ip(subnet), "192.168.4.1".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(
+            derive_bridge_ip(subnet),
+            "192.168.4.1".parse::<Ipv4Addr>().unwrap()
+        );
     }
 }

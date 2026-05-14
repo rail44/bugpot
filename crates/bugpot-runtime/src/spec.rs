@@ -9,8 +9,7 @@ use oci_client::config::ConfigFile as ImageConfigFile;
 use oci_spec::runtime::{
     Capability, LinuxBuilder, LinuxCapabilitiesBuilder, LinuxCpuBuilder, LinuxMemoryBuilder,
     LinuxNamespace, LinuxNamespaceBuilder, LinuxNamespaceType, LinuxResourcesBuilder, Mount,
-    MountBuilder, ProcessBuilder, RootBuilder, Spec, SpecBuilder, UserBuilder,
-    get_default_mounts,
+    MountBuilder, ProcessBuilder, RootBuilder, Spec, SpecBuilder, UserBuilder, get_default_mounts,
 };
 
 use crate::error::{Result, RuntimeError};
@@ -218,14 +217,13 @@ fn resolve_user(s: &str, rootfs: &Path) -> Result<(u32, Option<u32>)> {
             continue;
         }
         if fields[0] == s {
-            let uid =
-                fields[2]
-                    .parse::<u32>()
-                    .map_err(|_| RuntimeError::InvalidResource {
-                        field: "image.user",
-                        value: s.to_owned(),
-                        reason: "malformed uid in /etc/passwd",
-                    })?;
+            let uid = fields[2]
+                .parse::<u32>()
+                .map_err(|_| RuntimeError::InvalidResource {
+                    field: "image.user",
+                    value: s.to_owned(),
+                    reason: "malformed uid in /etc/passwd",
+                })?;
             let gid = fields[3].parse::<u32>().ok();
             return Ok((uid, gid));
         }

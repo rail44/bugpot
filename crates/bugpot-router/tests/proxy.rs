@@ -90,7 +90,9 @@ async fn start_router(apps: Vec<AppSpec>) -> SocketAddr {
     let addr = probe.local_addr().unwrap();
     drop(probe);
     tokio::spawn(async move {
-        serve(addr, app_router, RouterConfig::defaults()).await.unwrap();
+        serve(addr, app_router, RouterConfig::defaults())
+            .await
+            .unwrap();
     });
     // Wait until the router accepts connections.
     for _ in 0..100 {

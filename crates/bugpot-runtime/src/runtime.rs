@@ -12,8 +12,8 @@ use std::time::Instant;
 use bugpot_config::AppSpec;
 use futures::StreamExt;
 use inotify::{Inotify, WatchMask};
-use libcontainer::container::{Container, ContainerStatus};
 use libcontainer::container::builder::ContainerBuilder;
+use libcontainer::container::{Container, ContainerStatus};
 use libcontainer::signal::Signal;
 use libcontainer::syscall::syscall::SyscallType;
 use metrics::histogram;
@@ -117,7 +117,13 @@ impl Runtime {
         let bundles_dir = state_dir.join("bundles");
         let containers_dir = state_dir.join("containers");
         let logs_dir = state_dir.join("logs");
-        for p in [&state_dir, &images_dir, &bundles_dir, &containers_dir, &logs_dir] {
+        for p in [
+            &state_dir,
+            &images_dir,
+            &bundles_dir,
+            &containers_dir,
+            &logs_dir,
+        ] {
             fs::create_dir_all(p).map_err(|e| RuntimeError::io(p, e))?;
         }
 
@@ -308,7 +314,9 @@ impl RuntimeOps for Runtime {
             .as_raw();
         // `as_raw()` is i32; pids are always non-negative when running.
         let pid = u32::try_from(raw_pid).map_err(|_| {
-            RuntimeError::Other(format!("unexpected negative pid from libcontainer: {raw_pid}"))
+            RuntimeError::Other(format!(
+                "unexpected negative pid from libcontainer: {raw_pid}"
+            ))
         })?;
 
         Ok(RunningApp {
@@ -512,11 +520,7 @@ async fn forward_log_file(path: PathBuf, app: String, stream: &'static str) {
         }
     };
 
-    let file = match tokio::fs::OpenOptions::new()
-        .read(true)
-        .open(&path)
-        .await
-    {
+    let file = match tokio::fs::OpenOptions::new().read(true).open(&path).await {
         Ok(f) => f,
         Err(e) => {
             warn!(app = %app, stream, path = %path.display(), error = %e, "open log file for tail failed");
@@ -694,7 +698,10 @@ mod tests {
 12:cpuset:/\n\
 11:cpu,cpuacct:/foo\n\
 0::/unified/path\n";
-        assert_eq!(parse_cgroup_v2_path(body), Some("/unified/path".to_string()));
+        assert_eq!(
+            parse_cgroup_v2_path(body),
+            Some("/unified/path".to_string())
+        );
     }
 
     #[test]
@@ -725,7 +732,10 @@ nr_periods 0\n";
         // Only check the no-env fallback; mutating the process env from a
         // test would require `unsafe`, which the crate denies.
         if std::env::var_os("BUGPOT_STATE_DIR").is_none() {
-            assert_eq!(Runtime::default_state_dir(), PathBuf::from("/var/lib/bugpot"));
+            assert_eq!(
+                Runtime::default_state_dir(),
+                PathBuf::from("/var/lib/bugpot")
+            );
         }
     }
 

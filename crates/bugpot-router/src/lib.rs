@@ -211,9 +211,7 @@ impl AppRouter {
     #[must_use]
     pub fn resolve(&self, host: &str) -> Option<&RouteEntry> {
         let subdomain = subdomain_of(host)?;
-        self.routes
-            .iter()
-            .find(|d| d.spec.subdomain() == subdomain)
+        self.routes.iter().find(|d| d.spec.subdomain() == subdomain)
     }
 }
 
@@ -344,14 +342,15 @@ async fn handler(State(state): State<ProxyState>, req: Request) -> Response {
         .unwrap_or("")
         .to_owned();
 
-    let app_label = subdomain_of(&host)
-        .unwrap_or("unknown")
-        .to_owned();
+    let app_label = subdomain_of(&host).unwrap_or("unknown").to_owned();
 
     let response = match state.resolver.resolve(&host).await {
         None => {
             warn!(host = %host, "no app matched");
-            error_response(StatusCode::NOT_FOUND, format!("no app matched host '{host}'\n"))
+            error_response(
+                StatusCode::NOT_FOUND,
+                format!("no app matched host '{host}'\n"),
+            )
         }
         Some(upstream) => {
             info!(host = %host, %upstream, "matched route");
@@ -432,10 +431,16 @@ async fn forward(
         }
         Ok(Err(e)) => {
             warn!(error = %e, "upstream request failed");
-            error_response(StatusCode::BAD_GATEWAY, "upstream connection failed\n".to_owned())
+            error_response(
+                StatusCode::BAD_GATEWAY,
+                "upstream connection failed\n".to_owned(),
+            )
         }
         Err(_) => {
-            warn!(timeout_secs = REQUEST_TIMEOUT.as_secs(), "upstream request timed out");
+            warn!(
+                timeout_secs = REQUEST_TIMEOUT.as_secs(),
+                "upstream request timed out"
+            );
             error_response(
                 StatusCode::GATEWAY_TIMEOUT,
                 "upstream request timed out\n".to_owned(),
@@ -503,9 +508,7 @@ async fn forward_upgrade(state: &ProxyState, mut req: Request) -> Response {
             Ok((client_io, server_io)) => {
                 let client_io = TokioIo::new(client_io);
                 let server_io = TokioIo::new(server_io);
-                if let Err(e) =
-                    splice_with_idle(client_io, server_io, UPGRADE_IDLE_TIMEOUT).await
-                {
+                if let Err(e) = splice_with_idle(client_io, server_io, UPGRADE_IDLE_TIMEOUT).await {
                     debug!(error = %e, "upgraded stream closed with error");
                 }
             }
@@ -615,7 +618,10 @@ fn is_upgrade_request(headers: &HeaderMap) -> bool {
     headers
         .get(CONNECTION)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("upgrade")))
+        .is_some_and(|v| {
+            v.split(',')
+                .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
+        })
 }
 
 fn inject_forwarded_headers(
@@ -719,9 +725,7 @@ mod tests {
             RouteEntry::localhost(fake_app("beta")),
         ]);
         assert_eq!(
-            router
-                .resolve("alpha.bugpot.ts.net")
-                .map(|d| d.spec.name()),
+            router.resolve("alpha.bugpot.ts.net").map(|d| d.spec.name()),
             Some("alpha")
         );
         assert_eq!(
@@ -862,5 +866,4 @@ mod tests {
         rewrite_forwarded_for(&mut h, "5.6.7.8".parse().unwrap(), &trusted);
         assert_eq!(h.get(X_FORWARDED_FOR).unwrap(), "5.6.7.8");
     }
-
 }

@@ -113,8 +113,12 @@ enum AppState {
     /// `Notify`. The `Arc` lives only while the state machine is in
     /// this variant; transitioning away drops it (held clones held by
     /// waiters keep the channel alive long enough to receive the wake).
-    Starting { notify: Arc<Notify> },
-    Running { container_ip: Ipv4Addr },
+    Starting {
+        notify: Arc<Notify>,
+    },
+    Running {
+        container_ip: Ipv4Addr,
+    },
     Stopping,
 }
 
@@ -185,8 +189,10 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
             // here would indicate a caller bypassed that, which is a
             // bug — `expect` is the right reaction.
             let handle = make_handle(spec).expect("controller::new received unvalidated AppSpec");
-            maps.by_subdomain
-                .insert(handle.identity.subdomain.clone(), handle.identity.name.clone());
+            maps.by_subdomain.insert(
+                handle.identity.subdomain.clone(),
+                handle.identity.name.clone(),
+            );
             maps.by_name.insert(handle.identity.name.clone(), handle);
         }
         #[allow(clippy::cast_precision_loss)]
@@ -244,10 +250,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
     /// file — harmless functionally but visible as duplicate lines in
     /// tracing.
     pub async fn reattach_running(&self) {
-        if self
-            .reattach_done
-            .swap(true, Ordering::SeqCst)
-        {
+        if self.reattach_done.swap(true, Ordering::SeqCst) {
             warn!("reattach_running called more than once; ignoring subsequent calls");
             return;
         }
@@ -403,10 +406,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         // Only look at apps we believe are running. Starting /
         // Stopping / Stopped handles are already in motion or
         // already-cleaned.
-        let is_running = matches!(
-            handle.inner.lock().await.state,
-            AppState::Running { .. }
-        );
+        let is_running = matches!(handle.inner.lock().await.state, AppState::Running { .. });
         if !is_running {
             return;
         }
@@ -500,8 +500,8 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
             .map_err(|e| classify_pull_error(e, &name, &spec.image))?;
 
         let toml_path = self.apps_dir.join(format!("{name}.toml"));
-        let toml_body = toml::to_string_pretty(&spec)
-            .with_context(|| format!("serialize spec for {name}"))?;
+        let toml_body =
+            toml::to_string_pretty(&spec).with_context(|| format!("serialize spec for {name}"))?;
         tokio::fs::write(&toml_path, toml_body)
             .await
             .with_context(|| format!("write {}", toml_path.display()))?;
@@ -550,7 +550,9 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         if !self.apps.read().await.by_name.contains_key(name) {
             return Err(RemoveError::NotFound(name.to_owned()));
         }
-        self.remove_by_name(name).await.map_err(RemoveError::Internal)
+        self.remove_by_name(name)
+            .await
+            .map_err(RemoveError::Internal)
     }
 
     async fn remove_by_name(&self, name: &str) -> Result<()> {
@@ -636,9 +638,11 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
             // `own_notify` keeps it alive for the wake below.
             {
                 let mut inner = handle.inner.lock().await;
-                inner.state = result.as_ref().map_or(AppState::Stopped, |ip| {
-                    AppState::Running { container_ip: *ip }
-                });
+                inner.state = result
+                    .as_ref()
+                    .map_or(AppState::Stopped, |ip| AppState::Running {
+                        container_ip: *ip,
+                    });
             }
             own_notify.notify_waiters();
             return result;
@@ -901,7 +905,7 @@ mod tests {
     use std::sync::Mutex as StdMutex;
 
     use bugpot_config::{AppSpec, EgressSpec, Readiness, Resources, RuntimeSpec, Scaling};
-    use bugpot_egress::{Endpoint, EgressOps};
+    use bugpot_egress::{EgressOps, Endpoint};
     use bugpot_runtime::{Auth, ImageId, ResourceUsage, RunningApp, RuntimeOps};
 
     #[derive(Debug, Default)]
@@ -953,7 +957,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .pop_front()
-                .unwrap_or_else(|| Err(RuntimeError::Other("mock: no start response queued".into())))
+                .unwrap_or_else(|| {
+                    Err(RuntimeError::Other("mock: no start response queued".into()))
+                })
         }
 
         async fn stop_app(&self, name: &str) -> std::result::Result<(), RuntimeError> {
@@ -1063,11 +1069,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push("drain_unreclaimed_endpoints".to_owned());
-            self.discovered
-                .lock()
-                .unwrap()
-                .drain()
-                .collect()
+            self.discovered.lock().unwrap().drain().collect()
         }
 
         async fn cleanup_orphan_endpoint(
@@ -1162,7 +1164,11 @@ mod tests {
             "expected release after pull failure; got {egress_calls:?}"
         );
         assert!(
-            !controller.runtime.calls().iter().any(|c| c.starts_with("start_app")),
+            !controller
+                .runtime
+                .calls()
+                .iter()
+                .any(|c| c.starts_with("start_app")),
             "start_app must not be called when pull fails"
         );
     }
@@ -1187,11 +1193,25 @@ mod tests {
 
         let alpha_state = {
             let maps = controller.apps.read().await;
-            maps.by_name.get("alpha").unwrap().inner.lock().await.state.clone()
+            maps.by_name
+                .get("alpha")
+                .unwrap()
+                .inner
+                .lock()
+                .await
+                .state
+                .clone()
         };
         let beta_state = {
             let maps = controller.apps.read().await;
-            maps.by_name.get("beta").unwrap().inner.lock().await.state.clone()
+            maps.by_name
+                .get("beta")
+                .unwrap()
+                .inner
+                .lock()
+                .await
+                .state
+                .clone()
         };
         assert!(
             matches!(alpha_state, AppState::Running { container_ip } if container_ip == Ipv4Addr::new(10, 0, 0, 42)),
@@ -1247,7 +1267,9 @@ mod tests {
         let rt_calls = controller.runtime.calls();
         let eg_calls = controller.egress.calls();
         assert!(
-            !rt_calls.iter().any(|c| c == "cleanup_orphan_container(alpha)"),
+            !rt_calls
+                .iter()
+                .any(|c| c == "cleanup_orphan_container(alpha)"),
             "reattached alpha must not be cleaned as orphan; rt_calls={rt_calls:?}"
         );
         // beta was orphaned.

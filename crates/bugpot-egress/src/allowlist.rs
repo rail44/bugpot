@@ -87,7 +87,9 @@ impl Rule {
     fn parse(s: &str) -> anyhow::Result<Self> {
         // CIDR / IP forms contain '/' or are valid IPv4 literals.
         if s.contains('/') {
-            let net: Ipv4Net = s.parse().map_err(|e| anyhow::anyhow!("bad CIDR {s:?}: {e}"))?;
+            let net: Ipv4Net = s
+                .parse()
+                .map_err(|e| anyhow::anyhow!("bad CIDR {s:?}: {e}"))?;
             return Ok(Self::Cidr(net));
         }
         if let Ok(ip) = Ipv4Addr::from_str(s) {

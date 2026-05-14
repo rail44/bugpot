@@ -371,11 +371,7 @@ pub fn registry_host(image_ref: &str) -> &str {
 
 pub fn load_apps(dir: impl AsRef<Path>) -> Result<Vec<AppSpec>> {
     let dir = dir.as_ref();
-    anyhow::ensure!(
-        dir.exists(),
-        "apps directory not found: {}",
-        dir.display()
-    );
+    anyhow::ensure!(dir.exists(), "apps directory not found: {}", dir.display());
 
     let mut apps = Vec::new();
     for entry in walkdir::WalkDir::new(dir)
@@ -383,15 +379,14 @@ pub fn load_apps(dir: impl AsRef<Path>) -> Result<Vec<AppSpec>> {
         .into_iter()
         .filter_map(Result::ok)
         .filter(|e| {
-            e.file_type().is_file()
-                && e.path().extension().and_then(|s| s.to_str()) == Some("toml")
+            e.file_type().is_file() && e.path().extension().and_then(|s| s.to_str()) == Some("toml")
         })
     {
         let path = entry.path();
         let body = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let mut spec: AppSpec = toml::from_str(&body)
-            .with_context(|| format!("failed to parse {}", path.display()))?;
+        let mut spec: AppSpec =
+            toml::from_str(&body).with_context(|| format!("failed to parse {}", path.display()))?;
         spec.source_path = path.to_path_buf();
         spec.validate()
             .with_context(|| format!("invalid spec in {}", path.display()))?;
@@ -408,7 +403,10 @@ mod tests {
     #[test]
     fn validate_dns_label_accepts_typical_names() {
         for s in ["alpha", "beta", "dev-alpha", "app-1", "x", &"a".repeat(63)] {
-            assert!(validate_dns_label("name", s).is_ok(), "should accept: {s:?}");
+            assert!(
+                validate_dns_label("name", s).is_ok(),
+                "should accept: {s:?}"
+            );
         }
     }
 
@@ -420,16 +418,19 @@ mod tests {
             "foo/bar",
             "foo bar",
             "foo.bar",
-            "Foo",          // uppercase
-            "foo_bar",      // underscore
-            "-foo",         // leading hyphen
-            "foo-",         // trailing hyphen
+            "Foo",     // uppercase
+            "foo_bar", // underscore
+            "-foo",    // leading hyphen
+            "foo-",    // trailing hyphen
             &"a".repeat(64),
             "foo\0bar",
             "foo;bar",
             "foo$bar",
         ] {
-            assert!(validate_dns_label("name", s).is_err(), "should reject: {s:?}");
+            assert!(
+                validate_dns_label("name", s).is_err(),
+                "should reject: {s:?}"
+            );
         }
     }
 
@@ -498,7 +499,9 @@ mod tests {
             name = "../../etc/cron.d/evil"
         "#;
         let spec: AppSpec = toml::from_str(body).unwrap();
-        let err = spec.validate().expect_err("path traversal name must be rejected");
+        let err = spec
+            .validate()
+            .expect_err("path traversal name must be rejected");
         assert_eq!(err.field, "name");
     }
 
@@ -528,7 +531,9 @@ mod tests {
             subdomain = "Bad-Subdomain"
         "#;
         let spec: AppSpec = toml::from_str(body).unwrap();
-        let err = spec.validate().expect_err("uppercase subdomain must be rejected");
+        let err = spec
+            .validate()
+            .expect_err("uppercase subdomain must be rejected");
         assert_eq!(err.field, "subdomain");
     }
 
@@ -635,7 +640,9 @@ mod tests {
     #[test]
     fn readiness_default_returns_supplied_fallback() {
         let r = Readiness::default();
-        let got = r.resolve_timeout(std::time::Duration::from_secs(7)).unwrap();
+        let got = r
+            .resolve_timeout(std::time::Duration::from_secs(7))
+            .unwrap();
         assert_eq!(got, std::time::Duration::from_secs(7));
     }
 
@@ -644,7 +651,9 @@ mod tests {
         let r = Readiness {
             timeout: Some("30s".into()),
         };
-        let got = r.resolve_timeout(std::time::Duration::from_secs(7)).unwrap();
+        let got = r
+            .resolve_timeout(std::time::Duration::from_secs(7))
+            .unwrap();
         assert_eq!(got, std::time::Duration::from_secs(30));
     }
 
@@ -653,7 +662,9 @@ mod tests {
         let r = Readiness {
             timeout: Some(String::new()),
         };
-        let got = r.resolve_timeout(std::time::Duration::from_secs(7)).unwrap();
+        let got = r
+            .resolve_timeout(std::time::Duration::from_secs(7))
+            .unwrap();
         assert_eq!(got, std::time::Duration::from_secs(7));
     }
 
@@ -662,14 +673,19 @@ mod tests {
         let r = Readiness {
             timeout: Some("not-a-duration".into()),
         };
-        assert!(r.resolve_timeout(std::time::Duration::from_secs(7)).is_err());
+        assert!(
+            r.resolve_timeout(std::time::Duration::from_secs(7))
+                .is_err()
+        );
     }
 
     #[test]
     fn name_defaults_to_filename_stem() {
-        let mut spec: AppSpec = toml::from_str(r#"image = "x"
+        let mut spec: AppSpec = toml::from_str(
+            r#"image = "x"
 port = 80
-"#)
+"#,
+        )
         .unwrap();
         spec.source_path = PathBuf::from("/tmp/apps/some-app.toml");
         assert_eq!(spec.name(), "some-app");

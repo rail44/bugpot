@@ -113,9 +113,9 @@ impl Puller {
     /// Only a cache miss falls back to the monolithic `Client::pull`
     /// (manifest + config + all layers).
     pub(crate) async fn pull(&self, image_ref: &str, auth: Auth) -> Result<PulledImage> {
-        let reference: Reference = image_ref
-            .parse()
-            .map_err(|e: oci_client::ParseError| RuntimeError::InvalidImageRef(image_ref.to_owned(), e.to_string()))?;
+        let reference: Reference = image_ref.parse().map_err(|e: oci_client::ParseError| {
+            RuntimeError::InvalidImageRef(image_ref.to_owned(), e.to_string())
+        })?;
 
         let registry_auth: RegistryAuth = auth.into_registry_auth();
         debug!(image = %reference, "resolving image");
@@ -387,9 +387,10 @@ fn extract_layer_inner(
             // can't trick us into reserving multi-GiB before the
             // `.take()` even has a chance to fire. `read_to_end`
             // will grow the buffer geometrically as needed.
-            let initial_cap = data.len().saturating_mul(4).min(
-                usize::try_from(max_decompressed).unwrap_or(usize::MAX),
-            );
+            let initial_cap = data
+                .len()
+                .saturating_mul(4)
+                .min(usize::try_from(max_decompressed).unwrap_or(usize::MAX));
             let mut buf = Vec::with_capacity(initial_cap);
             decoder
                 .read_to_end(&mut buf)
