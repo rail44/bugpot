@@ -13,6 +13,8 @@ use axum::{
     routing::any,
 };
 use bugpot_config::AppSpec;
+use http_body::{Body as HttpBody, Frame};
+use hyper::body::Buf;
 use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::{TokioExecutor, TokioIo, TokioTimer},
@@ -21,10 +23,19 @@ use hyper_util::{
 };
 use ipnet::IpNet;
 use metrics::counter;
+use pin_project_lite::pin_project;
 use std::{
+    future::Future,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
-    time::Duration,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    task::{Context, Poll},
+    time::{Duration, Instant as StdInstant},
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::Semaphore,
+    time::{Instant as TokioInstant, Sleep},
 };
 use tower::Service;
 use tower::limit::ConcurrencyLimitLayer;
@@ -46,6 +57,28 @@ const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 /// the tower layer; combined with `REQUEST_TIMEOUT` they cannot pile
 /// up unboundedly.
 const MAX_CONCURRENT_REQUESTS: usize = 1024;
+/// Per-frame idle timeout on the response body once we start
+/// streaming it back to the client. `REQUEST_TIMEOUT` only covers the
+/// time until the response head is received; a slow-read attacker can
+/// stall body delivery beyond it.
+const RESPONSE_FRAME_TIMEOUT: Duration = Duration::from_mins(1);
+/// Hard ceiling on the total response body bytes a single request may
+/// stream. Stops a buggy / malicious upstream from monopolising a
+/// router connection (and host bandwidth) with multi-GB payloads.
+const MAX_RESPONSE_BODY_BYTES: u64 = 1024 * 1024 * 1024;
+/// Maximum simultaneous Upgrade (WebSocket) connections. Each upgrade
+/// detaches a spliced byte-pump task that the `MAX_CONCURRENT_REQUESTS`
+/// limit cannot bound; without an explicit cap an attacker could
+/// detach thousands of idle splices and pressure the tokio runtime.
+const MAX_CONCURRENT_UPGRADES: usize = 256;
+/// Idle (no traffic in either direction) timeout for an upgraded
+/// connection. Splices that exceed it are torn down.
+const UPGRADE_IDLE_TIMEOUT: Duration = Duration::from_mins(5);
+/// HTTP/2 max concurrent streams per connection. The hyper default
+/// (200) lets a small handful of h2 clients exhaust the global
+/// `MAX_CONCURRENT_REQUESTS` ceiling; pin it tighter so abusive
+/// clients don't starve the tower concurrency layer.
+const H2_MAX_CONCURRENT_STREAMS: u32 = 64;
 
 const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
@@ -194,6 +227,11 @@ struct ProxyState {
     resolver: Arc<dyn UpstreamResolver>,
     client: ProxyClient,
     config: Arc<RouterConfig>,
+    /// Caps the number of simultaneously-spliced Upgrade connections.
+    /// `forward_upgrade` acquires a permit before detaching its splice
+    /// task; if no permits are available the upgrade is rejected with
+    /// 503. Counts only successfully-spliced upgrades.
+    upgrade_slots: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for ProxyState {
@@ -230,6 +268,7 @@ pub async fn serve(
         resolver,
         client: build_client(),
         config: Arc::new(config),
+        upgrade_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_UPGRADES)),
     };
     let app = Router::new()
         .fallback(any(handler))
@@ -257,6 +296,10 @@ pub async fn serve(
         .http1()
         .timer(TokioTimer::new())
         .header_read_timeout(HEADER_READ_TIMEOUT);
+    builder
+        .http2()
+        .timer(TokioTimer::new())
+        .max_concurrent_streams(H2_MAX_CONCURRENT_STREAMS);
 
     // `into_make_service_with_connect_info` returns a `MakeService` that
     // takes a `SocketAddr` and produces a per-connection service whose
@@ -309,7 +352,7 @@ async fn handler(State(state): State<ProxyState>, req: Request) -> Response {
         }
         Some(upstream) => {
             info!(host = %host, %upstream, "matched route");
-            forward(state.client, &state.config, req, upstream, &host).await
+            forward(&state, req, upstream, &host).await
         }
     };
     counter!(
@@ -325,8 +368,7 @@ async fn handler(State(state): State<ProxyState>, req: Request) -> Response {
 ///
 /// Handles HTTP and HTTP/1.1 Upgrade (e.g. WebSocket) transparently.
 async fn forward(
-    client: ProxyClient,
-    config: &RouterConfig,
+    state: &ProxyState,
     mut req: Request,
     upstream: SocketAddr,
     original_host: &str,
@@ -355,24 +397,34 @@ async fn forward(
     };
     *req.uri_mut() = new_uri;
 
-    inject_forwarded_headers(req.headers_mut(), peer_addr, original_host, config);
+    inject_forwarded_headers(req.headers_mut(), peer_addr, original_host, &state.config);
 
     if is_upgrade {
         // The Upgrade path needs `Connection: Upgrade` and the
         // `Upgrade:` token to flow through to the upstream so it
         // returns 101. Skip the hop-by-hop strip here; the splice
         // takes over once both sides agree.
-        return forward_upgrade(client, req).await;
+        return forward_upgrade(state, req).await;
     }
 
     strip_hop_by_hop_headers(req.headers_mut());
 
-    let pending = client.request(req);
+    let pending = state.client.request(req);
     let result = tokio::time::timeout(REQUEST_TIMEOUT, pending).await;
     match result {
         Ok(Ok(mut res)) => {
             strip_hop_by_hop_headers(res.headers_mut());
-            res.map(Body::new)
+            // Bound the streaming half (per-frame idle + total bytes).
+            // `TimeoutLayer` only covers time-to-headers; without this
+            // wrap, slow-reading clients and runaway upstream bodies
+            // are unconstrained.
+            res.map(|body| {
+                Body::new(GuardedBody::new(
+                    body,
+                    RESPONSE_FRAME_TIMEOUT,
+                    MAX_RESPONSE_BODY_BYTES,
+                ))
+            })
         }
         Ok(Err(e)) => {
             warn!(error = %e, "upstream request failed");
@@ -390,12 +442,23 @@ async fn forward(
 
 /// Forward an HTTP/1.1 upgrade request (e.g. WebSocket) by splicing the two
 /// upgraded byte streams together.
-async fn forward_upgrade(client: ProxyClient, mut req: Request) -> Response {
+async fn forward_upgrade(state: &ProxyState, mut req: Request) -> Response {
+    // Reserve a slot before promising the client we'll splice. If the
+    // global cap is saturated we surface 503 instead of detaching yet
+    // another task into the background.
+    let Ok(permit) = Arc::clone(&state.upgrade_slots).try_acquire_owned() else {
+        warn!(cap = MAX_CONCURRENT_UPGRADES, "upgrade limit reached");
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "upgrade limit reached; retry later\n".to_owned(),
+        );
+    };
+
     // Capture the inbound upgrade future *before* sending the response. Hyper
     // will resolve it once the response (with 101) is flushed.
     let client_upgrade = hyper::upgrade::on(&mut req);
 
-    let pending = client.request(req);
+    let pending = state.client.request(req);
     let mut upstream_res = match tokio::time::timeout(REQUEST_TIMEOUT, pending).await {
         Ok(Ok(res)) => res,
         Ok(Err(e)) => {
@@ -415,8 +478,13 @@ async fn forward_upgrade(client: ProxyClient, mut req: Request) -> Response {
     };
 
     if upstream_res.status() != StatusCode::SWITCHING_PROTOCOLS {
-        // Upstream refused to upgrade — just forward whatever response it sent
-        // (including its body). The client never sees an upgrade.
+        // Upstream refused to upgrade — forward whatever response it
+        // sent (including its body). The client never sees an upgrade,
+        // so this is a normal HTTP/1.1 response: strip hop-by-hop
+        // headers like the non-upgrade path does, otherwise an
+        // upstream `Connection: close` or `Transfer-Encoding: chunked`
+        // leaks to the client.
+        strip_hop_by_hop_headers(upstream_res.headers_mut());
         return upstream_res.map(Body::new);
     }
 
@@ -424,11 +492,15 @@ async fn forward_upgrade(client: ProxyClient, mut req: Request) -> Response {
     // two halves once both are available.
     let server_upgrade = hyper::upgrade::on(&mut upstream_res);
     tokio::spawn(async move {
+        // `permit` is moved into this task; dropping it on exit
+        // releases the upgrade slot.
+        let _permit = permit;
         match tokio::try_join!(client_upgrade, server_upgrade) {
             Ok((client_io, server_io)) => {
-                let mut client_io = TokioIo::new(client_io);
-                let mut server_io = TokioIo::new(server_io);
-                if let Err(e) = tokio::io::copy_bidirectional(&mut client_io, &mut server_io).await
+                let client_io = TokioIo::new(client_io);
+                let server_io = TokioIo::new(server_io);
+                if let Err(e) =
+                    splice_with_idle(client_io, server_io, UPGRADE_IDLE_TIMEOUT).await
                 {
                     debug!(error = %e, "upgraded stream closed with error");
                 }
@@ -440,6 +512,190 @@ async fn forward_upgrade(client: ProxyClient, mut req: Request) -> Response {
     });
 
     upstream_res.map(Body::new)
+}
+
+/// Bidirectional copy with shared idle timeout and proper half-close
+/// semantics. Equivalent to `tokio::io::copy_bidirectional` but tears
+/// the splice down when no bytes have moved in either direction for
+/// `idle`. When one direction reaches EOF, that side's write half is
+/// shut down explicitly so the peer observes a clean half-close; the
+/// other direction is allowed to drain. Both must finish (or the
+/// watchdog must fire) before the splice task returns.
+async fn splice_with_idle<C, S>(client: C, server: S, idle: Duration) -> std::io::Result<()>
+where
+    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut cr, mut cw) = tokio::io::split(client);
+    let (mut sr, mut sw) = tokio::io::split(server);
+    let last = Arc::new(Mutex::new(StdInstant::now()));
+
+    let last_c = Arc::clone(&last);
+    let c_to_s = async move {
+        // Read from the client until EOF, write to the server, then
+        // shut down the server-side write half so the upstream sees a
+        // clean close on its read side. Errors propagate up.
+        let mut buf = vec![0u8; 8192];
+        loop {
+            let n = cr.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            *last_c.lock().expect("splice activity lock poisoned") = StdInstant::now();
+            sw.write_all(&buf[..n]).await?;
+        }
+        sw.shutdown().await?;
+        Ok::<(), std::io::Error>(())
+    };
+
+    let last_s = Arc::clone(&last);
+    let s_to_c = async move {
+        let mut buf = vec![0u8; 8192];
+        loop {
+            let n = sr.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            *last_s.lock().expect("splice activity lock poisoned") = StdInstant::now();
+            cw.write_all(&buf[..n]).await?;
+        }
+        cw.shutdown().await?;
+        Ok::<(), std::io::Error>(())
+    };
+
+    let watchdog_last = Arc::clone(&last);
+    let watchdog = async move {
+        let tick = idle / 2;
+        loop {
+            tokio::time::sleep(tick).await;
+            let elapsed = watchdog_last
+                .lock()
+                .expect("splice activity lock poisoned")
+                .elapsed();
+            if elapsed >= idle {
+                return;
+            }
+        }
+    };
+
+    // Wait for both directions to complete (proper half-close) or the
+    // idle watchdog to fire. `try_join` cancels the still-running
+    // direction on error so we don't keep a corrupt half alive.
+    tokio::select! {
+        r = futures::future::try_join(c_to_s, s_to_c) => r.map(|_| ()),
+        () = watchdog => {
+            debug!(?idle, "upgraded stream idle, closing");
+            Ok(())
+        }
+    }
+}
+
+pin_project! {
+    /// `http_body::Body` wrapper enforcing two limits on the response
+    /// body returned to the client: a per-frame idle timeout (slow-
+    /// read defence) and a total-bytes ceiling (memory / bandwidth
+    /// defence). Both fire as `Err`, terminating the response.
+    struct GuardedBody<B> {
+        #[pin]
+        inner: B,
+        #[pin]
+        sleep: Sleep,
+        // `armed` is false until the first `poll_frame`; the field
+        // arms the sleep on first poll so the timer doesn't burn
+        // through `frame_timeout` in the gap between `GuardedBody::new`
+        // (right after upstream headers arrive) and the first poll
+        // from the connection writer.
+        armed: bool,
+        frame_timeout: Duration,
+        bytes_seen: u64,
+        max_bytes: u64,
+    }
+}
+
+impl<B> GuardedBody<B> {
+    fn new(inner: B, frame_timeout: Duration, max_bytes: u64) -> Self {
+        Self {
+            inner,
+            // Placeholder deadline; `poll_frame` arms the real one on
+            // first entry. We can't construct an `!Unpin` `Sleep`
+            // lazily, so park it far in the future for now.
+            sleep: tokio::time::sleep(Duration::from_secs(u64::from(u32::MAX))),
+            armed: false,
+            frame_timeout,
+            bytes_seen: 0,
+            max_bytes,
+        }
+    }
+}
+
+impl<B> HttpBody for GuardedBody<B>
+where
+    B: HttpBody,
+    B::Error: Into<axum::BoxError>,
+{
+    type Data = B::Data;
+    type Error = axum::BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let mut this = self.project();
+        // Arm the idle timer the first time we're actually polled —
+        // not at construction. This makes "idle" mean "no progress
+        // since the last poll attempted to read a frame", which is
+        // the intuitive contract.
+        if !*this.armed {
+            this.sleep
+                .as_mut()
+                .reset(TokioInstant::now() + *this.frame_timeout);
+            *this.armed = true;
+        }
+        match this.inner.as_mut().poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    let added = data.remaining() as u64;
+                    let new_total = this.bytes_seen.saturating_add(added);
+                    if new_total > *this.max_bytes {
+                        return Poll::Ready(Some(Err(format!(
+                            "response body exceeded {} bytes",
+                            *this.max_bytes
+                        )
+                        .into())));
+                    }
+                    *this.bytes_seen = new_total;
+                }
+                // Activity: reset the idle deadline.
+                this.sleep
+                    .as_mut()
+                    .reset(TokioInstant::now() + *this.frame_timeout);
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e.into()))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => {
+                // Both `inner` and `sleep` register their own wakers
+                // on `cx` — they each hold internal queues, not a
+                // shared slot, so either source can wake the task.
+                match this.sleep.as_mut().poll(cx) {
+                    Poll::Ready(()) => Poll::Ready(Some(Err(format!(
+                        "response body idle for {:?}",
+                        *this.frame_timeout
+                    )
+                    .into()))),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 /// Build a new URI pointing at the given upstream socket address, preserving
@@ -709,5 +965,53 @@ mod tests {
         let trusted: Vec<IpNet> = vec!["10.0.0.0/8".parse().unwrap()];
         rewrite_forwarded_for(&mut h, "5.6.7.8".parse().unwrap(), &trusted);
         assert_eq!(h.get(X_FORWARDED_FOR).unwrap(), "5.6.7.8");
+    }
+
+    async fn drain_body<B>(body: B) -> Result<usize, B::Error>
+    where
+        B: http_body::Body<Data = bytes::Bytes>,
+    {
+        use http_body_util::BodyExt;
+        // `GuardedBody` is `!Unpin` (it owns a `Sleep`), but
+        // `Pin<Box<B>>` is `Unpin` and implements `Body`, so the
+        // util-collect path still works.
+        let collected = Box::pin(body).collect().await?;
+        Ok(collected.to_bytes().len())
+    }
+
+    #[tokio::test]
+    async fn guarded_body_rejects_oversize() {
+        let inner = http_body_util::Full::new(bytes::Bytes::from_static(b"hello world"));
+        let guarded = GuardedBody::new(inner, Duration::from_mins(1), 4);
+        let err = drain_body(guarded)
+            .await
+            .expect_err("body should exceed cap");
+        assert!(err.to_string().contains("exceeded"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn guarded_body_passes_under_cap() {
+        let inner = http_body_util::Full::new(bytes::Bytes::from_static(b"ok"));
+        let guarded = GuardedBody::new(inner, Duration::from_mins(1), 1024);
+        let n = drain_body(guarded).await.unwrap();
+        assert_eq!(n, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn guarded_body_idle_timeout_fires() {
+        // Channel-backed body that never sends a frame: the per-frame
+        // idle timer must trip and surface an error.
+        let (_tx, rx) = tokio::sync::mpsc::channel::<
+            Result<http_body::Frame<bytes::Bytes>, std::io::Error>,
+        >(1);
+        let body = http_body_util::StreamBody::new(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        );
+        let guarded = GuardedBody::new(body, Duration::from_millis(50), 1024);
+        let result = tokio::time::timeout(Duration::from_secs(5), drain_body(guarded))
+            .await
+            .expect("guarded body must fail before outer timeout");
+        let err = result.expect_err("expected idle-timeout error");
+        assert!(err.to_string().contains("idle"), "{err}");
     }
 }

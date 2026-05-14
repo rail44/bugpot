@@ -13,10 +13,14 @@ publish.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 axum.workspace = true
+futures.workspace = true
+http-body = "1"
+http-body-util = "0.1"
 hyper.workspace = true
-hyper-util = { version = "0.1", features = ["client-legacy", "http1", "server", "server-auto", "service", "tokio"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "server", "server-auto", "service", "tokio"] }
 ipnet = "2"
 metrics.workspace = true
+pin-project-lite = "0.2"
 tokio.workspace = true
 tower = { version = "0.5", features = ["limit"] }
 tower-http = { version = "0.6", features = ["limit", "timeout"] }
@@ -24,7 +28,10 @@ tracing.workspace = true
 bugpot-config.workspace = true
 
 [dev-dependencies]
+bytes = "1"
 http-body-util = "0.1"
+tokio = { workspace = true, features = ["test-util"] }
+tokio-stream = "0.1"
 
 [lints]
 workspace = true
