@@ -353,7 +353,12 @@ async fn handler(State(state): State<ProxyState>, req: Request) -> Response {
             )
         }
         Some(upstream) => {
-            info!(host = %host, %upstream, "matched route");
+            // Per-request route confirmation. At info-level this
+            // showed up as ~33μs/req (≈ 2.7× total router throughput
+            // hit at the default level). Route hits are not
+            // actionable operational signal — `bugpot_router_requests_total`
+            // covers the same fact with no allocations per call.
+            debug!(host = %host, %upstream, "matched route");
             forward(&state, req, upstream, &host).await
         }
     };
