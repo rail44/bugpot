@@ -346,13 +346,28 @@ fn read_admin_token_from_file(path: &str) -> Result<String> {
 }
 
 fn init_tracing() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                EnvFilter::new(
-                    "bugpot=info,bugpot_admin=info,bugpot_router=info,bugpot_runtime=info,bugpot_egress=info,bugpot_controller=info",
-                )
-            }),
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new(
+            "bugpot=info,bugpot_admin=info,bugpot_router=info,bugpot_runtime=info,bugpot_egress=info,bugpot_controller=info",
         )
-        .init();
+    });
+    let fmt_layer = tracing_subscriber::fmt::layer().with_filter(filter);
+
+    // When the `tokio-console` cargo feature is on, also wire up
+    // console-subscriber's `Console` layer so `tokio-console
+    // http://127.0.0.1:6669` can attach. The console layer
+    // deliberately has no `EnvFilter` — it watches
+    // `tokio::task` / `runtime::resource` targets directly and
+    // filtering them out would break the UI.
+    #[cfg(feature = "tokio-console")]
+    let console_layer = console_subscriber::spawn();
+
+    let registry = tracing_subscriber::registry().with(fmt_layer);
+    #[cfg(feature = "tokio-console")]
+    let registry = registry.with(console_layer);
+    registry.init();
 }

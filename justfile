@@ -83,6 +83,20 @@ check-host:
 clippy-host:
     cargo clippy {{HOST_CRATES}} --all-targets
 
+# --- tokio-console workflow ---
+
+# Build bugpot with the tokio-console feature. Sets `RUSTFLAGS` so
+# `console-subscriber` and the unstable-only `bugpot_tokio_*`
+# metric fields compile in. Use with `just run-console` (foreground)
+# or `just shell` + manual `./target/debug/bugpot`.
+build-console:
+    limactl shell bugpot -- bash -lc 'RUSTFLAGS="--cfg tokio_unstable" cargo build -p bugpot --features tokio-console'
+
+# Foreground run with tokio-console enabled. Attach from another
+# shell inside the VM: `tokio-console http://127.0.0.1:6669`.
+run-console:
+    limactl shell bugpot -- bash -lc 'RUSTFLAGS="--cfg tokio_unstable" sudo -E env "PATH=$PATH" cargo run -p bugpot --features tokio-console'
+
 # --- Smoke tests (need root inside the VM) ---
 
 # Infrastructure-only: bridge / nft / DNS / router, no apps.
