@@ -13,8 +13,7 @@ use axum::{
     routing::any,
 };
 use bugpot_config::AppSpec;
-use http_body::{Body as HttpBody, Frame};
-use hyper::body::Buf;
+use http_body_util::Limited;
 use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::{TokioExecutor, TokioIo, TokioTimer},
@@ -23,23 +22,21 @@ use hyper_util::{
 };
 use ipnet::IpNet;
 use metrics::counter;
-use pin_project_lite::pin_project;
 use std::{
-    future::Future,
     net::{IpAddr, SocketAddr},
-    pin::Pin,
     sync::{Arc, Mutex},
-    task::{Context, Poll},
     time::{Duration, Instant as StdInstant},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::Semaphore,
-    time::{Instant as TokioInstant, Sleep},
 };
 use tower::Service;
 use tower::limit::ConcurrencyLimitLayer;
-use tower_http::{limit::RequestBodyLimitLayer, timeout::TimeoutLayer};
+use tower_http::{
+    limit::RequestBodyLimitLayer,
+    timeout::{TimeoutBody, TimeoutLayer},
+};
 use tracing::{debug, info, warn};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -65,7 +62,7 @@ const RESPONSE_FRAME_TIMEOUT: Duration = Duration::from_mins(1);
 /// Hard ceiling on the total response body bytes a single request may
 /// stream. Stops a buggy / malicious upstream from monopolising a
 /// router connection (and host bandwidth) with multi-GB payloads.
-const MAX_RESPONSE_BODY_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024 * 1024;
 /// Maximum simultaneous Upgrade (WebSocket) connections. Each upgrade
 /// detaches a spliced byte-pump task that the `MAX_CONCURRENT_REQUESTS`
 /// limit cannot bound; without an explicit cap an attacker could
@@ -417,13 +414,14 @@ async fn forward(
             // Bound the streaming half (per-frame idle + total bytes).
             // `TimeoutLayer` only covers time-to-headers; without this
             // wrap, slow-reading clients and runaway upstream bodies
-            // are unconstrained.
+            // are unconstrained. Composed from two upstream layers:
+            // `Limited` enforces the byte ceiling and `TimeoutBody`
+            // enforces the per-frame idle timeout — same semantics
+            // we had with the home-grown wrapper, just delegated.
             res.map(|body| {
-                Body::new(GuardedBody::new(
-                    body,
-                    RESPONSE_FRAME_TIMEOUT,
-                    MAX_RESPONSE_BODY_BYTES,
-                ))
+                let limited = Limited::new(body, MAX_RESPONSE_BODY_BYTES);
+                let timed = TimeoutBody::new(RESPONSE_FRAME_TIMEOUT, limited);
+                Body::new(timed)
             })
         }
         Ok(Err(e)) => {
@@ -587,114 +585,6 @@ where
             debug!(?idle, "upgraded stream idle, closing");
             Ok(())
         }
-    }
-}
-
-pin_project! {
-    /// `http_body::Body` wrapper enforcing two limits on the response
-    /// body returned to the client: a per-frame idle timeout (slow-
-    /// read defence) and a total-bytes ceiling (memory / bandwidth
-    /// defence). Both fire as `Err`, terminating the response.
-    struct GuardedBody<B> {
-        #[pin]
-        inner: B,
-        #[pin]
-        sleep: Sleep,
-        // `armed` is false until the first `poll_frame`; the field
-        // arms the sleep on first poll so the timer doesn't burn
-        // through `frame_timeout` in the gap between `GuardedBody::new`
-        // (right after upstream headers arrive) and the first poll
-        // from the connection writer.
-        armed: bool,
-        frame_timeout: Duration,
-        bytes_seen: u64,
-        max_bytes: u64,
-    }
-}
-
-impl<B> GuardedBody<B> {
-    fn new(inner: B, frame_timeout: Duration, max_bytes: u64) -> Self {
-        Self {
-            inner,
-            // Placeholder deadline; `poll_frame` arms the real one on
-            // first entry. We can't construct an `!Unpin` `Sleep`
-            // lazily, so park it far in the future for now.
-            sleep: tokio::time::sleep(Duration::from_secs(u64::from(u32::MAX))),
-            armed: false,
-            frame_timeout,
-            bytes_seen: 0,
-            max_bytes,
-        }
-    }
-}
-
-impl<B> HttpBody for GuardedBody<B>
-where
-    B: HttpBody,
-    B::Error: Into<axum::BoxError>,
-{
-    type Data = B::Data;
-    type Error = axum::BoxError;
-
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        let mut this = self.project();
-        // Arm the idle timer the first time we're actually polled —
-        // not at construction. This makes "idle" mean "no progress
-        // since the last poll attempted to read a frame", which is
-        // the intuitive contract.
-        if !*this.armed {
-            this.sleep
-                .as_mut()
-                .reset(TokioInstant::now() + *this.frame_timeout);
-            *this.armed = true;
-        }
-        match this.inner.as_mut().poll_frame(cx) {
-            Poll::Ready(Some(Ok(frame))) => {
-                if let Some(data) = frame.data_ref() {
-                    let added = data.remaining() as u64;
-                    let new_total = this.bytes_seen.saturating_add(added);
-                    if new_total > *this.max_bytes {
-                        return Poll::Ready(Some(Err(format!(
-                            "response body exceeded {} bytes",
-                            *this.max_bytes
-                        )
-                        .into())));
-                    }
-                    *this.bytes_seen = new_total;
-                }
-                // Activity: reset the idle deadline.
-                this.sleep
-                    .as_mut()
-                    .reset(TokioInstant::now() + *this.frame_timeout);
-                Poll::Ready(Some(Ok(frame)))
-            }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e.into()))),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => {
-                // Both `inner` and `sleep` register their own wakers
-                // on `cx` — they each hold internal queues, not a
-                // shared slot, so either source can wake the task.
-                match this.sleep.as_mut().poll(cx) {
-                    Poll::Ready(()) => Poll::Ready(Some(Err(format!(
-                        "response body idle for {:?}",
-                        *this.frame_timeout
-                    )
-                    .into()))),
-                    Poll::Pending => Poll::Pending,
-                }
-            }
-        }
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> http_body::SizeHint {
-        self.inner.size_hint()
     }
 }
 
@@ -967,51 +857,4 @@ mod tests {
         assert_eq!(h.get(X_FORWARDED_FOR).unwrap(), "5.6.7.8");
     }
 
-    async fn drain_body<B>(body: B) -> Result<usize, B::Error>
-    where
-        B: http_body::Body<Data = bytes::Bytes>,
-    {
-        use http_body_util::BodyExt;
-        // `GuardedBody` is `!Unpin` (it owns a `Sleep`), but
-        // `Pin<Box<B>>` is `Unpin` and implements `Body`, so the
-        // util-collect path still works.
-        let collected = Box::pin(body).collect().await?;
-        Ok(collected.to_bytes().len())
-    }
-
-    #[tokio::test]
-    async fn guarded_body_rejects_oversize() {
-        let inner = http_body_util::Full::new(bytes::Bytes::from_static(b"hello world"));
-        let guarded = GuardedBody::new(inner, Duration::from_mins(1), 4);
-        let err = drain_body(guarded)
-            .await
-            .expect_err("body should exceed cap");
-        assert!(err.to_string().contains("exceeded"), "{err}");
-    }
-
-    #[tokio::test]
-    async fn guarded_body_passes_under_cap() {
-        let inner = http_body_util::Full::new(bytes::Bytes::from_static(b"ok"));
-        let guarded = GuardedBody::new(inner, Duration::from_mins(1), 1024);
-        let n = drain_body(guarded).await.unwrap();
-        assert_eq!(n, 2);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn guarded_body_idle_timeout_fires() {
-        // Channel-backed body that never sends a frame: the per-frame
-        // idle timer must trip and surface an error.
-        let (_tx, rx) = tokio::sync::mpsc::channel::<
-            Result<http_body::Frame<bytes::Bytes>, std::io::Error>,
-        >(1);
-        let body = http_body_util::StreamBody::new(
-            tokio_stream::wrappers::ReceiverStream::new(rx),
-        );
-        let guarded = GuardedBody::new(body, Duration::from_millis(50), 1024);
-        let result = tokio::time::timeout(Duration::from_secs(5), drain_body(guarded))
-            .await
-            .expect("guarded body must fail before outer timeout");
-        let err = result.expect_err("expected idle-timeout error");
-        assert!(err.to_string().contains("idle"), "{err}");
-    }
 }
