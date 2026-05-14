@@ -156,10 +156,7 @@ where
 
     Router::new()
         .route("/apps", post(deploy::<R, E>).get(list::<R, E>))
-        .route(
-            "/apps/{name}",
-            get(get_one::<R, E>).delete(remove::<R, E>),
-        )
+        .route("/apps/{name}", get(get_one::<R, E>).delete(remove::<R, E>))
         .with_state(controller)
         // Auth runs first (innermost layer) so unauthorised requests
         // don't burn a rate-limit slot. Body limit + rate limit are
@@ -193,10 +190,7 @@ where
     // Capture what we know up-front so the audit entry stays useful
     // even when validation rejects the spec before a name lands in
     // the controller's maps.
-    let audit_name = spec
-        .name
-        .clone()
-        .unwrap_or_else(|| "<unnamed>".to_owned());
+    let audit_name = spec.name.clone().unwrap_or_else(|| "<unnamed>".to_owned());
     let audit_image = spec.image.clone();
     match controller.deploy_app(spec).await {
         Ok(view) => {
@@ -415,10 +409,7 @@ mod tests {
     fn deploy_error_maps_to_status() {
         let cases: Vec<(DeployError, StatusCode)> = vec![
             (DeployError::MissingName, StatusCode::BAD_REQUEST),
-            (
-                DeployError::AlreadyExists("x".into()),
-                StatusCode::CONFLICT,
-            ),
+            (DeployError::AlreadyExists("x".into()), StatusCode::CONFLICT),
             (
                 DeployError::SubdomainTaken("y".into()),
                 StatusCode::CONFLICT,

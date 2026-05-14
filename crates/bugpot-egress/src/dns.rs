@@ -16,8 +16,8 @@
 //! handler is unit-testable without binding sockets or touching nftables.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr};
 use std::future::Future;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -145,7 +145,9 @@ impl<U: Upstream, A: AllowSet> RequestHandler for EgressDnsHandler<U, A> {
         let src = match request.src().ip() {
             IpAddr::V4(v4) => v4,
             // IPv6 not on the bridge — refuse.
-            IpAddr::V6(_) => return reply_code(request, &mut response_handle, ResponseCode::Refused).await,
+            IpAddr::V6(_) => {
+                return reply_code(request, &mut response_handle, ResponseCode::Refused).await;
+            }
         };
 
         let Ok(info) = request.request_info() else {
@@ -180,7 +182,8 @@ impl<U: Upstream, A: AllowSet> RequestHandler for EgressDnsHandler<U, A> {
                     Ok(ips) => ips,
                     Err(e) => {
                         tracing::warn!(error = %e, "upstream resolve failed");
-                        return reply_code(request, &mut response_handle, ResponseCode::ServFail).await;
+                        return reply_code(request, &mut response_handle, ResponseCode::ServFail)
+                            .await;
                     }
                 };
                 for ip in &ips {
@@ -192,7 +195,14 @@ impl<U: Upstream, A: AllowSet> RequestHandler for EgressDnsHandler<U, A> {
                         tracing::warn!(error = %e, "allow-set register failed");
                     }
                 }
-                reply_a(request, &mut response_handle, info.query.name().into(), &ips, self.ttl).await
+                reply_a(
+                    request,
+                    &mut response_handle,
+                    info.query.name().into(),
+                    &ips,
+                    self.ttl,
+                )
+                .await
             }
         }
     }
@@ -350,7 +360,10 @@ mod tests {
         for ip in &ips {
             allow.register(src, *ip).await.unwrap();
         }
-        assert_eq!(allow.calls.lock().unwrap().as_slice(), &[(src, "1.2.3.4".parse().unwrap())]);
+        assert_eq!(
+            allow.calls.lock().unwrap().as_slice(),
+            &[(src, "1.2.3.4".parse().unwrap())]
+        );
 
         // Deny path must never call upstream.
         match decide(&reg, src, "evil.example.com") {

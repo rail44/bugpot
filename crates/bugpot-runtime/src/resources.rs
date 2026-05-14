@@ -39,7 +39,11 @@ pub(crate) fn parse_memory(raw: &str) -> Result<u64> {
 
     // Allow lossy float<->int conversion: memory sizes fit comfortably in
     // an f64 mantissa for any realistic input.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
     let bytes = (value * multiplier as f64) as u64;
     Ok(bytes)
 }
@@ -62,8 +66,9 @@ pub(crate) fn parse_cpu(raw: &str) -> Result<(i64, u64)> {
         });
     }
 
-    let cpus: f64 = if let Some(stripped) =
-        trimmed.strip_suffix('m').or_else(|| trimmed.strip_suffix('M'))
+    let cpus: f64 = if let Some(stripped) = trimmed
+        .strip_suffix('m')
+        .or_else(|| trimmed.strip_suffix('M'))
     {
         stripped
             .parse::<f64>()

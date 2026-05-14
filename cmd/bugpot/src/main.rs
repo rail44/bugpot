@@ -217,8 +217,8 @@ fn parse_egress_config() -> Result<EgressConfig> {
     }
 
     if let Ok(raw) = std::env::var("BUGPOT_EGRESS_DNS_UPSTREAM") {
-        cfg.dns_upstream = bugpot_egress::parse_dns_upstream(&raw)
-            .context("parse BUGPOT_EGRESS_DNS_UPSTREAM")?;
+        cfg.dns_upstream =
+            bugpot_egress::parse_dns_upstream(&raw).context("parse BUGPOT_EGRESS_DNS_UPSTREAM")?;
     }
 
     cfg.validate().context("validate egress config")?;
@@ -328,8 +328,8 @@ fn read_admin_token() -> Result<String> {
 /// so both the admin token and `auth.toml` share one enforcement path.
 fn read_admin_token_from_file(path: &str) -> Result<String> {
     bugpot_config::require_owner_only(std::path::Path::new(path))?;
-    let body = std::fs::read_to_string(path)
-        .with_context(|| format!("read admin token from {path}"))?;
+    let body =
+        std::fs::read_to_string(path).with_context(|| format!("read admin token from {path}"))?;
     let trimmed = body.trim();
     if trimmed.is_empty() {
         anyhow::bail!("admin token file {path} is empty");

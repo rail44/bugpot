@@ -254,10 +254,7 @@ pub async fn flush_src(table: &str, src: Ipv4Addr) -> anyhow::Result<()> {
     let mut script = String::new();
     for (s, d) in entries {
         if s == src {
-            let _ = writeln!(
-                script,
-                "delete element inet {table} allow4 {{ {s} . {d} }}"
-            );
+            let _ = writeln!(script, "delete element inet {table} allow4 {{ {s} . {d} }}");
         }
     }
     if script.is_empty() {
@@ -345,7 +342,10 @@ mod tests {
             "172.20.0.10".parse().unwrap(),
             "1.2.3.4".parse().unwrap(),
         );
-        assert_eq!(s, "add element inet bugpot allow4 { 172.20.0.10 . 1.2.3.4 }");
+        assert_eq!(
+            s,
+            "add element inet bugpot allow4 { 172.20.0.10 . 1.2.3.4 }"
+        );
     }
 
     /// Pure parser test for the JSON shape emitted by
@@ -457,8 +457,6 @@ mod tests {
             eprintln!("nft -c needs CAP_NET_ADMIN; treating as inconclusive");
             return;
         }
-        panic!(
-            "nft -c rejected the bootstrap script:\n{stderr}\n--- script ---\n{script}"
-        );
+        panic!("nft -c rejected the bootstrap script:\n{stderr}\n--- script ---\n{script}");
     }
 }

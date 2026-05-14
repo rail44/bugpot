@@ -49,7 +49,10 @@ async fn metrics_handler(
 ) -> impl IntoResponse {
     (
         StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
         handle.render(),
     )
 }

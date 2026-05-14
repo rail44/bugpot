@@ -24,8 +24,12 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let image_ref = std::env::args().nth(1).unwrap_or_else(|| DEFAULT_IMAGE.to_owned());
-    let reference: Reference = image_ref.parse().with_context(|| format!("parse {image_ref}"))?;
+    let image_ref = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| DEFAULT_IMAGE.to_owned());
+    let reference: Reference = image_ref
+        .parse()
+        .with_context(|| format!("parse {image_ref}"))?;
     info!(image = %reference, "pulling manifest");
 
     let client = Client::default();

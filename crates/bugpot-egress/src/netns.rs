@@ -101,11 +101,7 @@ pub fn render_setup_bridge(bridge: &str, bridge_ip: Ipv4Addr, subnet: Ipv4Net) -
         s(&["ip", "link", "set", bridge, "up"]),
         // Allow forwarding inside the kernel (the nftables chain has its own
         // policy; this just turns on the global switch).
-        s(&[
-            "sysctl",
-            "-w",
-            "net.ipv4.ip_forward=1",
-        ]),
+        s(&["sysctl", "-w", "net.ipv4.ip_forward=1"]),
     ]
 }
 
@@ -128,7 +124,16 @@ pub fn render_attach_endpoint(bridge: &str, plan: &EndpointLayout) -> Vec<IpCmd>
         s(&["ip", "link", "set", host, "up"]),
         s(&["ip", "link", "set", tmp, "netns", ns]),
         s(&["ip", "-n", ns, "link", "set", tmp, "name", final_name]),
-        s(&["ip", "-n", ns, "addr", "add", &addr_in_ns, "dev", final_name]),
+        s(&[
+            "ip",
+            "-n",
+            ns,
+            "addr",
+            "add",
+            &addr_in_ns,
+            "dev",
+            final_name,
+        ]),
         s(&["ip", "-n", ns, "link", "set", final_name, "up"]),
         s(&["ip", "-n", ns, "link", "set", "lo", "up"]),
     ]
@@ -166,7 +171,9 @@ pub async fn list_app_namespaces() -> anyhow::Result<Vec<String>> {
         "`ip netns list` failed: {}",
         String::from_utf8_lossy(&output.stderr).trim()
     );
-    Ok(parse_app_namespaces(&String::from_utf8_lossy(&output.stdout)))
+    Ok(parse_app_namespaces(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
 }
 
 fn parse_app_namespaces(s: &str) -> Vec<String> {
@@ -221,7 +228,9 @@ fn parse_inet_addr(s: &str) -> Option<Ipv4Addr> {
 /// Run a single `ip` command. Returns an error including the command line
 /// and the program's stderr on non-zero exit.
 async fn run_one_cmd(cmd: &IpCmd) -> anyhow::Result<()> {
-    let (head, tail) = cmd.split_first().ok_or_else(|| anyhow::anyhow!("empty cmd"))?;
+    let (head, tail) = cmd
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("empty cmd"))?;
     let status = Command::new(head)
         .args(tail)
         .stdin(Stdio::null())
@@ -275,7 +284,10 @@ mod tests {
             "172.20.0.1".parse().unwrap(),
             "172.20.0.0/24".parse().unwrap(),
         );
-        assert_eq!(cmds[0], vec!["ip", "link", "add", "bugpot0", "type", "bridge"]);
+        assert_eq!(
+            cmds[0],
+            vec!["ip", "link", "add", "bugpot0", "type", "bridge"]
+        );
         assert_eq!(
             cmds[1],
             vec!["ip", "addr", "add", "172.20.0.1/24", "dev", "bugpot0"]
@@ -311,19 +323,24 @@ mod tests {
         // netns add comes first so subsequent moves can target it.
         assert_eq!(cmds[0][1], "netns");
         // host side ends up mastered by the bridge.
-        assert!(cmds
-            .iter()
-            .any(|c| c.windows(2).any(|w| w == ["master", "bugpot0"])));
+        assert!(
+            cmds.iter()
+                .any(|c| c.windows(2).any(|w| w == ["master", "bugpot0"]))
+        );
         // container IP is configured *inside* the netns.
-        assert!(cmds.iter().any(|c| c.contains(&"172.20.0.10/24".to_string())
-            && c.iter().any(|s| s == "-n")));
+        assert!(
+            cmds.iter()
+                .any(|c| c.contains(&"172.20.0.10/24".to_string()) && c.iter().any(|s| s == "-n"))
+        );
         // The veth pair MUST NOT be created with peer name `eth0` in the
         // host netns — that would collide with the host's real eth0.
         // It is renamed to eth0 only after being moved into the container
         // netns.
         assert!(
-            !cmds.iter().any(|c| c.windows(2).any(|w| w == ["peer", "name"])
-                && c.iter().any(|s| s == "eth0")),
+            !cmds
+                .iter()
+                .any(|c| c.windows(2).any(|w| w == ["peer", "name"])
+                    && c.iter().any(|s| s == "eth0")),
             "veth peer must not be named eth0 while in host netns"
         );
         assert!(
