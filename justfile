@@ -97,6 +97,15 @@ build-console:
 run-console:
     limactl shell bugpot -- bash -lc 'RUSTFLAGS="--cfg tokio_unstable" sudo -E env "PATH=$PATH" cargo run -p bugpot --features tokio-console'
 
+# --- Microbenchmarks (divan) ---
+
+# Run every divan microbench in the workspace. Each bench prints its
+# own table (wall-clock + allocation count); the run is read-only
+# and safe to repeat. Pass extra args after `--` to scope the run,
+# e.g. `just bench -- medium_hit`.
+bench *args:
+    limactl shell bugpot -- bash -lc 'cargo bench --workspace {{args}}'
+
 # --- Smoke tests (need root inside the VM) ---
 
 # Infrastructure-only: bridge / nft / DNS / router, no apps.
