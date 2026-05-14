@@ -38,12 +38,8 @@ humantime = "2"
 futures = "0.3"
 inotify = { version = "0.11", default-features = false, features = ["stream"] }
 divan = "0.1"
-# `nix` is pinned at the workspace level so every crate that touches
-# libcontainer's `Signal` type uses the *same* nix version libcontainer
-# itself was built with (currently 0.29 for `libcontainer 0.6.x`). A
-# mismatch makes `Signal::from(NixSignal::SIGTERM)` fail to type-check
-# across crate-version boundaries. Bump this in lock-step when
-# libcontainer bumps.
+# Tracks libcontainer's own nix pin. See CLAUDE.md > Dependency
+# policy. Bump in lock-step when libcontainer bumps.
 nix = { version = "0.29", default-features = false }
 
 bugpot-admin = { path = "crates/bugpot-admin" }

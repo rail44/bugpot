@@ -387,3 +387,21 @@ The console UI lists every tokio task with its busy / idle ratio and the longest
 - App TOML is the only config surface. `name` defaults to the file stem; `subdomain` defaults to `name`.
 - Tests that need root, network, or a real kernel namespace setup are marked `#[ignore]` with a reason string — never silently skipped.
 - `bugpot-egress` keeps host-touching code (`nft`, `ip`) and pure logic (allowlist, allocator, nft text rendering) in separate modules so the latter can be unit-tested without root.
+
+### Dependency policy
+
+Tolerate `cargo tree --duplicates` output by default. Duplicates are compile-time and binary-size cost only; nothing breaks at runtime as long as no API surface in our own code passes a type from one version of a crate into a function from another. Most appear because some transitive dep pins an older minor of a crate we (or another transitive) consume — they resolve naturally as the ecosystem catches up.
+
+Take action (workspace pin, `[patch.crates-io]`, or an upstream bump request) only when **all three** hold:
+
+1. The duplicated crate has security or behavioural weight (crypto / TLS / network / parser of untrusted input).
+2. The chain can be broken by changing a direct dep we control.
+3. The breaking-change cost on that dep is small.
+
+If a duplicate causes a real cross-type mismatch in our source (the bugpot code itself passes a type from version A into an API that expects version B), it is not a duplicate to tolerate — it is broken and must be pinned. The `nix` entry in `[workspace.dependencies]` is the only such case today (libcontainer exposes `Signal::from<nix::Signal>` and we call it directly).
+
+Notable known-safe duplicates (informational; not exhaustive, the list will shift as the ecosystem moves):
+
+- `sha2` / `digest` / `block-buffer` / `cpufeatures` / `crypto-common` 0.10 vs 0.11 — `oci-client 0.16` pins the 0.10 chain; we use 0.11 directly. Boundary is `String` digests, no type crossing.
+- `thiserror` 1 vs 2 — `libcontainer 0.6 → protobuf 3` brings thiserror 1; our workspace uses 2. Errors cross as `anyhow::Error`, no type sharing.
+- `rand`, `hashbrown`, `rustix`, `linux-raw-sys`, `getrandom`, `syn`, `darling`, `toml_edit` — all transitive only, no shared types in our code.
