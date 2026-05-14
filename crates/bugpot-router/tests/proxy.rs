@@ -17,8 +17,8 @@ use axum::{
     response::Response,
     routing::any,
 };
-use bugpot_config::{AppSpec, Egress, Readiness, Resources, Runtime, Scaling};
-use bugpot_router::{AppRouter, Deployment, RouterConfig, serve};
+use bugpot_config::{AppSpec, EgressSpec, Readiness, Resources, RuntimeSpec, Scaling};
+use bugpot_router::{AppRouter, RouteEntry, RouterConfig, serve};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use tokio::{net::TcpListener, time::timeout};
@@ -69,12 +69,12 @@ fn fake_app(name: &str, port: u16) -> AppSpec {
         port,
         name: Some(name.to_owned()),
         subdomain: Some(name.to_owned()),
-        egress: Egress::default(),
+        egress: EgressSpec::default(),
         env: HashMap::default(),
         scaling: Scaling::default(),
         readiness: Readiness::default(),
         resources: Resources::default(),
-        runtime: Runtime::default(),
+        runtime: RuntimeSpec::default(),
         source_path: PathBuf::from(format!("/apps/{name}.toml")),
     }
 }
@@ -82,8 +82,8 @@ fn fake_app(name: &str, port: u16) -> AppSpec {
 /// Bind the router on an ephemeral port and return its address. The supplied
 /// apps are deployed against `127.0.0.1:<app.port>` (the test backend).
 async fn start_router(apps: Vec<AppSpec>) -> SocketAddr {
-    let deployments = apps.into_iter().map(Deployment::localhost).collect();
-    let app_router = Arc::new(AppRouter::new(deployments));
+    let routes = apps.into_iter().map(RouteEntry::localhost).collect();
+    let app_router = Arc::new(AppRouter::new(routes));
     // Reserve a port, then immediately release the listener so `serve` can
     // re-bind. There's a small TOCTOU window but it's acceptable for tests.
     let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();

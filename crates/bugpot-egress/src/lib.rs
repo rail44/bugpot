@@ -61,7 +61,7 @@ pub mod nft;
 use allocator::IpAllocator;
 use allowlist::Allowlist;
 use dns::{AllowSet, AppEntry, AppRegistry, EgressDnsHandler, Upstream};
-use netns::EndpointPlan;
+use netns::EndpointLayout;
 use nft::NftConfig;
 
 #[derive(Debug, Clone)]
@@ -182,7 +182,7 @@ pub trait EgressOps: Send + Sync + std::fmt::Debug + 'static {
 #[derive(Debug)]
 struct AllocatedApp {
     container_ip: Ipv4Addr,
-    plan: EndpointPlan,
+    plan: EndpointLayout,
 }
 
 /// Internal state that the DNS handler shares with the public surface.
@@ -298,7 +298,7 @@ impl EgressOps for Egress {
     ) -> anyhow::Result<Endpoint> {
         let parsed = Allowlist::parse(allowlist)?;
         let container_ip = self.allocator.lock().allocate()?;
-        let plan = EndpointPlan::new(name, container_ip, self.config.subnet);
+        let plan = EndpointLayout::new(name, container_ip, self.config.subnet);
 
         // Defensive pre-detach: a prior `release_endpoint` may have
         // bailed mid-way and left a netns + veth named the way we're
@@ -347,7 +347,7 @@ impl EgressOps for Egress {
             return Ok(None);
         };
         let parsed = Allowlist::parse(allowlist)?;
-        let plan = EndpointPlan::new(name, container_ip, self.config.subnet);
+        let plan = EndpointLayout::new(name, container_ip, self.config.subnet);
         let ep = Endpoint {
             container_ip,
             netns_path: plan.ns_path.clone(),
@@ -387,7 +387,7 @@ impl EgressOps for Egress {
         // host veth name derive deterministically from the app name,
         // so this works even though we never called
         // `allocate_endpoint` for this app in this process.
-        let plan = netns::EndpointPlan::new(name, container_ip, self.config.subnet);
+        let plan = netns::EndpointLayout::new(name, container_ip, self.config.subnet);
         netns::force_detach_endpoint(&plan).await;
         self.allocator.lock().release(container_ip);
         Ok(())
@@ -397,14 +397,20 @@ impl EgressOps for Egress {
         let Some(app) = self.apps.lock().remove(name) else {
             return Ok(());
         };
+        // In-memory state is authoritative: drop the app from every
+        // bookkeeping structure before touching the kernel. A failure
+        // in the netns / nft path is logged by the caller and the
+        // next `discover_endpoints` at startup will reap any leaked
+        // kernel resources, but the allocator must not stay marked
+        // in_use just because `ip netns del` returned an error.
         self.registry.remove(app.container_ip);
+        self.allocator.lock().release(app.container_ip);
         // Flush this src's entries from the allow set (best-effort; the
         // 60s TTL is a backstop). Only entries matching *this* src IP
         // are removed — previous behaviour flushed the whole set, which
         // briefly broke egress for every other running app.
         let _ = nft::flush_src(&self.nft_table, app.container_ip).await;
         netns::run_cmds(netns::render_detach_endpoint(&app.plan)).await?;
-        self.allocator.lock().release(app.container_ip);
         Ok(())
     }
 }

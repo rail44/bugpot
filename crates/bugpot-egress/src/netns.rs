@@ -31,8 +31,13 @@ const NS_PREFIX: &str = "bugpot-";
 /// the full command line.
 pub(crate) type IpCmd = Vec<String>;
 
+/// Naming + addressing layout for one app's network endpoint.
+///
+/// The struct describes the *shape* of the resources (veth names,
+/// netns name, container IP); the imperative work of creating them
+/// is the returned `IpCmd` list from `render_attach_endpoint`.
 #[derive(Debug)]
-pub struct EndpointPlan {
+pub struct EndpointLayout {
     pub host_veth: String,
     /// Temporary name for the container side of the veth pair while it
     /// still lives in the host netns (before being moved into the
@@ -47,7 +52,7 @@ pub struct EndpointPlan {
     pub subnet_prefix: u8,
 }
 
-impl EndpointPlan {
+impl EndpointLayout {
     #[must_use]
     pub fn new(name: &str, container_ip: Ipv4Addr, subnet: Ipv4Net) -> Self {
         let short = short_name(name);
@@ -105,7 +110,7 @@ pub fn render_setup_bridge(bridge: &str, bridge_ip: Ipv4Addr, subnet: Ipv4Net) -
 }
 
 #[must_use]
-pub fn render_attach_endpoint(bridge: &str, plan: &EndpointPlan) -> Vec<IpCmd> {
+pub fn render_attach_endpoint(bridge: &str, plan: &EndpointLayout) -> Vec<IpCmd> {
     let host = &plan.host_veth;
     let ns = &plan.ns_name;
     let tmp = &plan.tmp_ns_veth;
@@ -130,7 +135,7 @@ pub fn render_attach_endpoint(bridge: &str, plan: &EndpointPlan) -> Vec<IpCmd> {
 }
 
 #[must_use]
-pub fn render_detach_endpoint(plan: &EndpointPlan) -> Vec<IpCmd> {
+pub fn render_detach_endpoint(plan: &EndpointLayout) -> Vec<IpCmd> {
     vec![
         // Deleting the netns also tears down the veth peer that lives in it;
         // the host side disappears when the bridge port is removed.
@@ -251,7 +256,7 @@ pub async fn run_cmds(cmds: Vec<IpCmd>) -> anyhow::Result<()> {
 /// netns from a failed `release_endpoint`, and by
 /// `cleanup_orphan_endpoint` so a missing veth doesn't block deleting
 /// the netns.
-pub async fn force_detach_endpoint(plan: &EndpointPlan) {
+pub async fn force_detach_endpoint(plan: &EndpointLayout) {
     for cmd in render_detach_endpoint(plan) {
         if let Err(e) = run_one_cmd(&cmd).await {
             tracing::debug!(?cmd, error = %e, "force-detach step failed; continuing");
@@ -280,12 +285,12 @@ mod tests {
 
     #[test]
     fn endpoint_plan_is_stable_per_name() {
-        let p1 = EndpointPlan::new(
+        let p1 = EndpointLayout::new(
             "myapp",
             "172.20.0.10".parse().unwrap(),
             "172.20.0.0/24".parse().unwrap(),
         );
-        let p2 = EndpointPlan::new(
+        let p2 = EndpointLayout::new(
             "myapp",
             "172.20.0.10".parse().unwrap(),
             "172.20.0.0/24".parse().unwrap(),
@@ -297,7 +302,7 @@ mod tests {
 
     #[test]
     fn attach_commands_target_bridge_and_netns() {
-        let plan = EndpointPlan::new(
+        let plan = EndpointLayout::new(
             "myapp",
             "172.20.0.10".parse().unwrap(),
             "172.20.0.0/24".parse().unwrap(),
@@ -362,7 +367,7 @@ mod tests {
 
     #[test]
     fn detach_removes_host_iface_and_netns() {
-        let plan = EndpointPlan::new(
+        let plan = EndpointLayout::new(
             "myapp",
             "172.20.0.10".parse().unwrap(),
             "172.20.0.0/24".parse().unwrap(),
