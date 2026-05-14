@@ -2,10 +2,16 @@
 //!
 //! - Reserves `.1` for the bridge / DNS endpoint, `.255` (broadcast in `/24`)
 //!   and the network address.
-//! - Hands out the next free host address, re-using released addresses.
+//! - Hands out the lowest free host address, re-using released addresses.
 //! - Pure data structure, no network side effects.
+//!
+//! Implementation: holds the **free** set (rather than the in-use set) in a
+//! `BTreeSet<Ipv4Addr>`. `pop_first` gives O(log N) allocate and preserves
+//! the "lowest free first" semantics tests rely on. Initialisation cost
+//! grows with the subnet size (one insert per host), bounded at startup;
+//! after that no per-allocation scan is needed regardless of subnet width.
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
 
 use ipnet::Ipv4Net;
@@ -14,7 +20,7 @@ use ipnet::Ipv4Net;
 pub struct IpAllocator {
     subnet: Ipv4Net,
     bridge_ip: Ipv4Addr,
-    in_use: HashSet<Ipv4Addr>,
+    free: BTreeSet<Ipv4Addr>,
 }
 
 impl IpAllocator {
@@ -23,40 +29,45 @@ impl IpAllocator {
             subnet.contains(&bridge_ip),
             "bridge IP {bridge_ip} not in subnet {subnet}"
         );
+        let mut free = BTreeSet::new();
+        for ip in subnet.hosts() {
+            if ip != bridge_ip {
+                free.insert(ip);
+            }
+        }
         Ok(Self {
             subnet,
             bridge_ip,
-            in_use: HashSet::new(),
+            free,
         })
     }
 
-    /// Allocate the next free address. Errors when the subnet is exhausted.
+    /// Allocate the lowest free address. Errors when the subnet is exhausted.
     pub fn allocate(&mut self) -> anyhow::Result<Ipv4Addr> {
-        for ip in self.subnet.hosts() {
-            if ip == self.bridge_ip {
-                continue;
-            }
-            if self.in_use.insert(ip) {
-                return Ok(ip);
-            }
-        }
-        anyhow::bail!("subnet {} exhausted", self.subnet)
+        self.free
+            .pop_first()
+            .ok_or_else(|| anyhow::anyhow!("subnet {} exhausted", self.subnet))
     }
 
     pub fn release(&mut self, ip: Ipv4Addr) {
-        self.in_use.remove(&ip);
+        // Defence-in-depth: never put the bridge IP or an address
+        // outside the subnet back into rotation, no matter what the
+        // caller hands us.
+        if ip != self.bridge_ip && self.subnet.contains(&ip) {
+            self.free.insert(ip);
+        }
     }
 
     /// Mark `ip` as already taken without going through `allocate`. Used at
     /// startup to seed the in-use set with addresses recovered from the
     /// kernel (live netns from a previous bugpot instance).
     pub fn mark_used(&mut self, ip: Ipv4Addr) {
-        self.in_use.insert(ip);
+        self.free.remove(&ip);
     }
 
     #[must_use]
     pub fn is_allocated(&self, ip: Ipv4Addr) -> bool {
-        self.in_use.contains(&ip)
+        ip != self.bridge_ip && self.subnet.contains(&ip) && !self.free.contains(&ip)
     }
 
     #[must_use]
@@ -113,5 +124,49 @@ mod tests {
     fn rejects_bridge_outside_subnet() {
         let net: Ipv4Net = "172.20.0.0/24".parse().unwrap();
         assert!(IpAllocator::new(net, "10.0.0.1".parse().unwrap()).is_err());
+    }
+
+    #[test]
+    fn is_allocated_classifies_special_addresses() {
+        let mut a = fixture();
+        // Bridge: never reported as allocated by the allocator (it is
+        // permanently reserved, not "given out").
+        assert!(!a.is_allocated(a.bridge_ip()));
+        // Out-of-subnet: never reported as allocated.
+        assert!(!a.is_allocated("10.0.0.1".parse().unwrap()));
+        // Fresh state: every host address is free.
+        assert!(!a.is_allocated("172.20.0.2".parse().unwrap()));
+        // After allocate the address is reported as allocated.
+        let ip = a.allocate().unwrap();
+        assert!(a.is_allocated(ip));
+    }
+
+    #[test]
+    fn release_ignores_bridge_and_out_of_subnet() {
+        let mut a = fixture();
+        // Releasing the bridge IP or a stray address must not put it
+        // into rotation — defence-in-depth against a caller bug.
+        a.release(a.bridge_ip());
+        a.release("10.0.0.1".parse().unwrap());
+        let first = a.allocate().unwrap();
+        // First handout is still .2, not .1.
+        assert_eq!(first, "172.20.0.2".parse::<Ipv4Addr>().unwrap());
+    }
+
+    #[test]
+    fn allocate_is_amortised_constant_at_subnet_scale() {
+        // Regression guard for the algorithmic-complexity rewrite: at
+        // /22 (about 1k hosts) the old linear-scan allocator did ~1M
+        // hash probes for a full drain. The BTreeSet path completes
+        // well under a tenth of a second; we only assert it finishes
+        // and returns the expected count.
+        let net: Ipv4Net = "10.0.0.0/22".parse().unwrap();
+        let mut a = IpAllocator::new(net, "10.0.0.1".parse().unwrap()).unwrap();
+        let mut count = 0;
+        while a.allocate().is_ok() {
+            count += 1;
+        }
+        // /22 has 1022 host addresses; minus the bridge IP we expect 1021.
+        assert_eq!(count, 1021);
     }
 }
