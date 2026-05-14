@@ -88,6 +88,27 @@ impl PulledImage {
     }
 }
 
+/// Per-image-ref coordination point used by [`Puller`] to dedupe
+/// concurrent pulls. The leader holds `barrier` for the lifetime
+/// of `Client::pull` + extract, and writes the resolved manifest
+/// digest into `resolved` on success. Waiters block on `barrier`,
+/// then read `resolved` to learn what digest was stored on disk
+/// (the leader's resolved digest can differ from any probe digest
+/// the waiter computed itself — see comment on [`Puller::pull`]).
+struct InflightSlot {
+    barrier: Arc<AsyncMutex<()>>,
+    resolved: std::sync::Mutex<Option<ImageId>>,
+}
+
+impl InflightSlot {
+    fn new() -> Self {
+        Self {
+            barrier: Arc::new(AsyncMutex::new(())),
+            resolved: std::sync::Mutex::new(None),
+        }
+    }
+}
+
 /// Image puller.
 ///
 /// One instance per [`crate::Runtime`]; the inflight map needs to be
@@ -96,12 +117,15 @@ impl PulledImage {
 pub(crate) struct Puller {
     client: Client,
     images_root: PathBuf,
-    /// Per-digest barriers used to dedupe concurrent pulls of the
-    /// same image. The leader holds the inner `AsyncMutex<()>` for
-    /// the duration of its `Client::pull` + extract; waiters block
-    /// on the same mutex, then re-read the on-disk cache after the
-    /// leader releases. See [`Puller::pull`] for the full protocol.
-    inflight: std::sync::Mutex<HashMap<ImageId, Arc<AsyncMutex<()>>>>,
+    /// Per-image-reference singleflight slots used to dedupe
+    /// concurrent pulls of the same image. Keyed on the raw image
+    /// reference string (not the probed digest) because multi-arch
+    /// references have a manifest-index digest that the probe sees
+    /// but `Client::pull` follows the index to the platform manifest
+    /// and stores under a *different* digest — a probe-digest key
+    /// would have waiters look up the wrong cache entry. See
+    /// [`Puller::pull`] for the full protocol.
+    inflight: std::sync::Mutex<HashMap<String, Arc<InflightSlot>>>,
 }
 
 impl std::fmt::Debug for Puller {
@@ -167,69 +191,102 @@ impl Puller {
         }
 
         // Cache miss. Coalesce with any concurrent pull of the same
-        // digest so only one task runs the full registry pull +
-        // extract; the rest block on the per-digest barrier and
-        // re-read from disk after `.done` is published.
+        // image reference. The leader runs the full pull + extract
+        // and publishes the resolved manifest digest into its slot;
+        // waiters block on the slot's barrier and use the published
+        // digest to read the on-disk cache once the leader releases.
+        //
+        // We key on the image reference string (not on `probed_id`)
+        // because for multi-arch images `manifest_probe` returns the
+        // image-index digest while `Client::pull` follows the index
+        // and stores under a different platform manifest digest. The
+        // waiter therefore must not assume "the leader stored under
+        // my probed digest" — it has to learn the storage digest
+        // from the leader directly.
         loop {
-            let role = self.claim_inflight(&probed_id);
+            let role = self.claim_inflight(image_ref);
             match role {
-                InflightRole::Leader(_guard) => {
+                InflightRole::Leader {
+                    slot,
+                    guard: _guard,
+                } => {
                     let result = self.do_full_pull(&reference, &registry_auth).await;
-                    self.release_inflight(&probed_id);
+                    if let Ok(ref pulled) = result {
+                        *slot.resolved.lock().expect("resolved slot poisoned") =
+                            Some(pulled.id.clone());
+                    }
+                    self.release_inflight(image_ref);
                     return result;
                 }
-                InflightRole::Waiter(barrier) => {
+                InflightRole::Waiter(slot) => {
                     counter!("bugpot_image_pull_coalesced_total").increment(1);
-                    info!(id = %probed_id, "awaiting in-flight pull");
-                    drop(barrier.lock().await);
-                    if let Some(cached) = load_cached_image(&self.images_root, &probed_id)? {
-                        // Same accounting as the cache-hit fast path
-                        // above: the waiter paid neither cost.
-                        histogram!("bugpot_image_pull_seconds", "step" => "registry").record(0.0);
-                        histogram!("bugpot_image_pull_seconds", "step" => "extract").record(0.0);
-                        info!(id = %probed_id, "in-flight pull completed; using cache");
-                        return Ok(cached);
+                    info!(ref_str = %image_ref, "awaiting in-flight pull");
+                    drop(slot.barrier.lock().await);
+                    let resolved = slot
+                        .resolved
+                        .lock()
+                        .expect("resolved slot poisoned")
+                        .clone();
+                    if let Some(id) = resolved {
+                        if let Some(cached) = load_cached_image(&self.images_root, &id)? {
+                            // Same accounting as the cache-hit fast
+                            // path above: the waiter paid neither
+                            // cost.
+                            histogram!("bugpot_image_pull_seconds", "step" => "registry")
+                                .record(0.0);
+                            histogram!("bugpot_image_pull_seconds", "step" => "extract")
+                                .record(0.0);
+                            info!(%id, "in-flight pull completed; using cache");
+                            return Ok(cached);
+                        }
+                        // Leader reported a digest but cache lookup
+                        // failed — should be impossible (leader
+                        // writes `.done` before publishing the
+                        // digest). Treat as a leader failure and
+                        // retry to keep this path safe.
+                        debug!(%id, "in-flight pull's reported digest is not on disk; retrying");
+                    } else {
+                        // Leader returned an error and never
+                        // published a digest. Loop and claim
+                        // leadership ourselves.
+                        debug!(ref_str = %image_ref, "in-flight pull failed; retrying");
                     }
-                    // Cache miss after wake: the leader failed. Loop
-                    // and try to claim leadership ourselves.
-                    debug!(id = %probed_id, "in-flight pull failed; retrying");
                 }
             }
         }
     }
 
-    /// Try to become leader for `id`. If another task already inserted
-    /// a barrier, return [`InflightRole::Waiter`] holding a clone of
-    /// it. Otherwise insert a fresh barrier, lock it, and return
-    /// [`InflightRole::Leader`] holding the guard.
-    fn claim_inflight(&self, id: &ImageId) -> InflightRole {
+    /// Try to become leader for `image_ref`. If another task already
+    /// inserted a slot, return [`InflightRole::Waiter`] holding a
+    /// clone of it. Otherwise insert a fresh slot, lock its barrier,
+    /// and return [`InflightRole::Leader`].
+    fn claim_inflight(&self, image_ref: &str) -> InflightRole {
         use std::collections::hash_map::Entry;
         let mut map = self.inflight.lock().expect("inflight map mutex poisoned");
-        match map.entry(id.clone()) {
+        match map.entry(image_ref.to_owned()) {
             Entry::Occupied(e) => InflightRole::Waiter(e.get().clone()),
             Entry::Vacant(v) => {
-                let barrier = Arc::new(AsyncMutex::new(()));
+                let slot = Arc::new(InflightSlot::new());
                 // Fresh mutex, never handed out — `try_lock_owned`
                 // cannot fail. Holding this guard while the leader
                 // works is what blocks waiters on their
-                // `barrier.lock().await`.
-                let guard = Arc::clone(&barrier)
+                // `slot.barrier.lock().await`.
+                let guard = Arc::clone(&slot.barrier)
                     .try_lock_owned()
                     .expect("fresh barrier mutex");
-                v.insert(barrier);
-                InflightRole::Leader(guard)
+                v.insert(Arc::clone(&slot));
+                InflightRole::Leader { slot, guard }
             }
         }
     }
 
-    /// Remove the barrier for `id`. The leader's guard drop after
+    /// Remove the slot for `image_ref`. The leader's guard drop after
     /// this call unblocks every queued waiter. Removing the entry
     /// first means a brand-new caller arriving after the removal
-    /// won't try to wait on a barrier whose leader has already
-    /// finished.
-    fn release_inflight(&self, id: &ImageId) {
+    /// won't try to wait on a slot whose leader has already finished.
+    fn release_inflight(&self, image_ref: &str) {
         let mut map = self.inflight.lock().expect("inflight map mutex poisoned");
-        map.remove(id);
+        map.remove(image_ref);
     }
 
     /// Full registry pull + extract. Called only by the singleflight
@@ -299,12 +356,16 @@ impl Puller {
     }
 }
 
-/// Outcome of [`Puller::claim_inflight`]: either we own the barrier
-/// (and must drive the pull) or we hold a clone of someone else's
-/// barrier (and must wait for them to finish).
+/// Outcome of [`Puller::claim_inflight`]: either we own the slot
+/// (and must drive the pull, then publish the resolved digest) or
+/// we hold a clone of someone else's slot (and must wait for them
+/// to finish, then read their published digest).
 enum InflightRole {
-    Leader(tokio::sync::OwnedMutexGuard<()>),
-    Waiter(Arc<AsyncMutex<()>>),
+    Leader {
+        slot: Arc<InflightSlot>,
+        guard: tokio::sync::OwnedMutexGuard<()>,
+    },
+    Waiter(Arc<InflightSlot>),
 }
 
 /// Reconstruct a [`PulledImage`] from the on-disk cache for `id`,
@@ -677,70 +738,74 @@ mod tests {
         assert_eq!(removed, 0);
     }
 
-    /// First claim becomes leader; second claim for the same id while
+    /// First claim becomes leader; second claim for the same ref while
     /// the leader still holds its guard becomes a waiter. After
     /// release, a new claim becomes leader again.
     #[tokio::test]
     async fn inflight_roles_leader_then_waiter_then_leader_again() {
         let puller = Puller::new(tempfile::tempdir().unwrap().keep());
-        let id = ImageId::new("sha256:abc");
+        let key = "registry.example/img:tag";
 
-        let leader_guard = match puller.claim_inflight(&id) {
-            InflightRole::Leader(g) => g,
+        let (leader_slot, leader_guard) = match puller.claim_inflight(key) {
+            InflightRole::Leader { slot, guard } => (slot, guard),
             InflightRole::Waiter(_) => panic!("first claim must be leader"),
         };
-        let waiter_barrier = match puller.claim_inflight(&id) {
-            InflightRole::Leader(_) => panic!("second claim must be waiter"),
-            InflightRole::Waiter(b) => b,
+        let waiter_slot = match puller.claim_inflight(key) {
+            InflightRole::Leader { .. } => panic!("second claim must be waiter"),
+            InflightRole::Waiter(s) => s,
         };
+        assert!(
+            Arc::ptr_eq(&leader_slot, &waiter_slot),
+            "waiter must observe the leader's slot, not a fresh one"
+        );
 
         // While the leader holds its guard, the waiter's barrier is
         // locked from the same Arc<Mutex>, so a non-blocking try_lock
         // must fail.
         assert!(
-            waiter_barrier.try_lock().is_err(),
+            waiter_slot.barrier.try_lock().is_err(),
             "waiter must be blocked while leader holds the guard"
         );
 
         drop(leader_guard);
-        puller.release_inflight(&id);
+        puller.release_inflight(key);
 
         // After release, the waiter's barrier is free.
         assert!(
-            waiter_barrier.try_lock().is_ok(),
+            waiter_slot.barrier.try_lock().is_ok(),
             "waiter must unblock once leader releases"
         );
 
         // And a brand-new claim becomes leader again — the entry has
         // been removed from the inflight map.
-        let _next = match puller.claim_inflight(&id) {
-            InflightRole::Leader(g) => g,
+        let _next = match puller.claim_inflight(key) {
+            InflightRole::Leader { guard, .. } => guard,
             InflightRole::Waiter(_) => panic!("post-release claim must be leader"),
         };
     }
 
-    /// Two concurrent waiters on the same digest both unblock once the
-    /// leader releases. Verifies that the per-digest barrier is shared
+    /// Two concurrent waiters on the same ref both unblock once the
+    /// leader releases. Verifies that the per-ref barrier is shared
     /// (not held exclusively by the first waiter to wake).
     #[tokio::test]
     async fn inflight_two_waiters_both_unblock() {
         let puller = Arc::new(Puller::new(tempfile::tempdir().unwrap().keep()));
-        let id = ImageId::new("sha256:def");
+        let key = "registry.example/img:tag";
 
-        let leader_guard = match puller.claim_inflight(&id) {
-            InflightRole::Leader(g) => g,
+        let leader_guard = match puller.claim_inflight(key) {
+            InflightRole::Leader { guard, .. } => guard,
             InflightRole::Waiter(_) => panic!("first claim must be leader"),
         };
 
         // Two waiters whose .lock().await must complete after release.
         let mut waiters = Vec::new();
         for _ in 0..2 {
-            let barrier = match puller.claim_inflight(&id) {
-                InflightRole::Leader(_) => panic!("must be waiter"),
-                InflightRole::Waiter(b) => b,
+            let slot = match puller.claim_inflight(key) {
+                InflightRole::Leader { .. } => panic!("must be waiter"),
+                InflightRole::Waiter(s) => s,
             };
             waiters.push(tokio::spawn(async move {
-                drop(barrier.lock().await);
+                drop(slot.barrier.lock().await);
             }));
         }
 
@@ -753,10 +818,48 @@ mod tests {
         }
 
         drop(leader_guard);
-        puller.release_inflight(&id);
+        puller.release_inflight(key);
 
         for w in waiters {
             w.await.expect("waiter task panicked");
         }
+    }
+
+    /// A leader-published digest (set on `slot.resolved`) is visible
+    /// to a waiter that wakes on the same slot. This is the bit that
+    /// stops the multi-arch cascade described in the doc comment on
+    /// `Puller::inflight`: waiters must read the leader's *stored*
+    /// digest, not their own probe digest.
+    #[tokio::test]
+    async fn inflight_leader_publishes_digest_for_waiter() {
+        let puller = Arc::new(Puller::new(tempfile::tempdir().unwrap().keep()));
+        let key = "registry.example/multiarch:tag";
+
+        let (leader_slot, leader_guard) = match puller.claim_inflight(key) {
+            InflightRole::Leader { slot, guard } => (slot, guard),
+            InflightRole::Waiter(_) => panic!("first claim must be leader"),
+        };
+        let waiter_slot = match puller.claim_inflight(key) {
+            InflightRole::Leader { .. } => panic!("second claim must be waiter"),
+            InflightRole::Waiter(s) => s,
+        };
+
+        // Leader resolves the platform manifest digest (different
+        // from any probe digest the waiter might compute on its
+        // own) and publishes it before releasing the barrier.
+        let platform_digest = ImageId::new("sha256:c2c89736deadbeef");
+        *leader_slot.resolved.lock().expect("resolved slot poisoned") =
+            Some(platform_digest.clone());
+        drop(leader_guard);
+        puller.release_inflight(key);
+
+        // Waiter reads the published digest from the same slot.
+        drop(waiter_slot.barrier.lock().await);
+        let observed = waiter_slot
+            .resolved
+            .lock()
+            .expect("resolved slot poisoned")
+            .clone();
+        assert_eq!(observed, Some(platform_digest));
     }
 }
