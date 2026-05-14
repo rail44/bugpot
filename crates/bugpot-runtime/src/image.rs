@@ -206,7 +206,10 @@ impl Puller {
         loop {
             let role = self.claim_inflight(image_ref);
             match role {
-                InflightRole::Leader { slot, guard: _guard } => {
+                InflightRole::Leader {
+                    slot,
+                    guard: _guard,
+                } => {
                     let result = self.do_full_pull(&reference, &registry_auth).await;
                     if let Ok(ref pulled) = result {
                         *slot.resolved.lock().expect("resolved slot poisoned") =
@@ -845,10 +848,8 @@ mod tests {
         // from any probe digest the waiter might compute on its
         // own) and publishes it before releasing the barrier.
         let platform_digest = ImageId::new("sha256:c2c89736deadbeef");
-        *leader_slot
-            .resolved
-            .lock()
-            .expect("resolved slot poisoned") = Some(platform_digest.clone());
+        *leader_slot.resolved.lock().expect("resolved slot poisoned") =
+            Some(platform_digest.clone());
         drop(leader_guard);
         puller.release_inflight(key);
 
