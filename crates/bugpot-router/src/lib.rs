@@ -24,7 +24,7 @@ use ipnet::IpNet;
 use metrics::counter;
 use std::{
     net::{IpAddr, SocketAddr},
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex},
     time::{Duration, Instant as StdInstant},
 };
 use tokio::{
@@ -81,21 +81,25 @@ const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
 const X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");
 
-/// RFC 7230 §6.1 hop-by-hop headers. Stored as lowercase strings so we
-/// can store them in a `const` (compound `HeaderName` arrays don't
-/// survive `const` because of interior mutability) and parsed at call
-/// time via `HeaderMap::remove(&str)`. `Upgrade` is in the list but
-/// the WebSocket path runs *before* the strip and keeps it.
-const HOP_BY_HOP_HEADERS: &[&str] = &[
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
-];
+/// RFC 7230 §6.1 hop-by-hop headers. Pre-parsed once into typed
+/// `HeaderName`s so the per-request strip path does eight pointer
+/// comparisons instead of eight `&str → HeaderName` parses. The
+/// `HeaderName` type has interior mutability (atomic refcount on the
+/// inner `Bytes`) so a compound `const [HeaderName; N]` will not
+/// compile, hence the `LazyLock`. `Upgrade` is in the list but the
+/// WebSocket path runs *before* the strip and keeps it.
+static HOP_BY_HOP_HEADERS: LazyLock<[HeaderName; 8]> = LazyLock::new(|| {
+    [
+        HeaderName::from_static("connection"),
+        HeaderName::from_static("keep-alive"),
+        HeaderName::from_static("proxy-authenticate"),
+        HeaderName::from_static("proxy-authorization"),
+        HeaderName::from_static("te"),
+        HeaderName::from_static("trailer"),
+        HeaderName::from_static("transfer-encoding"),
+        HeaderName::from_static("upgrade"),
+    ]
+});
 
 type ProxyClient = Client<HttpConnector, Body>;
 
@@ -686,8 +690,8 @@ fn strip_hop_by_hop_headers(headers: &mut HeaderMap) {
         .flat_map(|s| s.split(','))
         .filter_map(|name| HeaderName::try_from(name.trim()).ok())
         .collect();
-    for h in HOP_BY_HOP_HEADERS {
-        headers.remove(*h);
+    for h in HOP_BY_HOP_HEADERS.iter() {
+        headers.remove(h);
     }
     for h in extras {
         headers.remove(&h);
