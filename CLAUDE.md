@@ -400,6 +400,8 @@ Take action (workspace pin, `[patch.crates-io]`, or an upstream bump request) on
 
 If a duplicate causes a real cross-type mismatch in our source (the bugpot code itself passes a type from version A into an API that expects version B), it is not a duplicate to tolerate — it is broken and must be pinned. The `nix` entry in `[workspace.dependencies]` is the only such case today (libcontainer exposes `Signal::from<nix::Signal>` and we call it directly).
 
+When a parent crate **re-exports** a dependency we'd otherwise declare ourselves (e.g. `libcontainer::oci_spec` via `pub use oci_spec;`), prefer accessing it through the re-export instead of redeclaring. That removes the manual version-pin maintenance entirely — our path follows whatever the parent crate ships, in lock-step, for free. `oci_spec` is currently consumed this way; `nix` would be too if libcontainer ever adds a `pub use nix;`.
+
 Notable known-safe duplicates (informational; not exhaustive, the list will shift as the ecosystem moves):
 
 - `sha2` / `digest` / `block-buffer` / `cpufeatures` / `crypto-common` 0.10 vs 0.11 — `oci-client 0.16` pins the 0.10 chain; we use 0.11 directly. Boundary is `String` digests, no type crossing.

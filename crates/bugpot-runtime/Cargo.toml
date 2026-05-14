@@ -21,10 +21,11 @@ serde = { workspace = true }
 serde_json = "1"
 thiserror = "2"
 oci-client = "0.16"
-# Pin oci-spec to the same version libcontainer 0.6 re-exports, so
-# Spec values we build can be consumed by libcontainer without
-# crossing crate versions.
-oci-spec = { version = "0.9", features = ["runtime"] }
+# `oci-spec` is not declared here on purpose: libcontainer 0.6 does
+# `pub use oci_spec;`, and our code reaches it as
+# `libcontainer::oci_spec`. That keeps our version in lock-step with
+# libcontainer's automatically and removes a manual pin. See
+# CLAUDE.md > Dependency policy.
 # seccomp + v2 cgroup + systemd. Requires `libseccomp-dev` on the build
 # host (Ubuntu: `apt install libseccomp-dev`; the Lima provisioning in
 # `lima/bugpot.yaml` installs it). Runtime needs `libseccomp2`.
