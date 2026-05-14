@@ -74,7 +74,6 @@ EOF
         --setenv=BUGPOT_LISTEN="$LISTEN" \
         --setenv=BUGPOT_ADMIN_TOKEN="dev-only-do-not-deploy" \
         --setenv=BUGPOT_METRICS_LISTEN=127.0.0.1:9090 \
-        --setenv=RUST_LOG=info \
         "$BIN" >/dev/null
 
     for _ in $(seq 1 60); do
