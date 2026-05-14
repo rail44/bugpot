@@ -346,6 +346,29 @@ bugpot delegates image-index resolution to oci-client's default `current_platfor
 - The tail opens at offset 0, not EOF: on bugpot restart, anything still in the file (incl. bytes the app wrote during the interregnum) replays through tracing once. The replay window is bounded by the truncation cap below, so a restart costs at most one cap-worth of duplicate emissions.
 - **Log volume bound (#21):** when any of those files grows past `MAX_LOG_BYTES` (10 MiB), the tail truncates it in place via `ftruncate(0)`. The container's existing fd keeps working — its `O_APPEND` semantics make the next write seek to the new end (= 0). Bytes written between the size check and the truncate may be lost on disk; everything before that point was already emitted through tracing, so the loss is only visible to operators reading the file directly. No generations / no rotation files; if richer retention is needed, run an external collector (vector / otel-collector / fluent-bit) against the same files.
 
+### Performance profiling (development)
+
+The Lima VM provisioning sets `kernel.perf_event_paranoid = -1` and `kernel.kptr_restrict = 0` and installs `bpftrace` + `samply`. These are dev-only choices — do **not** carry them into any production image.
+
+**CPU profile a release build (samply):**
+
+```sh
+just shell                                          # inside the VM
+cargo build --release -p bugpot
+samply record -- ./target/release/bugpot           # ^C to stop and upload to Firefox Profiler
+```
+
+Samply pops a browser tab on the macOS host (via port forward) with a call tree / stack chart / CPU history. Symbolisation is automatic from DWARF.
+
+**Kernel-side trace (bpftrace) — last-resort when user-space profilers say "blocked here, no idea why":**
+
+```sh
+sudo bpftrace -e 'tracepoint:syscalls:sys_enter_execve { printf("%s -> %s\n", comm, str(args.filename)); }'
+sudo bpftrace -e 'kprobe:do_unlinkat /comm == "bugpot"/ { @ = count(); }'
+```
+
+Useful for nftables / netns / libcontainer `clone` cost questions that the in-process profilers can't see.
+
 ## Conventions
 
 - Workspace edition 2024, MSRV 1.85. Lints: `unsafe_code = "deny"` workspace-wide; clippy `all`/`pedantic`/`nursery`/`cargo` enabled.
