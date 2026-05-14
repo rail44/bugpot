@@ -48,6 +48,41 @@ test:
 clippy:
     limactl shell bugpot -- bash -lc 'cargo clippy --workspace --all-targets'
 
+# Single-crate variants. Faster than the workspace recipes when
+# iterating on one crate: cargo doesn't reanalyse the whole graph.
+# Example: `just check-crate bugpot-router`.
+check-crate crate:
+    limactl shell bugpot -- bash -lc 'cargo check -p {{crate}} --all-targets'
+
+clippy-crate crate:
+    limactl shell bugpot -- bash -lc 'cargo clippy -p {{crate}} --all-targets'
+
+test-crate crate:
+    limactl shell bugpot -- bash -lc 'cargo test -p {{crate}}'
+
+# --- Mac-native (no Lima round-trip) ---
+
+# Format the whole workspace. `rustfmt` is pure-Rust so it runs
+# natively on macOS — no Linux deps, no Lima overhead.
+fmt:
+    cargo fmt --all
+
+fmt-check:
+    cargo fmt --all -- --check
+
+# cargo check / clippy for the three crates that compile on macOS
+# (no `libcontainer` / `nix::sched` / `procfs` dependencies). Lets
+# the editor / a quick sanity loop skip the Lima round-trip on these.
+# The other five crates (controller, runtime, egress, admin, cmd)
+# must still go through `just check` / `just clippy`.
+HOST_CRATES := "-p bugpot-config -p bugpot-router -p bugpot-metrics"
+
+check-host:
+    cargo check {{HOST_CRATES}} --all-targets
+
+clippy-host:
+    cargo clippy {{HOST_CRATES}} --all-targets
+
 # --- Smoke tests (need root inside the VM) ---
 
 # Infrastructure-only: bridge / nft / DNS / router, no apps.

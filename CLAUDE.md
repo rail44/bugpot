@@ -45,6 +45,41 @@ subdomains resolve via the `*.localhost` wildcard, so `just hit alpha` and
 browsing `http://alpha.localhost:8080/` both work with no `/etc/hosts`
 changes.
 
+### Mac-native fast paths
+
+Most cargo commands have to run inside Lima because `bugpot-runtime`,
+`bugpot-egress`, `bugpot-controller`, `bugpot-admin`, and `cmd/bugpot`
+all transitively depend on Linux-only crates (`libcontainer`,
+`procfs`, `nix::sched`, `inotify`). Three crates are pure Rust and
+compile on macOS directly:
+
+- `bugpot-config`, `bugpot-router`, `bugpot-metrics`
+
+For those crates and for `cargo fmt`, the justfile exposes
+`-host` / `fmt` recipes that skip the Lima round-trip entirely:
+
+```sh
+just fmt              # rustfmt across the workspace, native
+just fmt-check        # CI-style check, native
+just check-host       # cargo check for the three host-compatible crates
+just clippy-host      # likewise for clippy
+```
+
+For the Linux-only crates, prefer the single-crate `just check-crate
+<name>` / `just clippy-crate <name>` / `just test-crate <name>` over
+the workspace-wide `just check` etc. when iterating on one crate —
+cargo skips the full-graph reanalysis and the Lima round-trip cost
+is amortised across one compilation pass instead of eight.
+
+Editor-side type checking is its own concern. `rustup target add
+aarch64-unknown-linux-gnu` gives the rust-analyzer / IDE side the
+Rust stdlib for the Linux target; configure your editor's
+rust-analyzer with `cargo.target = "aarch64-unknown-linux-gnu"` so
+diagnostics match what Lima sees. (Build scripts for libseccomp /
+libcontainer C bindings still fail without a Linux cross-linker, but
+rust-analyzer is tolerant of those failures and still surfaces
+source-level type errors for the pure-Rust parts of every crate.)
+
 ### Background dev server
 
 `just start` runs `scripts/dev-server.sh start` inside the VM, which
