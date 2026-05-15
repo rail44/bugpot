@@ -1,0 +1,157 @@
+name: bugpot rollout
+
+# Reusable workflow for an **application repo**. Builds a container
+# image from the repo's Dockerfile, pushes it to GHCR, and tells
+# bugpot to roll out that tag for the app.
+#
+# Auth split:
+#   - GHCR push uses `GITHUB_TOKEN` with `packages: write`.
+#   - bugpot rollout uses the per-app deploy token issued by the
+#     ops repo's apply-config workflow (see PR #84).
+#
+# Convention for `image_repo`: defaults to `ghcr.io/<owner>/<repo>`
+# (the caller's own repo path). The ops repo's app TOML must have
+# `repo` set to the **same** value, otherwise bugpot will pull from
+# somewhere other than where this workflow pushed.
+
+on:
+  workflow_call:
+    inputs:
+      admin_url:
+        description: >-
+          Base URL of bugpot's admin API (no trailing slash).
+        required: true
+        type: string
+      app_name:
+        description: >-
+          Name of the bugpot app to roll out. Must match the
+          `name` in the ops repo's TOML for this app.
+        required: true
+        type: string
+      tag:
+        description: >-
+          Image tag to build, push, and roll. Default = the full
+          commit SHA, which is unambiguous and immutable.
+        required: false
+        type: string
+        default: ${{ github.sha }}
+      image_repo:
+        description: >-
+          OCI repository to push to. Default
+          `ghcr.io/<owner>/<repo>` — must match the ops repo
+          TOML's `repo` field for this app.
+        required: false
+        type: string
+        default: ghcr.io/${{ github.repository }}
+      build_context:
+        description: Docker build context directory.
+        required: false
+        type: string
+        default: .
+      dockerfile:
+        description: Path to the Dockerfile, relative to the repo root.
+        required: false
+        type: string
+        default: Dockerfile
+      platforms:
+        description: >-
+          Target platforms passed to `docker buildx`. Default
+          `linux/amd64`. Set to e.g. `linux/amd64,linux/arm64`
+          for multi-arch (slower; needs QEMU emulation for the
+          non-native target).
+        required: false
+        type: string
+        default: linux/amd64
+    secrets:
+      BUGPOT_DEPLOY_TOKEN:
+        description: >-
+          Per-app deploy token from the ops repo's apply-config
+          workflow.
+        required: true
+    outputs:
+      tag:
+        description: The tag that was rolled out.
+        value: ${{ jobs.rollout.outputs.tag }}
+      image_ref:
+        description: The full `<image_repo>:<tag>` that was pushed.
+        value: ${{ jobs.rollout.outputs.image_ref }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  rollout:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ inputs.tag }}
+      image_ref: ${{ steps.image.outputs.ref }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: image
+        shell: bash
+        run: |
+          # Normalise the image path to lowercase: GHCR (and the OCI
+          # spec) require lowercase, but `github.repository` keeps
+          # whatever case the owner set on GitHub. A capital letter
+          # in the repo name would otherwise fail the push with a
+          # 400. `${{ github.repository }}` is the only segment that
+          # may have caps; the registry host is fixed.
+          repo_lc=$(echo "${{ inputs.image_repo }}" | tr '[:upper:]' '[:lower:]')
+          ref="${repo_lc}:${{ inputs.tag }}"
+          echo "ref=$ref" >>"$GITHUB_OUTPUT"
+          echo "repo_lc=$repo_lc" >>"$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.build_context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          push: true
+          tags: ${{ steps.image.outputs.ref }}
+
+      - name: Roll out via bugpot admin
+        shell: bash
+        env:
+          ADMIN_URL: ${{ inputs.admin_url }}
+          APP_NAME: ${{ inputs.app_name }}
+          TAG: ${{ inputs.tag }}
+          DEPLOY_TOKEN: ${{ secrets.BUGPOT_DEPLOY_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          body=$(jq -n --arg tag "$TAG" '{tag: $tag}')
+
+          http_code=$(
+            curl -sS -o /tmp/resp -w '%{http_code}' \
+              -X POST \
+              -H "Authorization: Bearer $DEPLOY_TOKEN" \
+              -H 'Content-Type: application/json' \
+              -d "$body" \
+              "$ADMIN_URL/apps/$APP_NAME/rollouts"
+          )
+          if [ "$http_code" != "201" ]; then
+            echo "::error::rollout failed for $APP_NAME: HTTP $http_code"
+            cat /tmp/resp
+            echo
+            exit 1
+          fi
+
+          {
+            echo "## bugpot rollout"
+            echo
+            echo "- App: \`$APP_NAME\`"
+            echo "- Tag: \`$TAG\`"
+            echo "- Image: \`${{ steps.image.outputs.ref }}\`"
+          } >>"$GITHUB_STEP_SUMMARY"
