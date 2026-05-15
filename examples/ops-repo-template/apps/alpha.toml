@@ -1,0 +1,39 @@
+# Sample bugpot app config. Drop one such file per app into the
+# ops repo's `apps/` directory; the apply-config workflow registers
+# each on push to main.
+#
+# Only the slow-changing fields go here. Image tags (rollouts) are
+# owned by the matching app repo's CI, not by this ops repo.
+
+# App identifier. Must match the filename (here: `alpha.toml`).
+# Required: the admin API has no filename context when receiving a
+# POST body, so the name has to be in the body explicitly.
+name = "alpha"
+
+# OCI image repository (no tag, no @digest).
+repo = "ghcr.io/your-org/alpha"
+
+# Port the container listens on. bugpot proxies HTTP to this port
+# inside the container's netns.
+port = 8080
+
+# Optional. Default = name. Routing uses the first DNS label of the
+# request's Host header, so `alpha.<your-bugpot-domain>` maps here.
+# subdomain = "alpha"
+
+[scaling]
+# "0" / missing → always-on. Otherwise any humantime duration:
+# "30s", "5m", "1h".
+idle_timeout = "5m"
+
+[egress]
+# Default-deny: only the domains listed below resolve and become
+# routable from inside this app's netns. Add the third-party APIs
+# your app actually calls.
+allow = [
+    # "api.openai.com",
+    # "*.googleapis.com",
+]
+
+[env]
+# LOG_LEVEL = "info"
