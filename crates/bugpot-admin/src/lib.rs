@@ -7,10 +7,18 @@
 //!
 //! # Routes
 //!
-//! - `POST   /apps`         JSON body → `AppSpec`, returns 200 + `AppView`
-//! - `GET    /apps`         returns 200 + `[AppView]`
-//! - `GET    /apps/{name}`  returns 200 + `AppView`, or 404
-//! - `DELETE /apps/{name}`  returns 204, or 404
+//! Config plane (rare, admin-token scoped):
+//!
+//! - `POST   /apps`                  JSON body → `AppSpec`, returns 201 + `AppView`. Registers only — does not pull an image or start a container.
+//! - `GET    /apps`                  returns 200 + `[AppView]`
+//! - `GET    /apps/{name}`           returns 200 + `AppView`, or 404
+//! - `DELETE /apps/{name}`           returns 204, or 404
+//!
+//! Rollout plane (frequent, same admin token for now — a per-app
+//! deploy token lands in a follow-up):
+//!
+//! - `POST   /apps/{name}/rollouts`  JSON `{tag}`, returns 201 + `Rollout`. Pulls and (re)starts the container.
+//! - `GET    /apps/{name}/rollouts`  returns 200 + `[Rollout]` (oldest first, current last)
 //!
 //! # Auth
 //!
@@ -45,11 +53,11 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use bugpot_config::AppSpec;
-use bugpot_controller::{AppController, AppView, DeployError, RemoveError};
+use bugpot_config::{AppSpec, Rollout};
+use bugpot_controller::{AppController, AppView, DeployError, RemoveError, RolloutError};
 use bugpot_egress::EgressOps;
 use bugpot_runtime::RuntimeOps;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use tower::ServiceBuilder;
 use tower::limit::RateLimitLayer;
@@ -157,6 +165,10 @@ where
     Router::new()
         .route("/apps", post(deploy::<R, E>).get(list::<R, E>))
         .route("/apps/{name}", get(get_one::<R, E>).delete(remove::<R, E>))
+        .route(
+            "/apps/{name}/rollouts",
+            post(roll_out::<R, E>).get(list_rollouts::<R, E>),
+        )
         .with_state(controller)
         // Auth runs first (innermost layer) so unauthorised requests
         // don't burn a rate-limit slot. Body limit + rate limit are
@@ -191,15 +203,15 @@ where
     // even when validation rejects the spec before a name lands in
     // the controller's maps.
     let audit_name = spec.name.clone().unwrap_or_else(|| "<unnamed>".to_owned());
-    let audit_image = spec.image.clone();
+    let audit_repo = spec.repo.clone();
     match controller.deploy_app(spec).await {
         Ok(view) => {
             info!(
                 target: "bugpot::audit",
-                action = "deploy",
+                action = "register",
                 peer = %peer.ip(),
                 app = %audit_name,
-                image = %audit_image,
+                repo = %audit_repo,
                 status = "ok",
             );
             Ok((StatusCode::CREATED, Json(view)))
@@ -210,16 +222,77 @@ where
             // pager rules. The mapped HTTP status carries severity.
             warn!(
                 target: "bugpot::audit",
-                action = "deploy",
+                action = "register",
                 peer = %peer.ip(),
                 app = %audit_name,
-                image = %audit_image,
+                repo = %audit_repo,
                 status = "error",
                 error = %e,
             );
             Err(e.into())
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct RolloutBody {
+    tag: String,
+}
+
+async fn roll_out<R, E>(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(controller): State<Arc<AppController<R, E>>>,
+    Path(name): Path<String>,
+    Json(body): Json<RolloutBody>,
+) -> Result<(StatusCode, Json<Rollout>), AdminError>
+where
+    R: RuntimeOps,
+    E: EgressOps,
+{
+    let audit_tag = body.tag.clone();
+    match controller.set_rollout(&name, body.tag).await {
+        Ok(rollout) => {
+            info!(
+                target: "bugpot::audit",
+                action = "rollout",
+                peer = %peer.ip(),
+                app = %name,
+                tag = %audit_tag,
+                status = "ok",
+            );
+            Ok((StatusCode::CREATED, Json(rollout)))
+        }
+        Err(e) => {
+            warn!(
+                target: "bugpot::audit",
+                action = "rollout",
+                peer = %peer.ip(),
+                app = %name,
+                tag = %audit_tag,
+                status = "error",
+                error = %e,
+            );
+            Err(e.into())
+        }
+    }
+}
+
+async fn list_rollouts<R, E>(
+    State(controller): State<Arc<AppController<R, E>>>,
+    Path(name): Path<String>,
+) -> Result<Json<Vec<Rollout>>, AdminError>
+where
+    R: RuntimeOps,
+    E: EgressOps,
+{
+    controller
+        .list_rollouts(&name)
+        .await
+        .map(Json)
+        .ok_or_else(|| AdminError {
+            status: StatusCode::NOT_FOUND,
+            message: format!("app '{name}' not found"),
+        })
 }
 
 async fn remove<R, E>(
@@ -330,6 +403,24 @@ impl From<RemoveError> for AdminError {
         let status = match &err {
             RemoveError::NotFound(_) => StatusCode::NOT_FOUND,
             RemoveError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        Self {
+            status,
+            message: format!("{err:#}"),
+        }
+    }
+}
+
+impl From<RolloutError> for AdminError {
+    fn from(err: RolloutError) -> Self {
+        let status = match &err {
+            RolloutError::NotFound(_) => StatusCode::NOT_FOUND,
+            RolloutError::EmptyTag => StatusCode::BAD_REQUEST,
+            RolloutError::Conflict(_) => StatusCode::CONFLICT,
+            RolloutError::ImageAuth(_) | RolloutError::ImagePull(_) => StatusCode::BAD_GATEWAY,
+            RolloutError::StartFailed(_) | RolloutError::Internal(_) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
         };
         Self {
             status,

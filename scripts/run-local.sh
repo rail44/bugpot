@@ -27,7 +27,8 @@ cd "$(dirname "$0")/.."
 WORKDIR=$(pwd)
 
 LISTEN=127.0.0.1:8080
-IMAGE="gcr.io/google-samples/hello-app:1.0"
+IMAGE_REPO="gcr.io/google-samples/hello-app"
+IMAGE_TAG="1.0"
 IDLE="30s"
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -51,11 +52,15 @@ trap cleanup EXIT INT TERM
 
 for name in alpha beta; do
     cat >"$APPS_DIR/$name.toml" <<EOF
-image = "$IMAGE"
+repo = "$IMAGE_REPO"
 port = 8080
 
 [scaling]
 idle_timeout = "$IDLE"
+
+[rollout]
+tag = "$IMAGE_TAG"
+created_at = "1970-01-01T00:00:00Z"
 EOF
 done
 

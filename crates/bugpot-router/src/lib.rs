@@ -714,7 +714,7 @@ mod tests {
 
     fn fake_app(name: &str) -> AppSpec {
         AppSpec {
-            image: format!("ghcr.io/test/{name}:latest"),
+            repo: format!("ghcr.io/test/{name}"),
             port: 3000,
             name: None,
             subdomain: None,

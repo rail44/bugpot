@@ -3,9 +3,46 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// One image-rollout event for an app.
+///
+/// The pair `(repo from AppSpec, tag)` is what bugpot actually pulls
+/// and runs; rollouts are appended to a bounded per-app history so a
+/// rollback can re-deploy a previous tag without going back to the
+/// registry's mutable view.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Rollout {
+    /// Image tag (e.g. `v1.2.3`, a git SHA, or `latest`). Combined with
+    /// the app's `repo` to form the full reference bugpot pulls.
+    pub tag: String,
+    /// RFC 3339 timestamp produced by bugpot at rollout creation time.
+    /// Stored as a string (rather than a typed `DateTime`) so the TOML
+    /// is round-trippable without pulling in a heavyweight time-format
+    /// dependency on the config side.
+    pub created_at: String,
+}
+
+/// On-disk persisted form: an app's config plus its current rollout.
+///
+/// bugpot writes one of these per app under `<state>/apps/<name>.toml`;
+/// a `[rollout]` table being absent means the app is registered but
+/// not yet deployed.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct StoredApp {
+    #[serde(flatten)]
+    pub spec: AppSpec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollout: Option<Rollout>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppSpec {
-    pub image: String,
+    /// OCI image repository without tag or digest, e.g.
+    /// `ghcr.io/owner/myapp`. The specific image to run (which tag /
+    /// digest) is selected by a separate Rollout — this field
+    /// answers only the "where does bugpot pull from" question.
+    /// Validation rejects `:` (tag separator) and `@` (digest
+    /// separator) in this value.
+    pub repo: String,
     pub port: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -214,6 +251,7 @@ impl AppSpec {
         // `subdomain()` defaults to `name`, so this also catches the
         // common case. When explicitly set it gets the same check.
         validate_dns_label("subdomain", self.subdomain())?;
+        validate_repo(&self.repo)?;
         Ok(())
     }
 }
@@ -235,6 +273,39 @@ pub struct InvalidSpec {
 /// Notably **rejects** `..`, `/`, whitespace, uppercase letters,
 /// underscores, and dots — the path-traversal / netns-name-escape
 /// vectors the admin API would otherwise expose.
+/// Reject image references that include a tag (`repo:tag`) or digest
+/// (`repo@sha256:...`). The spec carries only the repository part;
+/// the specific tag / digest to run is the Rollout's job.
+fn validate_repo(s: &str) -> Result<(), InvalidSpec> {
+    fn invalid(value: &str, reason: &'static str) -> InvalidSpec {
+        InvalidSpec {
+            field: "repo",
+            value: value.to_owned(),
+            reason,
+        }
+    }
+    if s.is_empty() {
+        return Err(invalid(s, "must not be empty"));
+    }
+    if s.contains('@') {
+        return Err(invalid(
+            s,
+            "must not include a digest (`@sha256:…`); pin via a rollout instead",
+        ));
+    }
+    // A `:` in the last path component (or in a tail with no `/`) is the
+    // tag separator. A `:` in the host component (e.g. `localhost:5000`)
+    // is the port — allow that.
+    let last = s.rsplit('/').next().unwrap_or(s);
+    if last.contains(':') {
+        return Err(invalid(
+            s,
+            "must not include a tag (`:tag`); pin via a rollout instead",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_dns_label(field: &'static str, s: &str) -> Result<(), InvalidSpec> {
     fn invalid(field: &'static str, value: &str, reason: &'static str) -> InvalidSpec {
         InvalidSpec {
@@ -369,7 +440,10 @@ pub fn registry_host(image_ref: &str) -> &str {
     }
 }
 
-pub fn load_apps(dir: impl AsRef<Path>) -> Result<Vec<AppSpec>> {
+/// Load every `<dir>/*.toml` as a [`StoredApp`] (an [`AppSpec`] plus
+/// an optional `[rollout]` table). The spec is validated; the rollout
+/// (when present) is trusted as bugpot's own previous write.
+pub fn load_apps(dir: impl AsRef<Path>) -> Result<Vec<StoredApp>> {
     let dir = dir.as_ref();
     anyhow::ensure!(dir.exists(), "apps directory not found: {}", dir.display());
 
@@ -385,14 +459,16 @@ pub fn load_apps(dir: impl AsRef<Path>) -> Result<Vec<AppSpec>> {
         let path = entry.path();
         let body = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let mut spec: AppSpec =
+        let mut stored: StoredApp =
             toml::from_str(&body).with_context(|| format!("failed to parse {}", path.display()))?;
-        spec.source_path = path.to_path_buf();
-        spec.validate()
+        stored.spec.source_path = path.to_path_buf();
+        stored
+            .spec
+            .validate()
             .with_context(|| format!("invalid spec in {}", path.display()))?;
-        apps.push(spec);
+        apps.push(stored);
     }
-    apps.sort_by(|a, b| a.name().cmp(b.name()));
+    apps.sort_by(|a, b| a.spec.name().cmp(b.spec.name()));
     Ok(apps)
 }
 
@@ -494,7 +570,7 @@ mod tests {
     #[test]
     fn appspec_validate_catches_path_traversal_via_name() {
         let body = r#"
-            image = "x:1"
+            repo = "x"
             port = 8080
             name = "../../etc/cron.d/evil"
         "#;
@@ -511,7 +587,7 @@ mod tests {
         // `"unknown"` sentinel. Must be caught at validate-time so two
         // such specs can't collide in `AppController.apps`.
         let body = r#"
-            image = "x:1"
+            repo = "x"
             port = 8080
         "#;
         let spec: AppSpec = toml::from_str(body).unwrap();
@@ -525,7 +601,7 @@ mod tests {
     #[test]
     fn appspec_validate_catches_bad_subdomain() {
         let body = r#"
-            image = "x:1"
+            repo = "x"
             port = 8080
             name = "ok"
             subdomain = "Bad-Subdomain"
@@ -538,13 +614,51 @@ mod tests {
     }
 
     #[test]
+    fn appspec_validate_rejects_repo_with_tag() {
+        let body = r#"
+            repo = "ghcr.io/owner/repo:v1"
+            port = 8080
+            name = "ok"
+        "#;
+        let spec: AppSpec = toml::from_str(body).unwrap();
+        let err = spec.validate().expect_err("tag in repo must be rejected");
+        assert_eq!(err.field, "repo");
+    }
+
+    #[test]
+    fn appspec_validate_rejects_repo_with_digest() {
+        let body = r#"
+            repo = "ghcr.io/owner/repo@sha256:abc"
+            port = 8080
+            name = "ok"
+        "#;
+        let spec: AppSpec = toml::from_str(body).unwrap();
+        let err = spec
+            .validate()
+            .expect_err("digest in repo must be rejected");
+        assert_eq!(err.field, "repo");
+    }
+
+    #[test]
+    fn appspec_validate_accepts_registry_port() {
+        let body = r#"
+            repo = "localhost:5000/foo"
+            port = 8080
+            name = "ok"
+        "#;
+        let spec: AppSpec = toml::from_str(body).unwrap();
+        spec.validate()
+            .expect("registry port (host-component colon) must be allowed");
+    }
+
+    #[test]
     fn parses_minimum_toml() {
         let body = r#"
-            image = "ghcr.io/org/myapp:sha-abc"
+            repo = "ghcr.io/org/myapp"
             port = 3000
         "#;
         let spec: AppSpec = toml::from_str(body).unwrap();
-        assert_eq!(spec.image, "ghcr.io/org/myapp:sha-abc");
+        assert_eq!(spec.repo, "ghcr.io/org/myapp");
         assert_eq!(spec.port, 3000);
         assert!(spec.egress.allow.is_empty());
     }
@@ -552,7 +666,7 @@ mod tests {
     #[test]
     fn parses_full_toml() {
         let body = r#"
-            image = "ghcr.io/org/myapp:sha-abc"
+            repo = "ghcr.io/org/myapp"
             port = 3000
             name = "myapp"
             subdomain = "my-custom"
@@ -682,7 +796,7 @@ mod tests {
     #[test]
     fn name_defaults_to_filename_stem() {
         let mut spec: AppSpec = toml::from_str(
-            r#"image = "x"
+            r#"repo = "x"
 port = 80
 "#,
         )
@@ -699,7 +813,7 @@ port = 80
     fn serialize_deserialize_round_trip_minimum() {
         let original: AppSpec = toml::from_str(
             r#"
-            image = "ghcr.io/org/app:sha-abc"
+            repo = "ghcr.io/org/app"
             port = 3000
             name = "myapp"
         "#,
@@ -707,7 +821,7 @@ port = 80
         .unwrap();
         let body = toml::to_string(&original).expect("serialize");
         let parsed: AppSpec = toml::from_str(&body).expect("deserialize");
-        assert_eq!(parsed.image, original.image);
+        assert_eq!(parsed.repo, original.repo);
         assert_eq!(parsed.port, original.port);
         assert_eq!(parsed.name, original.name);
     }
@@ -716,7 +830,7 @@ port = 80
     fn serialize_omits_default_sections() {
         let spec: AppSpec = toml::from_str(
             r#"
-            image = "x"
+            repo = "x"
             port = 80
             name = "x"
         "#,
@@ -797,7 +911,7 @@ port = 80
     fn serialize_preserves_egress_and_scaling() {
         let original: AppSpec = toml::from_str(
             r#"
-            image = "x"
+            repo = "x"
             port = 80
             name = "x"
             [egress]
