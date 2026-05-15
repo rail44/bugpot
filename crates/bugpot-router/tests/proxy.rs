@@ -122,7 +122,7 @@ async fn forwards_http_request_and_injects_forwarded_headers() {
     let req = hyper::Request::builder()
         .method("POST")
         .uri("/some/path?x=1")
-        .header("host", "hello.bugpot.ts.net")
+        .header("host", "hello.bugpot.example")
         .header("x-custom", "alpha")
         .body(Full::new(Bytes::from_static(b"ping")))
         .unwrap();
@@ -149,11 +149,11 @@ async fn forwards_http_request_and_injects_forwarded_headers() {
         "missing X-Forwarded-Proto; body was: {text}"
     );
     assert!(
-        text.contains("H:x-forwarded-host=hello.bugpot.ts.net"),
+        text.contains("H:x-forwarded-host=hello.bugpot.example"),
         "missing X-Forwarded-Host; body was: {text}"
     );
     assert!(
-        text.contains("H:host=hello.bugpot.ts.net"),
+        text.contains("H:host=hello.bugpot.example"),
         "Host header should be preserved verbatim; body was: {text}"
     );
     assert!(
@@ -186,7 +186,7 @@ async fn returns_502_when_upstream_is_unreachable() {
     let req = hyper::Request::builder()
         .method("GET")
         .uri("/")
-        .header("host", "dead.bugpot.ts.net")
+        .header("host", "dead.bugpot.example")
         .body(Full::new(Bytes::new()))
         .unwrap();
     let res = timeout(Duration::from_secs(10), sender.send_request(req))
@@ -214,7 +214,7 @@ async fn returns_404_for_unknown_host() {
     let req = hyper::Request::builder()
         .method("GET")
         .uri("/")
-        .header("host", "unknown.bugpot.ts.net")
+        .header("host", "unknown.bugpot.example")
         .body(Full::new(Bytes::new()))
         .unwrap();
     let res = timeout(Duration::from_secs(5), sender.send_request(req))
@@ -276,7 +276,7 @@ async fn proxies_http1_upgrade_transparently() {
     stream
         .write_all(
             b"GET /chat HTTP/1.1\r\n\
-              Host: ws.bugpot.ts.net\r\n\
+              Host: ws.bugpot.example\r\n\
               Upgrade: websocket\r\n\
               Connection: Upgrade\r\n\
               Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\

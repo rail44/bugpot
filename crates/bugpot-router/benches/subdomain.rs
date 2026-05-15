@@ -14,7 +14,7 @@ fn main() {
 
 #[divan::bench(args = [
     "alpha.localhost",
-    "beta.bugpot.ts.net:8080",
+    "beta.bugpot.example:8080",
     "myapp.bugpot.example.com",
     "very-long-subdomain.bugpot.somewhere.example.org:443",
 ])]

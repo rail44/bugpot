@@ -113,13 +113,14 @@ pub struct RouterConfig {
     /// IPv4/IPv6 networks whose `X-Forwarded-For` is honoured. Requests
     /// from any other peer have their incoming XFF discarded — the
     /// peer's IP becomes the head of a fresh chain. Empty (default)
-    /// means trust the existing chain (current behaviour); set to
-    /// loopback / Tailscale tailnet ranges in real deployments.
+    /// means trust the existing chain (current behaviour); set to the
+    /// IP ranges of whichever reverse proxy / private network sits in
+    /// front of bugpot in real deployments.
     pub trusted_proxies: Vec<IpNet>,
     /// Value to set in `X-Forwarded-Proto` when the upstream request
     /// doesn't already carry one. Defaults to `http`. Set to `https`
-    /// when bugpot sits behind a TLS-terminating front (Tailscale
-    /// Services, an external LB, etc.).
+    /// when bugpot sits behind a TLS-terminating front (reverse proxy,
+    /// external LB, etc.).
     pub forwarded_proto: String,
 }
 
@@ -209,7 +210,7 @@ impl AppRouter {
         Self { routes }
     }
 
-    /// Resolve a host header (e.g. `myapp.bugpot.ts.net` or `myapp.bugpot.ts.net:443`)
+    /// Resolve a host header (e.g. `myapp.bugpot.example` or `myapp.bugpot.example:443`)
     /// to a registered route by matching the first DNS label against the
     /// app's subdomain.
     #[must_use]
@@ -734,16 +735,18 @@ mod tests {
             RouteEntry::localhost(fake_app("beta")),
         ]);
         assert_eq!(
-            router.resolve("alpha.bugpot.ts.net").map(|d| d.spec.name()),
+            router
+                .resolve("alpha.bugpot.example")
+                .map(|d| d.spec.name()),
             Some("alpha")
         );
         assert_eq!(
             router
-                .resolve("beta.bugpot.ts.net:443")
+                .resolve("beta.bugpot.example:443")
                 .map(|d| d.spec.name()),
             Some("beta")
         );
-        assert!(router.resolve("gamma.bugpot.ts.net").is_none());
+        assert!(router.resolve("gamma.bugpot.example").is_none());
         assert!(router.resolve("").is_none());
     }
 
@@ -802,7 +805,7 @@ mod tests {
         assert_eq!(subdomain_of("[::1]:8080"), None);
         assert_eq!(subdomain_of("[2001:db8::1]:443"), None);
         // Regression: regular host:port still works.
-        assert_eq!(subdomain_of("alpha.bugpot.ts.net:443"), Some("alpha"));
+        assert_eq!(subdomain_of("alpha.bugpot.example:443"), Some("alpha"));
     }
 
     #[test]
