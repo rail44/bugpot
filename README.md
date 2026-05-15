@@ -19,6 +19,12 @@ A single-binary container PaaS for experimental apps.
 - Rust 1.95+
 - `libseccomp-dev`
 
+## Deploying
+
+See [`docs/deploy.md`](docs/deploy.md) for the end-to-end flow
+(set up bugpot host → ops repo with app configs → app repo with
+Dockerfile → automated rollouts via GitHub Actions).
+
 ## Architecture
 
 `cmd/bugpot` is a thin wiring layer over seven library crates:
