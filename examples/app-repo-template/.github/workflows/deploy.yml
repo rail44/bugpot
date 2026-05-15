@@ -1,0 +1,53 @@
+name: Deploy to bugpot
+
+# Drop this file into your application repo at
+# `.github/workflows/deploy.yml`. On every push to `main` it builds
+# your Dockerfile, pushes the image to GHCR, and tells bugpot to
+# roll out the new tag.
+#
+# Required repo configuration (Settings → Secrets and variables →
+# Actions):
+#
+#   variables:
+#     BUGPOT_ADMIN_URL  e.g. http://bugpot.internal:8081
+#   secrets:
+#     BUGPOT_DEPLOY_TOKEN  per-app deploy token, copied from the
+#                          ops repo's apply-config workflow summary
+#
+# The `repo` field in the ops repo's TOML for this app must equal
+# `ghcr.io/<owner>/<repo>` (lowercased) — that's where this workflow
+# pushes.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: >-
+          Override the rollout tag. Useful for rollback — pick an
+          existing image tag from GHCR (e.g. a previous commit SHA).
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  rollout:
+    # Pin to a tag once bugpot publishes them. While bugpot is
+    # pre-1.0, `@main` is the pragmatic choice.
+    uses: rail44/bugpot/.github/workflows/rollout.yml@main
+    with:
+      admin_url: ${{ vars.BUGPOT_ADMIN_URL }}
+      # Must match the `name` in the ops repo's TOML for this app.
+      app_name: my-app
+      # Default tag = full commit SHA. Override here if the user
+      # triggered a manual run with a different tag (rollback).
+      tag: ${{ inputs.tag || github.sha }}
+      # `dockerfile: path/to/Dockerfile`  # default: ./Dockerfile
+      # `build_context: subdir`           # default: .
+      # `platforms: linux/amd64,linux/arm64`  # default: linux/amd64
+    secrets:
+      BUGPOT_DEPLOY_TOKEN: ${{ secrets.BUGPOT_DEPLOY_TOKEN }}
