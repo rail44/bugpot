@@ -121,10 +121,13 @@ Open a PR, review, merge. The merge triggers the apply workflow:
    and prints it in the workflow's job summary table.
 3. DELETEs apps whose TOML has been removed.
 
-In-place edits to an existing TOML are **not** propagated yet
-(`PATCH /apps/<name>` is not implemented). Until it is, the fix
-path is delete-then-re-add across two PRs (or one PR that does
-both).
+In-place edits to an existing TOML — env, scaling, egress, port,
+repo, etc. — are picked up by the next apply-workflow run: it
+PATCHes every common app with the current TOML body. bugpot
+replaces the spec and restarts the container only if anything
+actually changed (TOML projection equality short-circuit;
+unchanged apps don't flap). `name` and `subdomain` remain
+immutable — those rename via delete + re-add.
 
 ## Step 4 — app repo
 
@@ -173,7 +176,7 @@ release).
 | --- | --- |
 | Ops repo: TOML added | Registered + deploy token surfaced. |
 | Ops repo: TOML removed | App stopped + unregistered on bugpot. |
-| Ops repo: TOML edited | Drift warning only; PATCH not implemented yet. |
+| Ops repo: TOML edited | PATCH propagates the change; container restarts iff anything actually differs. `name` / `subdomain` edits are rejected. |
 | App repo: push to main | New image tag pulled + container restarted. |
 | Admin token leaks | Rotate `BUGPOT_ADMIN_TOKEN[_FILE]` + update the ops repo's secret. |
 | One deploy token leaks | Rotate `BUGPOT_DEPLOY_SECRET[_FILE]` (revokes **every** deploy token), or change the offending app's `name` / `repo` in the ops repo TOML (revokes that one). |

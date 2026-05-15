@@ -8,14 +8,16 @@ name: bugpot apply-config
 #   1. Snapshot bugpot's current registered apps.
 #   2. POST every local TOML that's not yet registered, then mint a
 #      deploy key for each newly-registered app.
-#   3. DELETE every registered app whose TOML has been removed from
+#   3. PATCH every TOML that's already registered (replace-style;
+#      bugpot's controller short-circuits to a no-op when the TOML
+#      projection equals the live spec, so unchanged apps don't
+#      flap their containers).
+#   4. DELETE every registered app whose TOML has been removed from
 #      the ops repo.
 #
-# Editing an existing TOML in-place is NOT auto-applied — the
-# `PATCH /apps/<name>` endpoint does not exist yet. Until it does,
-# the fix path is delete-then-re-add. Drift detection is intentionally
-# deferred to the same PR that adds PATCH so the warning carries an
-# action.
+# `name` and `subdomain` are immutable on bugpot's side; PATCH
+# rejects any attempt to change them. The fix path for a rename
+# remains delete-then-re-add.
 #
 # Image rollouts are NOT this workflow's job. Each app repo's own CI
 # uses the rollout workflow (separate PR) to call
@@ -46,6 +48,7 @@ on:
       result:
         description: >-
           JSON: `{registered: {name: deploy_token, ...},
+                  reconciled: [name, ...],
                   unregistered: [name, ...]}`.
         value: ${{ jobs.apply.outputs.result }}
 
@@ -90,6 +93,7 @@ jobs:
 
           register_new=$(comm -23 <(echo "$desired") <(echo "$current"))
           remove_old=$(comm -13 <(echo "$desired") <(echo "$current"))
+          common=$(comm -12 <(echo "$desired") <(echo "$current"))
 
           # --- Register new apps + mint deploy keys -------------------
           tokens_json='{}'
@@ -124,6 +128,36 @@ jobs:
             echo "::endgroup::"
           done
 
+          # --- Reconcile existing apps (PATCH) ------------------------
+          # bugpot's `PATCH /apps/<name>` is replace-style: send the
+          # full TOML and the controller no-ops if nothing changed
+          # (TOML projection equality short-circuit). So we can
+          # PATCH unconditionally for every common app — unchanged
+          # ones are cheap, changed ones get a fresh restart.
+          reconciled_json='[]'
+          for name in $common; do
+            [ -z "$name" ] && continue
+            toml_path="$CONFIG_DIR/$name.toml"
+            echo "::group::reconcile $name"
+            http_code=$(
+              curl -sS -o /tmp/resp -w '%{http_code}' \
+                -X PATCH \
+                -H "$AUTH_HEADER" \
+                -H 'Content-Type: application/toml' \
+                --data-binary "@$toml_path" \
+                "$ADMIN_URL/apps/$name"
+            )
+            if [ "$http_code" != "200" ]; then
+              echo "::error::PATCH /apps/$name failed: HTTP $http_code"
+              cat /tmp/resp
+              echo
+              exit 1
+            fi
+            reconciled_json=$(jq --arg n "$name" '. + [$n]' <<<"$reconciled_json")
+            echo "reconciled $name"
+            echo "::endgroup::"
+          done
+
           # --- Remove apps no longer in ops repo ----------------------
           unregistered_json='[]'
           for name in $remove_old; do
@@ -147,8 +181,9 @@ jobs:
           # --- Output ------------------------------------------------
           result=$(jq -n \
             --argjson reg "$tokens_json" \
+            --argjson rec "$reconciled_json" \
             --argjson unreg "$unregistered_json" \
-            '{registered: $reg, unregistered: $unreg}')
+            '{registered: $reg, reconciled: $rec, unregistered: $unreg}')
           # Pass through workflow_call outputs.
           {
             echo "result<<EOF"
@@ -161,8 +196,10 @@ jobs:
             echo "## bugpot apply-config"
             echo
             reg_count=$(jq 'length' <<<"$tokens_json")
+            rec_count=$(jq 'length' <<<"$reconciled_json")
             unreg_count=$(jq 'length' <<<"$unregistered_json")
             echo "- Registered: $reg_count"
+            echo "- Reconciled (PATCH): $rec_count"
             echo "- Unregistered: $unreg_count"
             echo
             if [ "$reg_count" -gt 0 ]; then

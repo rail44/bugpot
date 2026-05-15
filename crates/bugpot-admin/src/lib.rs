@@ -22,6 +22,7 @@
 //! - `POST   /apps`                  JSON body → `AppSpec`, returns 201 + `AppView`. Registers only — does not pull an image or start a container.
 //! - `GET    /apps`                  returns 200 + `[AppView]`
 //! - `GET    /apps/{name}`           returns 200 + `AppView`, or 404
+//! - `PATCH  /apps/{name}`           replace-style update of every mutable field; `name` and `subdomain` are immutable. 200 + `AppView`, or 404 / 400 / 409 / 500. Same body shape as POST (JSON or TOML); if the body's TOML projection equals the current spec the call is a no-op.
 //! - `DELETE /apps/{name}`           returns 204, or 404
 //!
 //! Rollout plane (frequent, deploy-token scoped):
@@ -63,7 +64,9 @@ use axum::{
     routing::{get, post},
 };
 use bugpot_config::{AppSpec, Rollout};
-use bugpot_controller::{AppController, AppView, DeployError, RemoveError, RolloutError};
+use bugpot_controller::{
+    AppController, AppView, DeployError, RemoveError, RolloutError, UpdateError,
+};
 use bugpot_egress::EgressOps;
 use bugpot_runtime::RuntimeOps;
 use serde::{Deserialize, Serialize};
@@ -252,7 +255,12 @@ where
     // scoped to a per-app credential instead.
     let admin_routes = Router::new()
         .route("/apps", post(deploy::<R, E>).get(list::<R, E>))
-        .route("/apps/{name}", get(get_one::<R, E>).delete(remove::<R, E>))
+        .route(
+            "/apps/{name}",
+            get(get_one::<R, E>)
+                .patch(update::<R, E>)
+                .delete(remove::<R, E>),
+        )
         .route("/apps/{name}/deploy-keys", post(issue_deploy_key::<R, E>))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -365,6 +373,46 @@ where
                 action = "register",
                 peer = %peer.ip(),
                 app = %audit_name,
+                repo = %audit_repo,
+                status = "error",
+                error = %e,
+            );
+            Err(e.into())
+        }
+    }
+}
+
+async fn update<R, E>(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(state): State<AdminState<R, E>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<AppView>, AdminError>
+where
+    R: RuntimeOps,
+    E: EgressOps,
+{
+    let spec = parse_app_spec(&headers, &body)?;
+    let audit_repo = spec.repo.clone();
+    match state.controller.update_app(&name, spec).await {
+        Ok(view) => {
+            info!(
+                target: "bugpot::audit",
+                action = "update",
+                peer = %peer.ip(),
+                app = %name,
+                repo = %audit_repo,
+                status = "ok",
+            );
+            Ok(Json(view))
+        }
+        Err(e) => {
+            warn!(
+                target: "bugpot::audit",
+                action = "update",
+                peer = %peer.ip(),
+                app = %name,
                 repo = %audit_repo,
                 status = "error",
                 error = %e,
@@ -586,6 +634,25 @@ impl From<RemoveError> for AdminError {
         let status = match &err {
             RemoveError::NotFound(_) => StatusCode::NOT_FOUND,
             RemoveError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        Self {
+            status,
+            message: format!("{err:#}"),
+        }
+    }
+}
+
+impl From<UpdateError> for AdminError {
+    fn from(err: UpdateError) -> Self {
+        let status = match &err {
+            UpdateError::NotFound(_) => StatusCode::NOT_FOUND,
+            UpdateError::InvalidSpec(_)
+            | UpdateError::NameImmutable
+            | UpdateError::SubdomainImmutable => StatusCode::BAD_REQUEST,
+            UpdateError::Conflict(_) => StatusCode::CONFLICT,
+            UpdateError::RestartFailed(_) | UpdateError::Internal(_) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
         };
         Self {
             status,
