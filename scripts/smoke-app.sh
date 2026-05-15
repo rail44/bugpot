@@ -12,7 +12,7 @@ cd "$(dirname "$0")/.."
 WORKDIR=$(pwd)
 
 APP_NAME=hello
-DOMAIN="${APP_NAME}.bugpot.ts.net"
+DOMAIN="${APP_NAME}.bugpot.example"
 LISTEN=127.0.0.1:8080
 IMAGE="gcr.io/google-samples/hello-app:1.0"
 

@@ -9,14 +9,12 @@
 #
 # Prereqs (one-time):
 #   1) /etc/sudoers.d/bugpot-dev has a NOPASSWD entry for this script.
-#   2) /etc/hosts has entries for the demo subdomains:
-#        127.0.0.1  alpha.bugpot.ts.net  beta.bugpot.ts.net
-#      (any subdomain of bugpot.ts.net is fine — just add it to /etc/hosts
-#       and bugpot will route it as long as a matching app spec exists.)
 #
 # After it's up, point your browser at:
-#   http://alpha.bugpot.ts.net:8080/
-#   http://beta.bugpot.ts.net:8080/
+#   http://alpha.localhost:8080/
+#   http://beta.localhost:8080/
+# (the `*.localhost` wildcard resolves to 127.0.0.1 on modern OSes; no
+# /etc/hosts edits required)
 #
 # Each cold start runs `oci-client` pull + libcontainer start (~3-5s the
 # first time, ~0.5-1s after the image is cached). After ~30s of no traffic
@@ -65,12 +63,9 @@ cat <<EOF
 
 == bugpot will listen on $LISTEN ==
 
-If you haven't already, add this to /etc/hosts:
-   127.0.0.1  alpha.bugpot.ts.net  beta.bugpot.ts.net
-
-Then in your browser:
-   http://alpha.bugpot.ts.net:8080/
-   http://beta.bugpot.ts.net:8080/
+In your browser:
+   http://alpha.localhost:8080/
+   http://beta.localhost:8080/
 
    First load ≈ 5s (image pull + container start).
    After ${IDLE} idle, the container auto-stops; next request restarts it.

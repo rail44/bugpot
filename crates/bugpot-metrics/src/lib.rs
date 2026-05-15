@@ -13,8 +13,8 @@
 //! - `GET /healthz` — `200 OK` while the listener is up.
 //!
 //! Auth is intentionally absent. The metrics listener should bind to a
-//! trusted interface (loopback for dev, a Tailscale IP with ACL for
-//! anything more).
+//! trusted interface (loopback for dev, or whatever private network the
+//! operator scrapes from in production).
 
 use std::net::SocketAddr;
 use std::time::Duration;

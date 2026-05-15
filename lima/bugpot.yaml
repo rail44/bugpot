@@ -37,8 +37,9 @@ mounts:
   writable: true
 
 # bugpot listens on 127.0.0.1:8080 inside the VM. Forward it to the same
-# address on the host so `curl http://alpha.bugpot.ts.net:8080/` works from
-# macOS once /etc/hosts has the demo subdomains pointed at 127.0.0.1.
+# address on the host so `curl http://alpha.localhost:8080/` works from
+# macOS (the `*.localhost` wildcard resolves to 127.0.0.1, no /etc/hosts
+# edits needed).
 portForwards:
 - guestPort: 8080
   hostPort: 8080
@@ -73,16 +74,6 @@ provision:
     kernel.kptr_restrict = 0
     EOF
     sysctl -p /etc/sysctl.d/99-bugpot-perf.conf
-- mode: system
-  # Install tailscale (tailscaled service is started but the node is not
-  # yet authenticated). Run `sudo tailscale up …` interactively after
-  # `limactl start` to join your tailnet.
-  script: |
-    #!/bin/sh
-    set -eux
-    if ! command -v tailscale >/dev/null 2>&1; then
-      curl -fsSL https://tailscale.com/install.sh | sh
-    fi
 - mode: user
   script: |
     #!/bin/sh

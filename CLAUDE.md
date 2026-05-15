@@ -173,104 +173,26 @@ as siblings of `bugpot-admin`; the public mutation API on
 `AppController` (`deploy_app` / `remove_app` / `list_apps` / `get_app`)
 is the shared boundary.
 
-## Exposing apps on a tailnet (Tailscale Services)
+## Exposing apps externally
 
-For dogfooding on a real tailnet, bugpot integrates with **Tailscale
-Services** (the 2026 feature that gives each registered service its own
-`<service>.<tailnet>.ts.net` URL with automatic TLS). bugpot itself
-contains no Tailscale code — exposure is configured externally via the
-`tailscale serve` CLI on the bugpot host. Phase 1 is fully manual;
-automating registration from `deploy_app` is a deferred follow-up.
+bugpot's responsibility ends at binding the public router on
+`BUGPOT_LISTEN` and the admin API on `BUGPOT_ADMIN_LISTEN`. Making
+either reachable from outside the host (TLS termination, public DNS,
+tailnet, reverse proxy, etc.) is the operator's concern; bugpot
+itself ships no integration with any specific reachability layer.
 
-### One-time host setup
+Common patterns operators use:
 
-```sh
-# Join the tailnet (operator-supplied auth).
-curl -fsSL https://tailscale.com/install.sh | sh
-sudo tailscale up --advertise-tags=tag:bugpot
-```
+- Tailscale Services / `tailscale serve` mapping a tailnet URL to
+  `localhost:8080` / `localhost:8081`.
+- A TLS-terminating reverse proxy (Caddy, nginx) in front of the
+  router and admin listeners.
+- Self-hosted GitHub Actions runner on the bugpot host so CI reaches
+  admin via `localhost` without crossing the public internet.
 
-Then enable HTTPS in the Tailscale admin console (DNS → HTTPS
-Certificates → Enable). This authorises `*.ts.net` cert provisioning
-for every device in the tailnet.
-
-### Expose the admin API as a Service
-
-For CI to call `POST /apps` over the tailnet, the admin port also gets
-its own Service. (Service host devices cannot access their own
-Services — this also keeps operator-local access and CI access on
-different paths.)
-
-```sh
-sudo tailscale serve --service=svc:bugpot-admin --bg http://localhost:8081
-```
-
-Admin is then reachable from any other tailnet device at
-`https://bugpot-admin.<tailnet>.ts.net/apps` with TLS provisioned by
-Tailscale automatically.
-
-### Per-app Service registration
-
-For each app subdomain you want reachable from the tailnet, register a
-Service whose name **matches** the app's subdomain (the part bugpot's
-`subdomain_of` extracts from the `Host` header):
-
-```sh
-# Example: app TOML has subdomain = "alpha" (default = name).
-sudo tailscale serve --service=svc:alpha --bg http://localhost:8080
-sudo tailscale serve --service=svc:beta  --bg http://localhost:8080
-```
-
-Both Services proxy to bugpot's router on `127.0.0.1:8080`. The Host
-header that arrives at bugpot is `<service>.<tailnet>.ts.net`, so
-`subdomain_of` extracts `<service>` and routes to the matching app.
-**Names must align**: `tailscale serve --service=svc:alpha …` ↔ app
-spec `name = "alpha"` (or `subdomain = "alpha"`).
-
-### CI deploy flow
-
-`examples/github-actions-deploy.yml` is a copy-pasteable workflow for an
-**application repo** that builds, pushes to GHCR, joins the tailnet via
-`tailscale/github-action@v4`, and `POST`s the new spec to bugpot's admin
-Service. Required secrets in the application repo:
-
-- `TS_OAUTH_CLIENT_ID` / `TS_OAUTH_SECRET` — Tailscale OAuth client with
-  `devices:core:write` and `tag:bugpot-ci`
-- `BUGPOT_ADMIN_TOKEN` — bearer token from the bugpot host's
-  `/etc/bugpot/admin-token`
-- (`GHCR_PAT`) — only needed if the org disables packages:write on
-  `GITHUB_TOKEN`
-
-### Verifying end-to-end
-
-Checklist for confirming a fresh tailnet deploy resolves all the way
-through to a container:
-
-1. `tailscale status` on the bugpot host: device shows as online, tags
-   include `tag:bugpot`.
-2. `sudo tailscale serve status` lists `svc:bugpot-admin` (and any
-   per-app Services).
-3. From a *second* tailnet device:
-   `curl -fsS -H "Authorization: Bearer $TOKEN" https://bugpot-admin.<tailnet>.ts.net/apps`
-   returns `200` + the current app list.
-4. Trigger the deploy workflow (push to main, or
-   `gh workflow run deploy.yml`); job log shows `DELETE` (`404` first
-   time) and `POST` (`201` with `AppView`).
-5. `curl -fsS https://<APP_NAME>.<tailnet>.ts.net/` from the second
-   device returns the app's HTTP response. First request triggers TLS
-   provisioning and can take ~30 s.
-6. `journalctl` on the bugpot host shows
-   `bugpot_router: matched route host=<APP_NAME>.<tailnet>.ts.net`.
-
-### Phase 2 (deferred): automated Service registration
-
-Eventually `AppController::deploy_app` could shell out to
-`tailscale serve --service=svc:<name> --bg …` after a successful
-deploy, and the inverse on `remove_app`. Gated behind an env
-(e.g. `BUGPOT_TAILSCALE_SERVICES=on`) so non-Tailscale topologies stay
-unchanged. Not in this iteration — the manual path is enough for
-dogfooding and exposes operational gotchas (e.g. Service host
-self-access restriction) before they get hidden behind automation.
+Whichever path an operator picks, set `RouterConfig::trusted_proxies`
+to the IP range of the front layer so `X-Forwarded-For` rewriting
+works correctly.
 
 ## Architecture
 
@@ -300,7 +222,7 @@ cmd/bugpot (main: wires everything; no business logic)
 
 ### Router defences
 
-Sized against a public-internet client, not the tailnet — Tailscale is a deployment convenience, never a trust boundary. The router applies (constants in `crates/bugpot-router/src/lib.rs`):
+Sized against a public-internet client. Whatever reachability layer the operator picks in front of bugpot is a deployment convenience, never a trust boundary. The router applies (constants in `crates/bugpot-router/src/lib.rs`):
 
 - Request-side: `MAX_BODY_BYTES` (10 MiB inbound cap), `HEADER_READ_TIMEOUT` (10 s slowloris guard), `REQUEST_TIMEOUT` (30 s time-to-headers cap), `MAX_CONCURRENT_REQUESTS` (1024 in-flight via `tower::ConcurrencyLimitLayer`).
 - Response-side: every response body is wrapped in `GuardedBody`, which enforces `RESPONSE_FRAME_TIMEOUT` (1 min per-frame idle — closes slow-reading clients) and `MAX_RESPONSE_BODY_BYTES` (1 GiB total — stops runaway upstream payloads from monopolising a connection or host bandwidth).

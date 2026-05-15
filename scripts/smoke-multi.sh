@@ -121,17 +121,17 @@ fetch_and_assert() {
     fi
 }
 
-fetch_and_assert "alpha.bugpot.ts.net" "alpha"
-fetch_and_assert "beta.bugpot.ts.net"  "beta"
+fetch_and_assert "alpha.bugpot.example" "alpha"
+fetch_and_assert "beta.bugpot.example"  "beta"
 
 # Round-trip a few more times to confirm each subdomain is sticky.
 echo
 echo "=== sanity: 3x alpha + 3x beta ==="
 for _ in 1 2 3; do
-    fetch_and_assert "alpha.bugpot.ts.net" "alpha"
+    fetch_and_assert "alpha.bugpot.example" "alpha"
 done
 for _ in 1 2 3; do
-    fetch_and_assert "beta.bugpot.ts.net" "beta"
+    fetch_and_assert "beta.bugpot.example" "beta"
 done
 
 echo
