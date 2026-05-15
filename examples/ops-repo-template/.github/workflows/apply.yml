@@ -1,0 +1,42 @@
+name: Apply bugpot config
+
+# Drop this file into your ops repo at `.github/workflows/apply.yml`.
+#
+# What it does: on every push to `main` (= every merged PR that
+# changes the app config), call bugpot's reusable apply-config
+# workflow. New apps get registered + a deploy token surfaced in the
+# job summary; apps removed from the repo get unregistered.
+#
+# Required repo configuration (Settings → Secrets and variables →
+# Actions):
+#
+#   variables:
+#     BUGPOT_ADMIN_URL  e.g. http://bugpot.internal:8081
+#                       (must be reachable from your runner)
+#   secrets:
+#     BUGPOT_ADMIN_TOKEN  the bearer token from your bugpot host's
+#                         BUGPOT_ADMIN_TOKEN[_FILE]
+
+on:
+  push:
+    branches: [main]
+  # Allow manual re-runs so an operator can reconcile after editing a
+  # secret or fixing a transient admin-API outage.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  apply:
+    # Pin to a tag once bugpot starts publishing them. While bugpot is
+    # pre-1.0, `@main` is the pragmatic choice; it does mean every
+    # apply picks up workflow changes too.
+    uses: rail44/bugpot/.github/workflows/apply-config.yml@main
+    with:
+      admin_url: ${{ vars.BUGPOT_ADMIN_URL }}
+      # `apps/` is the default; override here if your repo uses a
+      # different layout.
+      # config_dir: apps
+    secrets:
+      BUGPOT_ADMIN_TOKEN: ${{ secrets.BUGPOT_ADMIN_TOKEN }}

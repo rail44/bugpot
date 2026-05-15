@@ -1,0 +1,179 @@
+name: bugpot apply-config
+
+# Reusable workflow for the ops repo that owns bugpot app configs.
+#
+# The caller stores one `<name>.toml` per app under a directory
+# (default `apps/`). On invocation we:
+#
+#   1. Snapshot bugpot's current registered apps.
+#   2. POST every local TOML that's not yet registered, then mint a
+#      deploy key for each newly-registered app.
+#   3. DELETE every registered app whose TOML has been removed from
+#      the ops repo.
+#
+# Editing an existing TOML in-place is NOT auto-applied — the
+# `PATCH /apps/<name>` endpoint does not exist yet. Until it does,
+# the fix path is delete-then-re-add. Drift detection is intentionally
+# deferred to the same PR that adds PATCH so the warning carries an
+# action.
+#
+# Image rollouts are NOT this workflow's job. Each app repo's own CI
+# uses the rollout workflow (separate PR) to call
+# `POST /apps/<name>/rollouts`.
+
+on:
+  workflow_call:
+    inputs:
+      admin_url:
+        description: >-
+          Base URL of bugpot's admin API (no trailing slash).
+          e.g. `http://bugpot.internal:8081` or
+          `https://bugpot-admin.example.org`.
+        required: true
+        type: string
+      config_dir:
+        description: >-
+          Directory in the caller repo holding `<name>.toml` files.
+          Default: `apps`.
+        required: false
+        type: string
+        default: apps
+    secrets:
+      BUGPOT_ADMIN_TOKEN:
+        description: Admin bearer token for bugpot's admin API.
+        required: true
+    outputs:
+      result:
+        description: >-
+          JSON: `{registered: {name: deploy_token, ...},
+                  unregistered: [name, ...]}`.
+        value: ${{ jobs.apply.outputs.result }}
+
+permissions:
+  contents: read
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    outputs:
+      result: ${{ steps.apply.outputs.result }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply config
+        id: apply
+        env:
+          ADMIN_URL: ${{ inputs.admin_url }}
+          CONFIG_DIR: ${{ inputs.config_dir }}
+          BUGPOT_ADMIN_TOKEN: ${{ secrets.BUGPOT_ADMIN_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -d "$CONFIG_DIR" ]; then
+            echo "::error::config_dir '$CONFIG_DIR' not found"
+            exit 1
+          fi
+
+          AUTH_HEADER="Authorization: Bearer $BUGPOT_ADMIN_TOKEN"
+
+          # --- Snapshot current ---------------------------------------
+          current_json=$(curl -fsS -H "$AUTH_HEADER" "$ADMIN_URL/apps")
+          current=$(jq -r '.[].name' <<<"$current_json" | sort -u)
+
+          # --- Read desired (one TOML per app) ------------------------
+          desired=$(
+            find "$CONFIG_DIR" -maxdepth 1 -name '*.toml' -printf '%f\n' \
+              | sed 's/\.toml$//' \
+              | sort -u
+          )
+
+          register_new=$(comm -23 <(echo "$desired") <(echo "$current"))
+          remove_old=$(comm -13 <(echo "$desired") <(echo "$current"))
+
+          # --- Register new apps + mint deploy keys -------------------
+          tokens_json='{}'
+          for name in $register_new; do
+            [ -z "$name" ] && continue
+            toml_path="$CONFIG_DIR/$name.toml"
+
+            echo "::group::register $name"
+            http_code=$(
+              curl -sS -o /tmp/resp -w '%{http_code}' \
+                -X POST \
+                -H "$AUTH_HEADER" \
+                -H 'Content-Type: application/toml' \
+                --data-binary "@$toml_path" \
+                "$ADMIN_URL/apps"
+            )
+            if [ "$http_code" != "201" ]; then
+              echo "::error::POST /apps failed for $name: HTTP $http_code"
+              cat /tmp/resp
+              echo
+              exit 1
+            fi
+            echo "registered $name"
+
+            key_json=$(
+              curl -fsS -X POST -H "$AUTH_HEADER" \
+                "$ADMIN_URL/apps/$name/deploy-keys"
+            )
+            token=$(jq -r '.token' <<<"$key_json")
+            tokens_json=$(jq --arg n "$name" --arg t "$token" \
+              '. + {($n): $t}' <<<"$tokens_json")
+            echo "::endgroup::"
+          done
+
+          # --- Remove apps no longer in ops repo ----------------------
+          unregistered_json='[]'
+          for name in $remove_old; do
+            [ -z "$name" ] && continue
+            echo "::group::unregister $name"
+            http_code=$(
+              curl -sS -o /tmp/resp -w '%{http_code}' \
+                -X DELETE -H "$AUTH_HEADER" \
+                "$ADMIN_URL/apps/$name"
+            )
+            if [ "$http_code" != "204" ] && [ "$http_code" != "404" ]; then
+              echo "::error::DELETE /apps/$name failed: HTTP $http_code"
+              cat /tmp/resp
+              exit 1
+            fi
+            unregistered_json=$(jq --arg n "$name" '. + [$n]' <<<"$unregistered_json")
+            echo "unregistered $name"
+            echo "::endgroup::"
+          done
+
+          # --- Output ------------------------------------------------
+          result=$(jq -n \
+            --argjson reg "$tokens_json" \
+            --argjson unreg "$unregistered_json" \
+            '{registered: $reg, unregistered: $unreg}')
+          # Pass through workflow_call outputs.
+          {
+            echo "result<<EOF"
+            echo "$result"
+            echo "EOF"
+          } >>"$GITHUB_OUTPUT"
+
+          # --- Step summary (human-readable) -------------------------
+          {
+            echo "## bugpot apply-config"
+            echo
+            reg_count=$(jq 'length' <<<"$tokens_json")
+            unreg_count=$(jq 'length' <<<"$unregistered_json")
+            echo "- Registered: $reg_count"
+            echo "- Unregistered: $unreg_count"
+            echo
+            if [ "$reg_count" -gt 0 ]; then
+              echo "### New deploy keys"
+              echo
+              echo "Save each token into the matching app repo as the"
+              echo "secret \`BUGPOT_DEPLOY_TOKEN\` so its rollout workflow can use it."
+              echo
+              echo '| app | deploy token |'
+              echo '|---|---|'
+              jq -r 'to_entries[] | "| \(.key) | `\(.value)` |"' <<<"$tokens_json"
+              echo
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"
