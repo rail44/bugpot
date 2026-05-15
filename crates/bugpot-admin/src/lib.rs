@@ -291,15 +291,54 @@ async fn handle_rate_limit_error(err: BoxError) -> Response {
     .into_response()
 }
 
+/// Parse an `AppSpec` from a request body, dispatching on
+/// `Content-Type`:
+///
+/// - `application/toml` (or `text/toml`) → decoded as TOML so the
+///   ops repo's TOML files can be `POST`ed directly with
+///   `curl --data-binary @alpha.toml`.
+/// - Anything else (including no header) → decoded as JSON. The
+///   default kept matching legacy admin clients without an
+///   explicit `Content-Type`.
+fn parse_app_spec(headers: &HeaderMap, body: &[u8]) -> Result<AppSpec, AdminError> {
+    let ct = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    // `application/toml` is the IANA-registered form (RFC 9707);
+    // `text/toml` was used informally before that and is still
+    // produced by some tools. Match both, parameter-tolerant.
+    let media_type = ct.split(';').next().unwrap_or("").trim();
+    if media_type.eq_ignore_ascii_case("application/toml")
+        || media_type.eq_ignore_ascii_case("text/toml")
+    {
+        let s = std::str::from_utf8(body).map_err(|_| AdminError {
+            status: StatusCode::BAD_REQUEST,
+            message: "TOML body must be UTF-8".to_owned(),
+        })?;
+        toml::from_str::<AppSpec>(s).map_err(|e| AdminError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("invalid TOML body: {e}"),
+        })
+    } else {
+        serde_json::from_slice::<AppSpec>(body).map_err(|e| AdminError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("invalid JSON body: {e}"),
+        })
+    }
+}
+
 async fn deploy<R, E>(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<AdminState<R, E>>,
-    Json(spec): Json<AppSpec>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
 ) -> Result<(StatusCode, Json<AppView>), AdminError>
 where
     R: RuntimeOps,
     E: EgressOps,
 {
+    let spec = parse_app_spec(&headers, &body)?;
     // Capture what we know up-front so the audit entry stays useful
     // even when validation rejects the spec before a name lands in
     // the controller's maps.
@@ -678,5 +717,91 @@ mod tests {
         assert_eq!(nf.status, StatusCode::NOT_FOUND);
         let internal: AdminError = RemoveError::Internal(anyhow!("io")).into();
         assert_eq!(internal.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    fn ct(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_str(value).unwrap(),
+        );
+        h
+    }
+
+    #[test]
+    fn parse_app_spec_accepts_json_by_default() {
+        let body = br#"{"repo":"ghcr.io/owner/x","port":8080,"name":"alpha"}"#;
+        let spec = parse_app_spec(&HeaderMap::new(), body).expect("json default");
+        assert_eq!(spec.repo, "ghcr.io/owner/x");
+        assert_eq!(spec.name.as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn parse_app_spec_accepts_explicit_json() {
+        let body = br#"{"repo":"ghcr.io/owner/x","port":8080,"name":"alpha"}"#;
+        let spec = parse_app_spec(&ct("application/json"), body).expect("explicit json");
+        assert_eq!(spec.repo, "ghcr.io/owner/x");
+    }
+
+    #[test]
+    fn parse_app_spec_accepts_toml() {
+        let body = br#"
+            repo = "ghcr.io/owner/x"
+            port = 8080
+            name = "alpha"
+        "#;
+        let spec = parse_app_spec(&ct("application/toml"), body).expect("application/toml");
+        assert_eq!(spec.repo, "ghcr.io/owner/x");
+        assert_eq!(spec.name.as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn parse_app_spec_accepts_text_toml_alias() {
+        let body = br#"
+            repo = "ghcr.io/owner/x"
+            port = 8080
+            name = "alpha"
+        "#;
+        let spec = parse_app_spec(&ct("text/toml"), body).expect("text/toml");
+        assert_eq!(spec.repo, "ghcr.io/owner/x");
+    }
+
+    #[test]
+    fn parse_app_spec_strips_content_type_parameters() {
+        let body = br#"
+            repo = "ghcr.io/owner/x"
+            port = 8080
+            name = "alpha"
+        "#;
+        let spec = parse_app_spec(&ct("application/toml; charset=utf-8"), body)
+            .expect("toml with charset param");
+        assert_eq!(spec.repo, "ghcr.io/owner/x");
+    }
+
+    #[test]
+    fn parse_app_spec_rejects_invalid_toml_with_400() {
+        let body = b"this = is = not = valid toml";
+        let err = parse_app_spec(&ct("application/toml"), body).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("invalid TOML"), "got {}", err.message);
+    }
+
+    #[test]
+    fn parse_app_spec_rejects_invalid_json_with_400() {
+        let body = b"{this is not json}";
+        let err = parse_app_spec(&HeaderMap::new(), body).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("invalid JSON"), "got {}", err.message);
+    }
+
+    /// The defensive path: a `Content-Type: application/toml` header
+    /// on a body that isn't valid UTF-8 must not panic the parser.
+    #[test]
+    fn parse_app_spec_rejects_non_utf8_toml_body() {
+        // 0xFF is invalid as a leading UTF-8 byte.
+        let body: &[u8] = &[0xff, 0xfe];
+        let err = parse_app_spec(&ct("application/toml"), body).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("UTF-8"), "got {}", err.message);
     }
 }

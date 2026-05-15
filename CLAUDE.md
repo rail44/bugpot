@@ -153,20 +153,37 @@ global rate limit (returns `429 Too Many Requests` when exceeded), so
 brute-forcing the token over the network is infeasible even if a
 weak token is configured.
 
-| Method | Path           | Body / Response                                    |
-|--------|----------------|----------------------------------------------------|
-| POST   | `/apps`        | JSON `AppSpec` in, `201` + `AppView`. Pulls image immediately; persists `apps/<name>.toml` only on success. |
-| GET    | `/apps`        | `200` + `[AppView]`                                |
-| GET    | `/apps/{name}` | `200` + `AppView`, `404` if absent                 |
-| DELETE | `/apps/{name}` | `204` on stop+remove, `404` if absent              |
+Config plane (admin token):
 
-Error → status mapping:
+| Method | Path                          | Body / Response                                    |
+|--------|-------------------------------|----------------------------------------------------|
+| POST   | `/apps`                       | `AppSpec` in (JSON by default; `Content-Type: application/toml` accepts the on-disk TOML form), `201` + `AppView`. Registers only — does NOT pull an image or start a container. |
+| GET    | `/apps`                       | `200` + `[AppView]`                                |
+| GET    | `/apps/{name}`                | `200` + `AppView`, `404` if absent                 |
+| DELETE | `/apps/{name}`                | `204` on stop+remove, `404` if absent              |
+| POST   | `/apps/{name}/deploy-keys`    | `201` + `{token: "bp1.<hex>"}`. The token authorises this app's rollout endpoints only. |
 
-- `400` missing `name`
+Rollout plane (per-app deploy token):
+
+| Method | Path                          | Body / Response                                    |
+|--------|-------------------------------|----------------------------------------------------|
+| POST   | `/apps/{name}/rollouts`       | JSON `{tag}`. Pulls and (re)starts the container. `201` + `Rollout`. |
+| GET    | `/apps/{name}/rollouts`       | `200` + `[Rollout]` (oldest first, current last).  |
+
+Error → status mapping (POST/PATCH/DELETE `/apps`):
+
+- `400` missing `name`, invalid spec, malformed JSON / TOML body
 - `404` not found
 - `409` name or subdomain already in use
-- `502` image pull failed (registry unreachable / auth wrong)
-- `500` other internal errors
+- `500` internal errors
+
+Rollout endpoint (`/apps/{name}/rollouts`):
+
+- `400` empty tag
+- `404` app not registered
+- `409` app is mid-transition (Starting/Stopping); retry
+- `502` registry auth / pull failure
+- `500` post-pull start failure or internal error
 
 Adapter crates (webhook receiver, GitHub poller, CLI) can be added later
 as siblings of `bugpot-admin`; the public mutation API on
