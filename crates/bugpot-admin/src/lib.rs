@@ -1,5 +1,15 @@
 //! HTTP admin adapter for bugpot.
 //!
+//! Two auth scopes live side by side here:
+//!
+//! - **Admin token** (`BUGPOT_ADMIN_TOKEN[_FILE]`): full config-plane
+//!   access — register / view / remove apps and mint per-app deploy
+//!   keys.
+//! - **Deploy token** (`bp1.<hex>`, derived from
+//!   `BUGPOT_DEPLOY_SECRET[_FILE]`): scoped to one app's rollout
+//!   plane — `POST/GET /apps/<name>/rollouts` only. See
+//!   [`deploy_key`] for the HMAC derivation and verification rules.
+//!
 //! Translates HTTP requests to mutations on [`bugpot_controller::AppController`].
 //! This crate is one of several possible deploy frontends (future: webhook
 //! receiver, GitHub poller, CLI over Unix socket); each translates an
@@ -14,8 +24,7 @@
 //! - `GET    /apps/{name}`           returns 200 + `AppView`, or 404
 //! - `DELETE /apps/{name}`           returns 204, or 404
 //!
-//! Rollout plane (frequent, same admin token for now — a per-app
-//! deploy token lands in a follow-up):
+//! Rollout plane (frequent, deploy-token scoped):
 //!
 //! - `POST   /apps/{name}/rollouts`  JSON `{tag}`, returns 201 + `Rollout`. Pulls and (re)starts the container.
 //! - `GET    /apps/{name}/rollouts`  returns 200 + `[Rollout]` (oldest first, current last)
@@ -47,7 +56,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use axum::{
     BoxError, Json, Router,
     error_handling::HandleErrorLayer,
-    extract::{ConnectInfo, Path, Request, State},
+    extract::{ConnectInfo, FromRequestParts, Path, Request, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -64,6 +73,9 @@ use tower::limit::RateLimitLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tracing::{info, warn};
 use zeroize::Zeroizing;
+
+pub mod deploy_key;
+pub use deploy_key::DeployKeySecret;
 
 /// Maximum POST body size for `POST /apps`. `AppSpec` JSON is usually
 /// well under 1 KB; the cap stops the `env` map from being weaponised
@@ -113,12 +125,78 @@ impl AdminAuth {
     }
 }
 
-async fn require_token(
-    State(auth): State<Arc<AdminAuth>>,
+/// Combined state passed to every handler / middleware.
+///
+/// Bundling these together lets one merged router cover both auth
+/// scopes (admin token + deploy token) without the State-type
+/// juggling that arises from per-route `.with_state(...)`.
+#[derive(Debug)]
+pub struct AdminState<R: RuntimeOps, E: EgressOps> {
+    pub controller: Arc<AppController<R, E>>,
+    pub admin_auth: Arc<AdminAuth>,
+    pub deploy_secret: Arc<DeployKeySecret>,
+}
+
+impl<R, E> Clone for AdminState<R, E>
+where
+    R: RuntimeOps,
+    E: EgressOps,
+{
+    fn clone(&self) -> Self {
+        Self {
+            controller: self.controller.clone(),
+            admin_auth: self.admin_auth.clone(),
+            deploy_secret: self.deploy_secret.clone(),
+        }
+    }
+}
+
+async fn require_admin_token<R, E>(
+    State(state): State<AdminState<R, E>>,
     req: Request,
     next: Next,
-) -> Result<Response, StatusCode> {
-    auth.check(req.headers())?;
+) -> Result<Response, StatusCode>
+where
+    R: RuntimeOps,
+    E: EgressOps,
+{
+    state.admin_auth.check(req.headers())?;
+    Ok(next.run(req).await)
+}
+
+/// Path-aware deploy-token check: extracts `{name}` from the
+/// matched route, looks up the app's current `repo`, and verifies
+/// the Bearer token against the per-app HMAC. A miss at any step
+/// returns 401 with no detail, so the verdict reveals nothing
+/// about app existence or token shape.
+async fn require_deploy_token<R, E>(
+    State(state): State<AdminState<R, E>>,
+    req: Request,
+    next: Next,
+) -> Result<Response, StatusCode>
+where
+    R: RuntimeOps,
+    E: EgressOps,
+{
+    let (mut parts, body) = req.into_parts();
+    let Path(name) = Path::<String>::from_request_parts(&mut parts, &state)
+        .await
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let presented = parts
+        .headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    let view = state
+        .controller
+        .get_app(&name)
+        .await
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    if !state.deploy_secret.verify(presented, &name, &view.repo) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let req = Request::from_parts(parts, body);
     Ok(next.run(req).await)
 }
 
@@ -126,13 +204,19 @@ async fn require_token(
 pub async fn serve<R, E>(
     addr: SocketAddr,
     controller: Arc<AppController<R, E>>,
-    auth: Arc<AdminAuth>,
+    admin_auth: Arc<AdminAuth>,
+    deploy_secret: Arc<DeployKeySecret>,
 ) -> anyhow::Result<()>
 where
     R: RuntimeOps,
     E: EgressOps,
 {
-    let app = router(controller, auth);
+    let state = AdminState {
+        controller,
+        admin_auth,
+        deploy_secret,
+    };
+    let app = router(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!(%addr, "bugpot-admin listening");
     // `into_make_service_with_connect_info` exposes the peer's
@@ -147,7 +231,7 @@ where
     Ok(())
 }
 
-fn router<R, E>(controller: Arc<AppController<R, E>>, auth: Arc<AdminAuth>) -> Router
+fn router<R, E>(state: AdminState<R, E>) -> Router
 where
     R: RuntimeOps,
     E: EgressOps,
@@ -162,18 +246,35 @@ where
         .buffer(32)
         .layer(RateLimitLayer::new(RATE_LIMIT_REQUESTS, RATE_LIMIT_PERIOD));
 
-    Router::new()
+    // Two route groups, each with its own auth middleware. Merging
+    // them rather than layering one global middleware lets the
+    // rollout routes skip the admin-token check entirely — they're
+    // scoped to a per-app credential instead.
+    let admin_routes = Router::new()
         .route("/apps", post(deploy::<R, E>).get(list::<R, E>))
         .route("/apps/{name}", get(get_one::<R, E>).delete(remove::<R, E>))
+        .route("/apps/{name}/deploy-keys", post(issue_deploy_key::<R, E>))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_admin_token::<R, E>,
+        ));
+
+    let rollout_routes = Router::new()
         .route(
             "/apps/{name}/rollouts",
             post(roll_out::<R, E>).get(list_rollouts::<R, E>),
         )
-        .with_state(controller)
-        // Auth runs first (innermost layer) so unauthorised requests
-        // don't burn a rate-limit slot. Body limit + rate limit are
-        // outermost — they protect the auth comparison itself.
-        .layer(middleware::from_fn_with_state(auth, require_token))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_deploy_token::<R, E>,
+        ));
+
+    Router::new()
+        .merge(admin_routes)
+        .merge(rollout_routes)
+        .with_state(state)
+        // Body limit + rate limit are outermost — they protect both
+        // auth comparisons themselves.
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         .layer(throttle)
 }
@@ -192,7 +293,7 @@ async fn handle_rate_limit_error(err: BoxError) -> Response {
 
 async fn deploy<R, E>(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    State(controller): State<Arc<AppController<R, E>>>,
+    State(state): State<AdminState<R, E>>,
     Json(spec): Json<AppSpec>,
 ) -> Result<(StatusCode, Json<AppView>), AdminError>
 where
@@ -204,7 +305,7 @@ where
     // the controller's maps.
     let audit_name = spec.name.clone().unwrap_or_else(|| "<unnamed>".to_owned());
     let audit_repo = spec.repo.clone();
-    match controller.deploy_app(spec).await {
+    match state.controller.deploy_app(spec).await {
         Ok(view) => {
             info!(
                 target: "bugpot::audit",
@@ -241,7 +342,7 @@ struct RolloutBody {
 
 async fn roll_out<R, E>(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    State(controller): State<Arc<AppController<R, E>>>,
+    State(state): State<AdminState<R, E>>,
     Path(name): Path<String>,
     Json(body): Json<RolloutBody>,
 ) -> Result<(StatusCode, Json<Rollout>), AdminError>
@@ -250,7 +351,7 @@ where
     E: EgressOps,
 {
     let audit_tag = body.tag.clone();
-    match controller.set_rollout(&name, body.tag).await {
+    match state.controller.set_rollout(&name, body.tag).await {
         Ok(rollout) => {
             info!(
                 target: "bugpot::audit",
@@ -278,14 +379,15 @@ where
 }
 
 async fn list_rollouts<R, E>(
-    State(controller): State<Arc<AppController<R, E>>>,
+    State(state): State<AdminState<R, E>>,
     Path(name): Path<String>,
 ) -> Result<Json<Vec<Rollout>>, AdminError>
 where
     R: RuntimeOps,
     E: EgressOps,
 {
-    controller
+    state
+        .controller
         .list_rollouts(&name)
         .await
         .map(Json)
@@ -295,16 +397,57 @@ where
         })
 }
 
+#[derive(Debug, Serialize)]
+struct DeployKeyResponse {
+    /// Wire-format deploy token (`bp1.<hex>`). Bearer this in
+    /// `Authorization` against `/apps/<name>/rollouts`.
+    token: String,
+}
+
+async fn issue_deploy_key<R, E>(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(state): State<AdminState<R, E>>,
+    Path(name): Path<String>,
+) -> Result<(StatusCode, Json<DeployKeyResponse>), AdminError>
+where
+    R: RuntimeOps,
+    E: EgressOps,
+{
+    let Some(view) = state.controller.get_app(&name).await else {
+        warn!(
+            target: "bugpot::audit",
+            action = "issue_deploy_key",
+            peer = %peer.ip(),
+            app = %name,
+            status = "error",
+            error = "not found",
+        );
+        return Err(AdminError {
+            status: StatusCode::NOT_FOUND,
+            message: format!("app '{name}' not found"),
+        });
+    };
+    let token = state.deploy_secret.derive(&name, &view.repo);
+    info!(
+        target: "bugpot::audit",
+        action = "issue_deploy_key",
+        peer = %peer.ip(),
+        app = %name,
+        status = "ok",
+    );
+    Ok((StatusCode::CREATED, Json(DeployKeyResponse { token })))
+}
+
 async fn remove<R, E>(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    State(controller): State<Arc<AppController<R, E>>>,
+    State(state): State<AdminState<R, E>>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, AdminError>
 where
     R: RuntimeOps,
     E: EgressOps,
 {
-    match controller.remove_app(&name).await {
+    match state.controller.remove_app(&name).await {
         Ok(()) => {
             info!(
                 target: "bugpot::audit",
@@ -329,23 +472,24 @@ where
     }
 }
 
-async fn list<R, E>(State(controller): State<Arc<AppController<R, E>>>) -> Json<Vec<AppView>>
+async fn list<R, E>(State(state): State<AdminState<R, E>>) -> Json<Vec<AppView>>
 where
     R: RuntimeOps,
     E: EgressOps,
 {
-    Json(controller.list_apps().await)
+    Json(state.controller.list_apps().await)
 }
 
 async fn get_one<R, E>(
-    State(controller): State<Arc<AppController<R, E>>>,
+    State(state): State<AdminState<R, E>>,
     Path(name): Path<String>,
 ) -> Result<Json<AppView>, AdminError>
 where
     R: RuntimeOps,
     E: EgressOps,
 {
-    controller
+    state
+        .controller
         .get_app(&name)
         .await
         .map(Json)
