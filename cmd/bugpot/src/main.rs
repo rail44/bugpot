@@ -293,9 +293,13 @@ fn spawn_admin<R: RuntimeOps, E: EgressOps>(
     let token = read_admin_token()?;
     let admin_auth = Arc::new(AdminAuth::from_token(token));
     info!("admin API bearer token loaded");
+    let deploy_secret = Arc::new(read_deploy_secret()?);
+    info!("deploy-key secret loaded");
     let admin_controller = Arc::clone(controller);
     Ok(tokio::spawn(async move {
-        if let Err(e) = bugpot_admin::serve(admin_listen, admin_controller, admin_auth).await {
+        if let Err(e) =
+            bugpot_admin::serve(admin_listen, admin_controller, admin_auth, deploy_secret).await
+        {
             error!(error = %e, "admin api exited with error");
         }
     }))
@@ -343,6 +347,47 @@ fn read_admin_token_from_file(path: &str) -> Result<String> {
         anyhow::bail!("admin token file {path} is empty");
     }
     Ok(trimmed.to_owned())
+}
+
+/// Read the HMAC secret used to derive per-app deploy tokens. Same
+/// shape as the admin token: a file path (preferred) or an env var
+/// fallback that logs a warning. The secret is purely a server-side
+/// derivation key — leaking it lets an attacker mint a deploy token
+/// for any app, so the same `chmod 600` + ancestor-permission rules
+/// apply.
+fn read_deploy_secret() -> Result<bugpot_admin::DeployKeySecret> {
+    if let Ok(path) = std::env::var("BUGPOT_DEPLOY_SECRET_FILE") {
+        return read_deploy_secret_from_file(&path);
+    }
+    if let Ok(raw) = std::env::var("BUGPOT_DEPLOY_SECRET") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            warn!(
+                "deploy-key secret loaded from BUGPOT_DEPLOY_SECRET; the \
+                 env-var path is visible in /proc/<pid>/environ. Prefer \
+                 BUGPOT_DEPLOY_SECRET_FILE for production deployments.",
+            );
+            return Ok(bugpot_admin::DeployKeySecret::from_bytes(
+                trimmed.as_bytes().to_vec(),
+            ));
+        }
+    }
+    anyhow::bail!(
+        "deploy-key secret is required: set BUGPOT_DEPLOY_SECRET_FILE (preferred) or BUGPOT_DEPLOY_SECRET"
+    );
+}
+
+fn read_deploy_secret_from_file(path: &str) -> Result<bugpot_admin::DeployKeySecret> {
+    bugpot_config::require_owner_only(std::path::Path::new(path))?;
+    let body = std::fs::read_to_string(path)
+        .with_context(|| format!("read deploy-key secret from {path}"))?;
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("deploy-key secret file {path} is empty");
+    }
+    Ok(bugpot_admin::DeployKeySecret::from_bytes(
+        trimmed.as_bytes().to_vec(),
+    ))
 }
 
 fn init_tracing() {

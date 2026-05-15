@@ -88,5 +88,7 @@ exec env \
     BUGPOT_APPS_DIR="$APPS_DIR" \
     BUGPOT_STATE_DIR="$STATE_DIR" \
     BUGPOT_LISTEN="$LISTEN" \
+    BUGPOT_ADMIN_TOKEN="dev-only-do-not-deploy" \
+    BUGPOT_DEPLOY_SECRET="dev-only-deploy-secret" \
     RUST_LOG="bugpot=info,bugpot_router=info,bugpot_runtime=info,bugpot_egress=info" \
     "$BIN"

@@ -77,6 +77,8 @@ echo "=== launching bugpot ==="
 BUGPOT_APPS_DIR="$APPS_DIR" \
 BUGPOT_STATE_DIR="$STATE_DIR" \
 BUGPOT_LISTEN="$LISTEN" \
+BUGPOT_ADMIN_TOKEN="smoke-only-do-not-deploy" \
+BUGPOT_DEPLOY_SECRET="smoke-only-deploy-secret" \
 RUST_LOG="bugpot=info,bugpot_router=info,bugpot_runtime=info,bugpot_egress=info" \
     "$BIN" >"$LOG" 2>&1 &
 PID=$!
