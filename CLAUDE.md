@@ -160,6 +160,7 @@ Config plane (admin token):
 | POST   | `/apps`                       | `AppSpec` in (JSON by default; `Content-Type: application/toml` accepts the on-disk TOML form), `201` + `AppView`. Registers only — does NOT pull an image or start a container. |
 | GET    | `/apps`                       | `200` + `[AppView]`                                |
 | GET    | `/apps/{name}`                | `200` + `AppView`, `404` if absent                 |
+| PATCH  | `/apps/{name}`                | Replace-style update of mutable fields. Body shape = `POST /apps` (JSON or TOML). `200` + `AppView`. `name` and `subdomain` are immutable (reject with 400). Container is restarted iff the spec actually changes (TOML projection equality short-circuit). |
 | DELETE | `/apps/{name}`                | `204` on stop+remove, `404` if absent              |
 | POST   | `/apps/{name}/deploy-keys`    | `201` + `{token: "bp1.<hex>"}`. The token authorises this app's rollout endpoints only. |
 

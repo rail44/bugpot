@@ -39,7 +39,12 @@ Delete the TOML, open a PR, merge. The next workflow run calls
 
 ## Editing an existing app
 
-`PATCH /apps/<name>` is not yet implemented in bugpot. Until it is,
-the apply workflow does not propagate in-place TOML edits; the
-fix path is delete-then-re-add (two PRs, or one PR that removes
-and recreates).
+In-place edits to a TOML (env, scaling, egress, port, repo, etc.)
+are picked up by the next apply-workflow run: it `PATCH`es every
+common app with the current TOML body. bugpot replaces the spec
+and restarts the container if anything actually changed (TOML
+projection equality short-circuit; unchanged apps don't flap).
+
+`name` and `subdomain` are **immutable**. Bugpot rejects PATCH
+attempts to change either with a 400. The fix path for a rename
+is delete-then-re-add.

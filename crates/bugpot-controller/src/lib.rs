@@ -96,6 +96,35 @@ pub enum RolloutError {
     Internal(#[from] anyhow::Error),
 }
 
+/// Errors specific to the config plane's `PATCH /apps/<name>` path.
+/// Adapter crates map these to HTTP status codes.
+#[derive(Debug, Error)]
+pub enum UpdateError {
+    #[error("app '{0}' not found")]
+    NotFound(String),
+    #[error("invalid spec: {0}")]
+    InvalidSpec(#[from] bugpot_config::InvalidSpec),
+    /// The caller attempted to change `name` (identity). Rename =
+    /// delete + recreate; PATCH does not perform it.
+    #[error("name is immutable; delete + recreate to rename")]
+    NameImmutable,
+    /// Same constraint as `name`. Routing identity is fixed for the
+    /// life of an app.
+    #[error("subdomain is immutable; delete + recreate to change")]
+    SubdomainImmutable,
+    /// App is mid-transition (Starting / Stopping); the caller should
+    /// retry once the state settles.
+    #[error("app '{0}' is currently transitioning state; retry")]
+    Conflict(String),
+    /// PATCH succeeded at the config-store level but the post-update
+    /// restart (stop + start) of a running container failed. The new
+    /// config has already been persisted.
+    #[error("config updated but app failed to restart: {0:#}")]
+    RestartFailed(#[source] anyhow::Error),
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
 /// How long to wait for an app to start accepting TCP connections on its
 /// declared port after libcontainer reports the container is running.
 /// Default readiness timeout when an app does not override
@@ -598,6 +627,105 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
             maps.by_name.insert(name.clone(), handle.clone());
         }
         gauge!("bugpot_apps_active").increment(1.0);
+
+        Ok(view_of(&handle).await)
+    }
+
+    /// Update an existing app's config in place.
+    ///
+    /// PATCH semantics — `new_spec` is the new desired state for
+    /// every mutable field; `name` and `subdomain` are identity and
+    /// rejected for change (rename = delete + recreate).
+    ///
+    /// Behaviour:
+    ///   - Mid-transition (`Starting` / `Stopping`) → 409 Conflict.
+    ///   - No effective change (TOML round-trip equal) → no-op
+    ///     returning the current view. Lets the ops apply workflow
+    ///     PATCH unconditionally without restarting containers on
+    ///     every CI run.
+    ///   - Spec changed → persist new TOML, reset the per-handle
+    ///     `image_digest` cache if `repo` moved, and (if the app
+    ///     was `Running`) stop + start it so the new config takes
+    ///     effect. The current rollout history is preserved.
+    pub async fn update_app(
+        &self,
+        name: &str,
+        new_spec: AppSpec,
+    ) -> std::result::Result<AppView, UpdateError> {
+        new_spec.validate()?;
+
+        let handle = self
+            .apps
+            .read()
+            .await
+            .by_name
+            .get(name)
+            .cloned()
+            .ok_or_else(|| UpdateError::NotFound(name.to_owned()))?;
+
+        // Identity guards: PATCH cannot change `name` / `subdomain`.
+        // The body's `name` field is allowed to either match or be
+        // absent (some clients omit identity from the body).
+        if let Some(ref body_name) = new_spec.name
+            && body_name != name
+        {
+            return Err(UpdateError::NameImmutable);
+        }
+        if new_spec.subdomain() != handle.identity.subdomain {
+            return Err(UpdateError::SubdomainImmutable);
+        }
+
+        {
+            let inner = handle.inner.lock().await;
+            if matches!(inner.state, AppState::Starting { .. } | AppState::Stopping) {
+                return Err(UpdateError::Conflict(name.to_owned()));
+            }
+        }
+
+        // Short-circuit if nothing changed in the TOML projection.
+        // `source_path` is `#[serde(skip)]`, so two specs whose
+        // serialised TOML matches are functionally identical.
+        let existing = handle.spec.read().await.clone();
+        let logically_equal = match (toml::to_string(&existing), toml::to_string(&new_spec)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        };
+        if logically_equal {
+            return Ok(view_of(&handle).await);
+        }
+
+        let was_running = matches!(handle.inner.lock().await.state, AppState::Running { .. });
+
+        // Replace under the write lock.
+        {
+            let mut guard = handle.spec.write().await;
+            *guard = new_spec.clone();
+        }
+
+        // The deploy-time digest cache (from PR #73) is bound to
+        // whatever ref the previous `repo` resolved to. Clear it
+        // when `repo` changes so the next pull rebuilds it against
+        // the new registry path.
+        if existing.repo != new_spec.repo {
+            *handle.image_digest.lock().await = None;
+        }
+
+        if let Err(e) = self.persist_stored(&handle).await {
+            return Err(UpdateError::Internal(e));
+        }
+
+        if was_running {
+            if let Err(e) = self.stop(&handle).await {
+                return Err(UpdateError::RestartFailed(anyhow!(
+                    "stop before reconfigure: {e:#}"
+                )));
+            }
+            if let Err(e) = self.ensure_running(&handle).await {
+                return Err(UpdateError::RestartFailed(anyhow!(
+                    "restart after reconfigure: {e:#}"
+                )));
+            }
+        }
 
         Ok(view_of(&handle).await)
     }
@@ -1425,6 +1553,159 @@ mod tests {
         assert!(
             view.current_rollout.is_none(),
             "rollout history must stay empty on pull failure"
+        );
+    }
+
+    /// PATCH on a stopped, registered app rewrites the spec and
+    /// persists. The previous + new TOML differ on disk.
+    #[tokio::test]
+    async fn update_app_persists_new_spec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let controller = make_controller(vec![], tmp.path().to_owned());
+        controller
+            .deploy_app(spec_with_name("alpha"))
+            .await
+            .expect("register");
+
+        // PATCH: change port + add an env var.
+        let mut updated = spec_with_name("alpha");
+        updated.port = 9999;
+        updated
+            .env
+            .insert("LOG_LEVEL".to_owned(), "debug".to_owned());
+
+        let view = controller
+            .update_app("alpha", updated)
+            .await
+            .expect("update succeeds");
+        assert_eq!(view.port, 9999);
+
+        // TOML on disk reflects the new state.
+        let toml_body = std::fs::read_to_string(tmp.path().join("alpha.toml")).unwrap();
+        assert!(
+            toml_body.contains("port = 9999"),
+            "toml missing new port: {toml_body}"
+        );
+        assert!(
+            toml_body.contains("LOG_LEVEL"),
+            "toml missing new env var: {toml_body}"
+        );
+    }
+
+    /// PATCH with an identity-only difference (rename via `name`) is
+    /// rejected with `NameImmutable`; the rest of the spec is left
+    /// untouched.
+    #[tokio::test]
+    async fn update_app_rejects_name_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let controller = make_controller(vec![], tmp.path().to_owned());
+        controller
+            .deploy_app(spec_with_name("alpha"))
+            .await
+            .expect("register");
+
+        let mut renamed = spec_with_name("alpha");
+        renamed.name = Some("beta".to_owned());
+        let err = controller
+            .update_app("alpha", renamed)
+            .await
+            .expect_err("expected NameImmutable");
+        assert!(matches!(err, UpdateError::NameImmutable), "got {err:?}");
+    }
+
+    /// Subdomain change is also rejected (routing identity is fixed
+    /// for the life of an app in v1).
+    #[tokio::test]
+    async fn update_app_rejects_subdomain_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let controller = make_controller(vec![], tmp.path().to_owned());
+        controller
+            .deploy_app(spec_with_name("alpha"))
+            .await
+            .expect("register");
+
+        let mut moved = spec_with_name("alpha");
+        moved.subdomain = Some("alpha-renamed".to_owned());
+        let err = controller
+            .update_app("alpha", moved)
+            .await
+            .expect_err("expected SubdomainImmutable");
+        assert!(
+            matches!(err, UpdateError::SubdomainImmutable),
+            "got {err:?}"
+        );
+    }
+
+    /// PATCH with a body whose TOML projection equals the current
+    /// one is a no-op. This is the path the ops apply workflow
+    /// hits on every CI run for unchanged apps; the short-circuit
+    /// is what stops the workflow from flapping containers.
+    #[tokio::test]
+    async fn update_app_noop_when_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let controller = make_controller(vec![], tmp.path().to_owned());
+        controller
+            .deploy_app(spec_with_name("alpha"))
+            .await
+            .expect("register");
+        let runtime_calls_before = controller.runtime.calls().len();
+
+        // Re-PATCH with the same content.
+        controller
+            .update_app("alpha", spec_with_name("alpha"))
+            .await
+            .expect("noop succeeds");
+
+        // No runtime side effects (no stop, no start, no pull).
+        assert_eq!(
+            controller.runtime.calls().len(),
+            runtime_calls_before,
+            "noop PATCH must not touch the runtime"
+        );
+    }
+
+    /// PATCH on a missing app returns `NotFound`.
+    #[tokio::test]
+    async fn update_app_returns_not_found_for_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let controller = make_controller(vec![], tmp.path().to_owned());
+        let err = controller
+            .update_app("ghost", spec_with_name("ghost"))
+            .await
+            .expect_err("expected NotFound");
+        assert!(matches!(err, UpdateError::NotFound(_)), "got {err:?}");
+    }
+
+    /// `repo` change clears the per-handle `image_digest` cache so
+    /// the next start re-resolves against the new registry path
+    /// rather than reusing the previous repo's digest.
+    #[tokio::test]
+    async fn update_app_clears_digest_cache_on_repo_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let controller = make_controller(vec![], tmp.path().to_owned());
+        controller
+            .deploy_app(spec_with_name("alpha"))
+            .await
+            .expect("register");
+
+        let handle = {
+            let maps = controller.apps.read().await;
+            maps.by_name.get("alpha").cloned().unwrap()
+        };
+        // Seed the cache as if a prior start populated it.
+        *handle.image_digest.lock().await =
+            Some(bugpot_runtime::ImageId::new("sha256:oldcacheddigest"));
+
+        let mut new_spec = spec_with_name("alpha");
+        new_spec.repo = "registry.example/other-img".to_owned();
+        controller
+            .update_app("alpha", new_spec)
+            .await
+            .expect("repo change PATCH succeeds");
+
+        assert!(
+            handle.image_digest.lock().await.is_none(),
+            "image_digest cache must clear on repo change"
         );
     }
 
