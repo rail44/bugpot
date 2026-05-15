@@ -65,7 +65,7 @@ fn summarize_headers(h: &HeaderMap) -> String {
 
 fn fake_app(name: &str, port: u16) -> AppSpec {
     AppSpec {
-        image: "ghcr.io/test/app:latest".to_owned(),
+        repo: "ghcr.io/test/app".to_owned(),
         port,
         name: Some(name.to_owned()),
         subdomain: Some(name.to_owned()),

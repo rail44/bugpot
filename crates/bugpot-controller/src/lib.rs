@@ -13,16 +13,18 @@
 //! it at runtime via [`AppController::deploy_app`] / [`AppController::remove_app`].
 //! Per-app `Mutex`-protected state machines coalesce concurrent starts.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use bugpot_config::{AppIdentity, AppSpec, AuthConfig, RegistryCredential, registry_host};
+use bugpot_config::{
+    AppIdentity, AppSpec, AuthConfig, RegistryCredential, Rollout, StoredApp, registry_host,
+};
 use bugpot_egress::EgressOps;
 use bugpot_router::{UpstreamResolver, subdomain_of};
 use bugpot_runtime::{Auth, ResourceUsage, RuntimeError, RuntimeOps};
@@ -68,12 +70,44 @@ pub enum RemoveError {
     Internal(#[from] anyhow::Error),
 }
 
+/// Errors specific to the rollout plane (image-tag updates that do not
+/// touch app config). Adapter crates map these to HTTP status codes.
+#[derive(Debug, Error)]
+pub enum RolloutError {
+    #[error("app '{0}' not found")]
+    NotFound(String),
+    #[error("rollout tag must not be empty")]
+    EmptyTag,
+    #[error("registry authentication failed: {0:#}")]
+    ImageAuth(#[source] anyhow::Error),
+    #[error("image pull failed: {0:#}")]
+    ImagePull(#[source] anyhow::Error),
+    /// App is mid-transition (Starting / Stopping); the caller should
+    /// retry once the state settles.
+    #[error("app '{0}' is currently transitioning state; retry")]
+    Conflict(String),
+    /// Pull + persist succeeded but the cold start (or re-start)
+    /// driven by the rollout failed. The rollout history still
+    /// contains the new entry; operators can roll back to a previous
+    /// tag.
+    #[error("rollout started but app failed to come up: {0:#}")]
+    StartFailed(#[source] anyhow::Error),
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
 /// How long to wait for an app to start accepting TCP connections on its
 /// declared port after libcontainer reports the container is running.
 /// Default readiness timeout when an app does not override
 /// `readiness.timeout` in its TOML.
 const READINESS_TIMEOUT_DEFAULT: Duration = Duration::from_secs(10);
 const READINESS_POLL: Duration = Duration::from_millis(100);
+
+/// Cap on the per-app rollout history retained in memory + on disk.
+/// Older rollouts are dropped (popped from the front of the deque) as
+/// new ones land. Hard-coded for v1; promote to a config knob once
+/// bugpot's settings model is established.
+const MAX_ROLLOUT_HISTORY: usize = 4;
 
 #[derive(Debug)]
 struct AppHandle {
@@ -107,6 +141,11 @@ struct AppHandle {
     /// operator-side redeploy is required to pick up an upstream
     /// retag. No TTL.
     image_digest: Mutex<Option<bugpot_runtime::ImageId>>,
+    /// Bounded rollout history. The back of the deque is the current
+    /// rollout (the tag bugpot pulls and runs). Empty = the app is
+    /// registered but not yet deployed, in which case
+    /// `ensure_running` will fail and the router returns 404.
+    rollouts: Mutex<VecDeque<Rollout>>,
     inner: Mutex<HandleInner>,
 }
 
@@ -144,9 +183,12 @@ enum AppState {
 pub struct AppView {
     pub name: String,
     pub subdomain: String,
-    pub image: String,
+    pub repo: String,
     pub port: u16,
     pub state: AppStateView,
+    /// `None` when the app has never been rolled out (registered only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_rollout: Option<Rollout>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -198,14 +240,15 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         egress: Arc<E>,
         apps_dir: PathBuf,
         auth: AuthConfig,
-        specs: Vec<AppSpec>,
+        stored: Vec<StoredApp>,
     ) -> Self {
         let mut maps = AppMaps::default();
-        for spec in specs {
+        for s in stored {
             // `load_apps` already validated each spec; an `InvalidSpec`
             // here would indicate a caller bypassed that, which is a
             // bug — `expect` is the right reaction.
-            let handle = make_handle(spec).expect("controller::new received unvalidated AppSpec");
+            let handle = make_handle(s.spec, s.rollout)
+                .expect("controller::new received unvalidated AppSpec");
             maps.by_subdomain.insert(
                 handle.identity.subdomain.clone(),
                 handle.identity.name.clone(),
@@ -363,9 +406,21 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
                 .scaling
                 .resolve_idle_timeout()
                 .map_err(|e| anyhow!("{}: {e}", handle.identity.name))?;
-            if timeout.is_none() {
-                always_on.push(handle);
+            if timeout.is_some() {
+                continue;
             }
+            // An always-on app that has never been rolled out can't be
+            // started yet. Skip with a warning rather than failing the
+            // entire bring-up — the operator will see the warning and
+            // POST a rollout when ready.
+            if handle.rollouts.lock().await.is_empty() {
+                warn!(
+                    app = %handle.identity.name,
+                    "eager start skipped: app has no rollout yet"
+                );
+                continue;
+            }
+            always_on.push(handle);
         }
         if always_on.is_empty() {
             return Ok(());
@@ -488,10 +543,12 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         }
     }
 
-    /// Register a new app. Fails if an app with the same name or subdomain
-    /// already exists. The image is pulled before persistence so failure
-    /// leaves no state. If `idle_timeout = 0`, the app is eager-started
-    /// before this call returns.
+    /// Register a new app. Fails if an app with the same name or
+    /// subdomain already exists. **Does not pull an image or start a
+    /// container** — the new app exists in `Stopped` state with no
+    /// rollouts. Operators (or `set_rollout` from the admin API)
+    /// supply the first rollout in a separate step, which is what
+    /// actually pulls and starts.
     pub async fn deploy_app(&self, mut spec: AppSpec) -> std::result::Result<AppView, DeployError> {
         let name = spec.name.clone().ok_or(DeployError::MissingName)?;
         // Strict validation BEFORE we touch the filesystem — `name`
@@ -500,7 +557,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         spec.validate()?;
         let subdomain = spec.subdomain().to_owned();
 
-        // Fast-fail on obvious collisions before doing the expensive pull.
+        // Fast-fail on obvious collisions before persisting.
         {
             let maps = self.apps.read().await;
             if maps.by_name.contains_key(&name) {
@@ -511,24 +568,19 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
             }
         }
 
-        let resolved_digest = self
-            .runtime
-            .pull_image(&spec.image, self.resolve_auth(&spec.image))
-            .await
-            .map_err(|e| classify_pull_error(e, &name, &spec.image))?;
-
         let toml_path = self.apps_dir.join(format!("{name}.toml"));
+        let stored = StoredApp {
+            spec: spec.clone(),
+            rollout: None,
+        };
         let toml_body =
-            toml::to_string_pretty(&spec).with_context(|| format!("serialize spec for {name}"))?;
+            toml::to_string_pretty(&stored).with_context(|| format!("serialize app for {name}"))?;
         tokio::fs::write(&toml_path, toml_body)
             .await
             .with_context(|| format!("write {}", toml_path.display()))?;
         spec.source_path.clone_from(&toml_path);
 
-        let handle = make_handle(spec.clone())?;
-        // Pre-populate the digest cache from the pull we just did so
-        // the eager-start (or first request) below doesn't re-probe.
-        *handle.image_digest.lock().await = Some(resolved_digest);
+        let handle = make_handle(spec.clone(), None)?;
 
         {
             let mut maps = self.apps.write().await;
@@ -547,22 +599,115 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         }
         gauge!("bugpot_apps_active").increment(1.0);
 
-        let eager = spec
-            .scaling
-            .resolve_idle_timeout()
-            .map_err(|e| anyhow!("{name}: {e}"))?
-            .is_none();
-        if eager {
-            info!(app = %name, "eager start on deploy");
-            if let Err(e) = self.ensure_running(&handle).await {
-                // remove_by_name decrements the gauge to keep it balanced
-                // with the increment above.
-                let _ = self.remove_by_name(&name).await;
-                return Err(DeployError::StartFailed(e));
+        Ok(view_of(&handle).await)
+    }
+
+    /// Append a new rollout to `name` and bring the app to that tag.
+    ///
+    /// Steps:
+    ///   1. Pull `{repo}:{tag}`.
+    ///   2. Push to the rollout history (popping the oldest entry
+    ///      when the deque is full).
+    ///   3. Persist `<apps_dir>/<name>.toml` with the new current
+    ///      rollout.
+    ///   4. If the app is `Running`, stop it; then start under the
+    ///      new rollout.
+    ///   5. If `Stopped`, start now (so callers observe a deployed
+    ///      app on return).
+    ///   6. If `Starting` / `Stopping`, return [`RolloutError::Conflict`]
+    ///      and let the caller retry.
+    pub async fn set_rollout(
+        &self,
+        name: &str,
+        tag: String,
+    ) -> std::result::Result<Rollout, RolloutError> {
+        if tag.trim().is_empty() {
+            return Err(RolloutError::EmptyTag);
+        }
+        let handle = self
+            .apps
+            .read()
+            .await
+            .by_name
+            .get(name)
+            .cloned()
+            .ok_or_else(|| RolloutError::NotFound(name.to_owned()))?;
+
+        // Conflict check: refuse mid-transition. Done before pull so
+        // we don't waste a registry round-trip on a doomed call.
+        {
+            let inner = handle.inner.lock().await;
+            if matches!(inner.state, AppState::Starting { .. } | AppState::Stopping) {
+                return Err(RolloutError::Conflict(name.to_owned()));
             }
         }
 
-        Ok(view_of(&handle).await)
+        // 1. Pull.
+        let repo = handle.spec.read().await.repo.clone();
+        let image_ref = format!("{repo}:{tag}");
+        let resolved_digest = self
+            .runtime
+            .pull_image(&image_ref, self.resolve_auth(&repo))
+            .await
+            .map_err(|e| classify_pull_error_for_rollout(e, name, &image_ref))?;
+
+        // 2. Append to history. Reset the digest cache so the next
+        // `do_start` uses *this* rollout's digest (not the previous
+        // rollout's, which may have been a different tag).
+        let rollout = Rollout {
+            tag,
+            created_at: humantime::format_rfc3339_seconds(SystemTime::now()).to_string(),
+        };
+        {
+            let mut rollouts = handle.rollouts.lock().await;
+            while rollouts.len() >= MAX_ROLLOUT_HISTORY {
+                rollouts.pop_front();
+            }
+            rollouts.push_back(rollout.clone());
+        }
+        *handle.image_digest.lock().await = Some(resolved_digest);
+
+        // 3. Persist.
+        if let Err(e) = self.persist_stored(&handle).await {
+            warn!(app = %name, error = ?e, "failed to persist updated stored toml");
+        }
+
+        // 4 + 5: bring the container to the new image. If it was
+        // running, stop first so the start uses the new digest cache.
+        let was_running = matches!(handle.inner.lock().await.state, AppState::Running { .. });
+        if was_running && let Err(e) = self.stop(&handle).await {
+            warn!(app = %name, error = ?e, "stop before rollout-restart failed");
+        }
+        if let Err(e) = self.ensure_running(&handle).await {
+            return Err(RolloutError::StartFailed(e));
+        }
+
+        Ok(rollout)
+    }
+
+    /// Return a snapshot of the rollout history (front = oldest,
+    /// back = current) for `name`, or `None` if the app does not
+    /// exist.
+    pub async fn list_rollouts(&self, name: &str) -> Option<Vec<Rollout>> {
+        let handle = self.apps.read().await.by_name.get(name).cloned()?;
+        Some(handle.rollouts.lock().await.iter().cloned().collect())
+    }
+
+    /// Persist the handle's spec + current rollout to
+    /// `<apps_dir>/<name>.toml`. Best-effort; the caller logs on
+    /// error.
+    async fn persist_stored(&self, handle: &Arc<AppHandle>) -> Result<()> {
+        let name = &handle.identity.name;
+        let spec = handle.spec.read().await.clone();
+        let rollout = handle.rollouts.lock().await.back().cloned();
+        let stored = StoredApp { spec, rollout };
+        let body = toml::to_string_pretty(&stored)
+            .with_context(|| format!("serialize stored app for {name}"))?;
+        let path = self.apps_dir.join(format!("{name}.toml"));
+        tokio::fs::write(&path, body)
+            .await
+            .with_context(|| format!("write {}", path.display()))?;
+        Ok(())
     }
 
     /// Unregister an app by name. Stops the container (if running) and
@@ -673,11 +818,21 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
     async fn do_start(&self, handle: &AppHandle) -> Result<Ipv4Addr> {
         let name = &handle.identity.name;
         // Snapshot the spec once: a cold start interleaves several
-        // awaits with reads of image / port / egress.allow / readiness,
+        // awaits with reads of repo / port / egress.allow / readiness,
         // so cloning the small `AppSpec` is cheaper than holding the
         // RwLock guard across them (or re-locking each time).
         let spec = handle.spec.read().await.clone();
-        info!(app = %name, image = %spec.image, "starting");
+        // Resolve current rollout. An app without a rollout cannot
+        // start — fail fast before allocating any resources.
+        let tag = handle
+            .rollouts
+            .lock()
+            .await
+            .back()
+            .map(|r| r.tag.clone())
+            .ok_or_else(|| anyhow!("app '{name}' has no rollout; POST a rollout first"))?;
+        let plain_image_ref = format!("{repo}:{tag}", repo = spec.repo);
+        info!(app = %name, image = %plain_image_ref, "starting");
 
         // Each cold-start phase records into bugpot_cold_start_seconds
         // *only on success*; failure paths intentionally don't record so
@@ -699,10 +854,11 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         // manifest probe is skipped (`Puller::pull` short-circuits on
         // digest references). The cache invalidates only when the
         // handle is destroyed (operator redeploy or bugpot restart).
-        let image_ref = digest_pinned_ref(&spec.image, handle.image_digest.lock().await.as_ref());
+        let image_ref =
+            digest_pinned_ref(&plain_image_ref, handle.image_digest.lock().await.as_ref());
         let image_id = match self
             .runtime
-            .pull_image(&image_ref, self.resolve_auth(&spec.image))
+            .pull_image(&image_ref, self.resolve_auth(&spec.repo))
             .await
         {
             Ok(id) => id,
@@ -818,12 +974,20 @@ async fn discard_failed_toml(path: &Path) {
 /// `spec.identity()` fails (the spec's name / subdomain weren't valid
 /// DNS labels). Callers in the deploy path are expected to have run
 /// `spec.validate()` earlier; this is the belt-and-braces version.
-fn make_handle(spec: AppSpec) -> Result<Arc<AppHandle>, bugpot_config::InvalidSpec> {
+fn make_handle(
+    spec: AppSpec,
+    initial_rollout: Option<Rollout>,
+) -> Result<Arc<AppHandle>, bugpot_config::InvalidSpec> {
     let identity = spec.identity()?;
+    let mut rollouts = VecDeque::with_capacity(MAX_ROLLOUT_HISTORY);
+    if let Some(r) = initial_rollout {
+        rollouts.push_back(r);
+    }
     Ok(Arc::new(AppHandle {
         identity,
         spec: RwLock::new(spec),
         image_digest: Mutex::new(None),
+        rollouts: Mutex::new(rollouts),
         inner: Mutex::new(HandleInner {
             state: AppState::Stopped,
             last_access: Instant::now(),
@@ -845,18 +1009,19 @@ fn digest_pinned_ref(image: &str, digest: Option<&bugpot_runtime::ImageId>) -> S
     }
 }
 
-/// Classify a `pull_image` failure into the deploy-level error
+/// Classify a `pull_image` failure into the rollout-level error
 /// variant. Auth-side failures (registry rejected bugpot's
 /// credentials, or none were configured for a private image) become
-/// [`DeployError::ImageAuth`]; everything else (network, manifest
-/// parsing, missing image) stays in the generic [`DeployError::ImagePull`].
-fn classify_pull_error(err: RuntimeError, name: &str, image_ref: &str) -> DeployError {
+/// [`RolloutError::ImageAuth`]; everything else (network, manifest
+/// parsing, missing image) stays in the generic
+/// [`RolloutError::ImagePull`].
+fn classify_pull_error_for_rollout(err: RuntimeError, name: &str, image_ref: &str) -> RolloutError {
     let is_auth = err.is_registry_auth_error();
     let context = anyhow::Error::from(err).context(format!("pull {image_ref} for {name}"));
     if is_auth {
-        DeployError::ImageAuth(context)
+        RolloutError::ImageAuth(context)
     } else {
-        DeployError::ImagePull(context)
+        RolloutError::ImagePull(context)
     }
 }
 
@@ -868,12 +1033,14 @@ async fn view_of(handle: &Arc<AppHandle>) -> AppView {
         AppState::Stopping => AppStateView::Stopping,
     };
     let spec = handle.spec.read().await;
+    let current_rollout = handle.rollouts.lock().await.back().cloned();
     AppView {
         name: handle.identity.name.clone(),
         subdomain: handle.identity.subdomain.clone(),
-        image: spec.image.clone(),
+        repo: spec.repo.clone(),
         port: spec.port,
         state,
+        current_rollout,
     }
 }
 
@@ -1162,7 +1329,7 @@ mod tests {
 
     fn spec_with_name(name: &str) -> AppSpec {
         AppSpec {
-            image: "registry.example/img:tag".to_owned(),
+            repo: "registry.example/img".to_owned(),
             port: 8080,
             name: Some(name.to_owned()),
             subdomain: None,
@@ -1176,8 +1343,21 @@ mod tests {
         }
     }
 
+    /// Pre-registered app with an initial rollout for tests that
+    /// want to drive `ensure_running` directly (skipping the
+    /// register-then-rollout choreography of the real admin API).
+    fn stored_with_name(name: &str, tag: &str) -> StoredApp {
+        StoredApp {
+            spec: spec_with_name(name),
+            rollout: Some(Rollout {
+                tag: tag.to_owned(),
+                created_at: "1970-01-01T00:00:00Z".to_owned(),
+            }),
+        }
+    }
+
     fn make_controller(
-        specs: Vec<AppSpec>,
+        stored: Vec<StoredApp>,
         apps_dir: PathBuf,
     ) -> Arc<AppController<MockRuntime, MockEgress>> {
         Arc::new(AppController::new(
@@ -1185,28 +1365,67 @@ mod tests {
             Arc::new(MockEgress::default()),
             apps_dir,
             AuthConfig::default(),
-            specs,
+            stored,
         ))
     }
 
-    /// `deploy_app` must surface a pull failure as `DeployError::ImagePull`
-    /// and leave no TOML file behind.
+    /// `deploy_app` only registers; it does not pull. So even a
+    /// runtime configured to fail on pull must produce a successful
+    /// register (with a TOML written and the app in `Stopped`).
     #[tokio::test]
-    async fn deploy_app_propagates_pull_failure() {
+    async fn deploy_app_does_not_pull() {
         let tmp = tempfile::tempdir().unwrap();
         let controller = make_controller(vec![], tmp.path().to_owned());
+        // A pull queued up should remain unconsumed — register must
+        // not touch the runtime's pull path.
+        controller
+            .runtime
+            .push_pull(Err(RuntimeError::Other("would-be pull failure".into())));
+
+        let view = controller
+            .deploy_app(spec_with_name("alpha"))
+            .await
+            .expect("register should succeed without pulling");
+        assert_eq!(view.name, "alpha");
+        assert!(
+            view.current_rollout.is_none(),
+            "newly registered app has no rollout yet"
+        );
+        let toml = tmp.path().join("alpha.toml");
+        assert!(toml.exists(), "register must persist the toml");
+        let calls = controller.runtime.calls();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("pull_image")),
+            "register must not pull; got {calls:?}"
+        );
+    }
+
+    /// `set_rollout` must surface a pull failure as
+    /// `RolloutError::ImagePull` and leave the rollout history empty
+    /// (so the next attempt starts clean).
+    #[tokio::test]
+    async fn set_rollout_propagates_pull_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let controller = make_controller(vec![], tmp.path().to_owned());
+        controller
+            .deploy_app(spec_with_name("alpha"))
+            .await
+            .expect("register");
         controller
             .runtime
             .push_pull(Err(RuntimeError::Other("registry unreachable".into())));
 
         let err = controller
-            .deploy_app(spec_with_name("alpha"))
+            .set_rollout("alpha", "v1".to_owned())
             .await
             .expect_err("expected pull failure");
-        assert!(matches!(err, DeployError::ImagePull(_)), "got {err:?}");
+        assert!(matches!(err, RolloutError::ImagePull(_)), "got {err:?}");
 
-        let toml = tmp.path().join("alpha.toml");
-        assert!(!toml.exists(), "toml should not be written on pull failure");
+        let view = controller.get_app("alpha").await.expect("app present");
+        assert!(
+            view.current_rollout.is_none(),
+            "rollout history must stay empty on pull failure"
+        );
     }
 
     /// On cold-start failure during image pull, the previously-allocated
@@ -1215,9 +1434,10 @@ mod tests {
     #[tokio::test]
     async fn cold_start_releases_endpoint_on_pull_failure() {
         let tmp = tempfile::tempdir().unwrap();
-        // Pre-register so we hit ensure_running without going through
-        // deploy_app's own pull (which would short-circuit).
-        let controller = make_controller(vec![spec_with_name("alpha")], tmp.path().to_owned());
+        // Pre-register with a rollout so we hit ensure_running →
+        // do_start without going through any admin API path.
+        let controller =
+            make_controller(vec![stored_with_name("alpha", "v1")], tmp.path().to_owned());
         controller
             .runtime
             .push_pull(Err(RuntimeError::Other("registry down".into())));
@@ -1255,7 +1475,10 @@ mod tests {
     async fn reattach_running_recovers_live_containers() {
         let tmp = tempfile::tempdir().unwrap();
         let controller = make_controller(
-            vec![spec_with_name("alpha"), spec_with_name("beta")],
+            vec![
+                stored_with_name("alpha", "v1"),
+                stored_with_name("beta", "v1"),
+            ],
             tmp.path().to_owned(),
         );
         // alpha is alive with a recovered IP; beta is gone.
@@ -1326,7 +1549,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         // `alpha` is the only known app; `beta` (registered in egress
         // discovery) has no TOML and must be reaped.
-        let controller = make_controller(vec![spec_with_name("alpha")], tmp.path().to_owned());
+        let controller =
+            make_controller(vec![stored_with_name("alpha", "v1")], tmp.path().to_owned());
         controller.runtime.set_running("alpha", true);
         controller
             .egress
@@ -1369,7 +1593,8 @@ mod tests {
     #[tokio::test]
     async fn reattach_running_is_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
-        let controller = make_controller(vec![spec_with_name("alpha")], tmp.path().to_owned());
+        let controller =
+            make_controller(vec![stored_with_name("alpha", "v1")], tmp.path().to_owned());
         controller.runtime.set_running("alpha", true);
         controller
             .egress
@@ -1400,7 +1625,8 @@ mod tests {
     #[tokio::test]
     async fn sweep_detects_dead_container() {
         let tmp = tempfile::tempdir().unwrap();
-        let controller = make_controller(vec![spec_with_name("alpha")], tmp.path().to_owned());
+        let controller =
+            make_controller(vec![stored_with_name("alpha", "v1")], tmp.path().to_owned());
 
         // Force the handle into Running state without going through the
         // real cold-start path.

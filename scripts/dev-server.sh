@@ -23,7 +23,8 @@ UNIT=bugpot-dev.service
 APPS_LINK=/tmp/bugpot-dev.apps-dir
 STATE_DIR=/var/lib/bugpot-dev
 LISTEN=127.0.0.1:8080
-IMAGE=${BUGPOT_DEV_IMAGE:-gcr.io/google-samples/hello-app:1.0}
+IMAGE_REPO=${BUGPOT_DEV_REPO:-gcr.io/google-samples/hello-app}
+IMAGE_TAG=${BUGPOT_DEV_TAG:-1.0}
 BIN="$(pwd)/target/debug/bugpot"
 
 is_active() {
@@ -46,12 +47,15 @@ start() {
     APPS=$(mktemp -d)
     for sub in alpha beta; do
         cat >"$APPS/dev-$sub.toml" <<EOF
-image = "$IMAGE"
+repo = "$IMAGE_REPO"
 port = 8080
 name = "dev-$sub"
 subdomain = "$sub"
 [scaling]
 idle_timeout = "0"
+[rollout]
+tag = "$IMAGE_TAG"
+created_at = "1970-01-01T00:00:00Z"
 EOF
     done
     echo "$APPS" >"$APPS_LINK"

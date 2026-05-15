@@ -48,7 +48,7 @@ pub(crate) fn build_spec(inputs: &SpecInputs<'_>) -> Result<Spec> {
     let args = derive_args(image_cfg).ok_or_else(|| {
         RuntimeError::Other(format!(
             "image {:?} has neither entrypoint nor cmd",
-            spec.image
+            spec.repo
         ))
     })?;
 
@@ -109,7 +109,7 @@ pub(crate) fn build_spec(inputs: &SpecInputs<'_>) -> Result<Spec> {
     let mut annotations: HashMap<String, String> = HashMap::new();
     annotations.insert("io.bugpot.app".into(), spec.name().to_owned());
     annotations.insert("io.bugpot.port".into(), spec.port.to_string());
-    annotations.insert("io.bugpot.image".into(), spec.image.clone());
+    annotations.insert("io.bugpot.repo".into(), spec.repo.clone());
 
     let oci_spec = SpecBuilder::default()
         .version("1.0.2-dev")
@@ -372,9 +372,9 @@ mod tests {
     use bugpot_config::AppSpec;
     use oci_client::config::{Config as ImageConfig, ConfigFile, Rootfs};
 
-    fn make_app_spec(image: &str, port: u16) -> AppSpec {
+    fn make_app_spec(repo: &str, port: u16) -> AppSpec {
         let toml = format!(
-            r#"image = "{image}"
+            r#"repo = "{repo}"
 port = {port}
 name = "myapp"
 
@@ -406,7 +406,7 @@ cpu = "0.5"
 
     #[test]
     fn spec_includes_env_port_and_resources() {
-        let app = make_app_spec("ghcr.io/x/y:tag", 8081);
+        let app = make_app_spec("ghcr.io/x/y", 8081);
         let image = make_image_config(vec!["/bin/run"], vec!["--serve"]);
         let rootfs = PathBuf::from("/tmp/bugpot-test-rootfs");
         let spec = build_spec(&SpecInputs {
@@ -465,7 +465,7 @@ cpu = "0.5"
 
     #[test]
     fn spec_joins_external_netns() {
-        let app = make_app_spec("ghcr.io/x/y:tag", 8080);
+        let app = make_app_spec("ghcr.io/x/y", 8080);
         let image = make_image_config(vec!["/bin/run"], vec![]);
         let rootfs = PathBuf::from("/tmp/bugpot-rootfs");
         let netns = PathBuf::from("/var/run/netns/bugpot-myapp");
@@ -491,7 +491,7 @@ cpu = "0.5"
 
     #[test]
     fn spec_attaches_default_seccomp_profile() {
-        let app = make_app_spec("ghcr.io/x/y:tag", 8080);
+        let app = make_app_spec("ghcr.io/x/y", 8080);
         let image = make_image_config(vec!["/bin/run"], vec![]);
         let spec = build_spec(&SpecInputs {
             spec: &app,
@@ -517,7 +517,7 @@ cpu = "0.5"
     fn user_env_overrides_image_env_on_collision() {
         // PORT collision: user wants PORT=9999, app spec wants port=8080
         let toml = r#"
-image = "ghcr.io/x/y:tag"
+repo = "ghcr.io/x/y"
 port = 8080
 name = "x"
 
@@ -542,7 +542,7 @@ PORT = "9999"
 
     #[test]
     fn errors_when_image_has_no_entrypoint_or_cmd() {
-        let app = make_app_spec("ghcr.io/x/y:tag", 8080);
+        let app = make_app_spec("ghcr.io/x/y", 8080);
         let image = ConfigFile {
             config: Some(ImageConfig::default()),
             rootfs: Rootfs::default(),

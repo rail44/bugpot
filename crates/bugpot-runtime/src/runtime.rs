@@ -782,13 +782,14 @@ nr_periods 0\n";
         let tmp = tempfile::tempdir().unwrap();
         let rt = Runtime::new(tmp.path().to_path_buf()).unwrap();
         let toml_src = r#"
-image = "docker.io/library/hello-world:latest"
+repo = "docker.io/library/hello-world"
 port = 8080
 name = "hello"
 "#;
         let app: AppSpec = toml::from_str(toml_src).unwrap();
+        let image_ref = format!("{}:latest", app.repo);
         let image_id = rt
-            .pull_image(&app.image, Auth::Anonymous)
+            .pull_image(&image_ref, Auth::Anonymous)
             .await
             .expect("pull_image");
         let running = rt

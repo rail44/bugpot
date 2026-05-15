@@ -14,7 +14,8 @@ WORKDIR=$(pwd)
 APP_NAME=hello
 DOMAIN="${APP_NAME}.bugpot.example"
 LISTEN=127.0.0.1:8080
-IMAGE="gcr.io/google-samples/hello-app:1.0"
+IMAGE_REPO="gcr.io/google-samples/hello-app"
+IMAGE_TAG="1.0"
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "must run as root (try: sudo $0)" >&2
@@ -63,15 +64,18 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 cat >"$APPS_DIR/$APP_NAME.toml" <<EOF
-image = "$IMAGE"
+repo = "$IMAGE_REPO"
 port = 8080
+[rollout]
+tag = "$IMAGE_TAG"
+created_at = "1970-01-01T00:00:00Z"
 EOF
 
 echo "=== preflight ==="
 echo "bin       : $BIN"
 echo "apps_dir  : $APPS_DIR"
 echo "state_dir : $STATE_DIR"
-echo "image     : $IMAGE"
+echo "image     : $IMAGE_REPO:$IMAGE_TAG"
 echo "log       : $LOG"
 echo
 
