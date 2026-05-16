@@ -49,33 +49,37 @@ const IDLE_TIMEOUT: Duration = Duration::from_mins(1);
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// Hard upper bound on a single request body. Larger bodies are
 /// rejected with 413 by `tower_http::limit::RequestBodyLimitLayer`.
-const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+/// Sized for the "many small apps on a cheap VM" scenario: total
+/// bookkeeping floor is `MAX_BODY_BYTES * MAX_CONCURRENT_REQUESTS`
+/// (4 MiB × 64 = 256 MiB), which leaves room on a 1 GiB host.
+const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 /// Maximum simultaneous in-flight requests. Excess requests queue at
 /// the tower layer; combined with `REQUEST_TIMEOUT` they cannot pile
-/// up unboundedly.
-const MAX_CONCURRENT_REQUESTS: usize = 1024;
+/// up unboundedly. 64 fits 1 vCPU / 1 GiB hosts; higher numbers
+/// (e.g. the previous 1024) trip the bookkeeping invariant above.
+const MAX_CONCURRENT_REQUESTS: usize = 64;
 /// Per-frame idle timeout on the response body once we start
 /// streaming it back to the client. `REQUEST_TIMEOUT` only covers the
 /// time until the response head is received; a slow-read attacker can
 /// stall body delivery beyond it.
 const RESPONSE_FRAME_TIMEOUT: Duration = Duration::from_mins(1);
 /// Hard ceiling on the total response body bytes a single request may
-/// stream. Stops a buggy / malicious upstream from monopolising a
-/// router connection (and host bandwidth) with multi-GB payloads.
-const MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024 * 1024;
+/// stream. 64 MiB is generous for the "internal apps on a cheap VM"
+/// scenario; larger responses should stream out-of-band (e.g.
+/// presigned URLs) rather than through the router.
+const MAX_RESPONSE_BODY_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum simultaneous Upgrade (WebSocket) connections. Each upgrade
 /// detaches a spliced byte-pump task that the `MAX_CONCURRENT_REQUESTS`
 /// limit cannot bound; without an explicit cap an attacker could
 /// detach thousands of idle splices and pressure the tokio runtime.
-const MAX_CONCURRENT_UPGRADES: usize = 256;
+const MAX_CONCURRENT_UPGRADES: usize = 32;
 /// Idle (no traffic in either direction) timeout for an upgraded
 /// connection. Splices that exceed it are torn down.
 const UPGRADE_IDLE_TIMEOUT: Duration = Duration::from_mins(5);
-/// HTTP/2 max concurrent streams per connection. The hyper default
-/// (200) lets a small handful of h2 clients exhaust the global
-/// `MAX_CONCURRENT_REQUESTS` ceiling; pin it tighter so abusive
-/// clients don't starve the tower concurrency layer.
-const H2_MAX_CONCURRENT_STREAMS: u32 = 64;
+/// HTTP/2 max concurrent streams per connection. Pinned well below
+/// `MAX_CONCURRENT_REQUESTS` so a single h2 client can't exhaust the
+/// global ceiling with one connection.
+const H2_MAX_CONCURRENT_STREAMS: u32 = 16;
 
 const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
@@ -723,7 +727,6 @@ mod tests {
             scaling: bugpot_config::Scaling::default(),
             readiness: bugpot_config::Readiness::default(),
             resources: bugpot_config::Resources::default(),
-            runtime: bugpot_config::RuntimeSpec::default(),
             source_path: PathBuf::from(format!("/apps/{name}.toml")),
         }
     }

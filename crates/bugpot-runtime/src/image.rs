@@ -519,7 +519,7 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 /// 2 GiB is well above any sane base image (debian-slim ~80 MB,
 /// node:20 ~1.1 GB, full python:3.12 ~1.2 GB) while still being
 /// orders of magnitude smaller than a successful exhaustion attack.
-const MAX_LAYER_DECOMPRESSED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_LAYER_DECOMPRESSED_BYTES: u64 = 512 * 1024 * 1024;
 
 fn extract_layer(rootfs: &Path, data: &[u8], media_type: &str) -> Result<()> {
     extract_layer_inner(rootfs, data, media_type, MAX_LAYER_DECOMPRESSED_BYTES)

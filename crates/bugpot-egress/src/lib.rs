@@ -41,7 +41,7 @@
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use anyhow::Context;
 use hickory_resolver::TokioResolver;
@@ -64,48 +64,70 @@ use dns::{AllowSet, AppEntry, AppRegistry, EgressDnsHandler, Upstream};
 use netns::EndpointLayout;
 use nft::NftConfig;
 
+// ---- Host-fixed parameters (one bugpot per host, scenario "small VM"). ----
+//
+// Originally `EgressConfig` made these tunable — none of them actually
+// varied between deployments in practice, every test/script hardcoded the
+// same values, and most weren't even reachable from env. Folded down to
+// constants so the surface area matches reality. Re-introduce a knob
+// only when a second concrete deployment actually needs a different value.
+
+/// Linux bridge interface name on the host.
+pub const BRIDGE_NAME: &str = "bugpot0";
+/// nftables table name. Survives bugpot restarts (re-installed atomically).
+pub const NFT_TABLE: &str = "bugpot";
+/// DNS server listen port on the bridge IP.
+pub const DNS_PORT: u16 = 53;
+/// TTL (seconds) for entries in the nft `allow4` set. Determines how long
+/// after a DNS resolve a container has to actually reach the resolved IP.
+pub const ALLOW_TTL_SECS: u32 = 60;
+
+static SUBNET_NET: LazyLock<Ipv4Net> =
+    LazyLock::new(|| "172.20.0.0/24".parse().expect("const subnet parses"));
+static BRIDGE_IP_ADDR: LazyLock<Ipv4Addr> =
+    LazyLock::new(|| "172.20.0.1".parse().expect("const bridge ip parses"));
+
+/// Bridge subnet (CIDR). Backed by [`LazyLock`] because `Ipv4Net::new`
+/// isn't `const`.
+#[must_use]
+pub fn subnet() -> Ipv4Net {
+    *SUBNET_NET
+}
+
+/// Bridge IP (host side of the bridge — the DNS server binds here).
+#[must_use]
+pub fn bridge_ip() -> Ipv4Addr {
+    *BRIDGE_IP_ADDR
+}
+
+/// Per-deployment knobs the operator may want to override via env.
+///
+/// Currently the only such knob is the DNS upstream list — corporate
+/// networks routinely run their own resolver, but the bridge address /
+/// nft table / port aren't worth exposing.
 #[derive(Debug, Clone)]
 pub struct EgressConfig {
-    pub bridge_name: String,
-    pub subnet: Ipv4Net,
-    pub bridge_ip: Ipv4Addr,
     pub dns_upstream: Vec<SocketAddr>,
-    pub dns_port: u16,
-    pub allow_ttl_secs: u32,
-    pub nft_table: String,
 }
 
 impl Default for EgressConfig {
     fn default() -> Self {
         Self {
-            bridge_name: "bugpot0".to_string(),
-            subnet: "172.20.0.0/24".parse().expect("const subnet parses"),
-            bridge_ip: "172.20.0.1".parse().expect("const ip parses"),
             dns_upstream: vec![
                 "1.1.1.1:53".parse().expect("const sockaddr parses"),
                 "8.8.8.8:53".parse().expect("const sockaddr parses"),
             ],
-            dns_port: 53,
-            allow_ttl_secs: 60,
-            nft_table: "bugpot".to_string(),
         }
     }
 }
 
 impl EgressConfig {
-    /// Reject configurations whose fields don't fit together. Called at
-    /// startup so misconfig fails before any bridge / nft work runs.
+    /// Reject obviously-broken configs. Currently only checks that the
+    /// upstream resolver list is non-empty; the host-fixed parameters
+    /// (`subnet`, `bridge_ip`, etc.) are validated at the type level
+    /// because they're consts.
     pub fn validate(&self) -> anyhow::Result<()> {
-        if !self.subnet.contains(&self.bridge_ip) {
-            anyhow::bail!(
-                "bridge_ip {} is not within subnet {}",
-                self.bridge_ip,
-                self.subnet,
-            );
-        }
-        if self.dns_upstream.is_empty() {
-            anyhow::bail!("dns_upstream is empty");
-        }
+        anyhow::ensure!(!self.dns_upstream.is_empty(), "dns_upstream is empty");
         Ok(())
     }
 }
@@ -122,14 +144,6 @@ pub fn parse_dns_upstream(s: &str) -> anyhow::Result<Vec<SocketAddr>> {
                 .with_context(|| format!("parse dns upstream entry {p:?}"))
         })
         .collect()
-}
-
-/// Pick a default bridge IP for `subnet`: the first usable host address
-/// (e.g. `172.20.0.1` for `172.20.0.0/24`). Falls back to the network
-/// address when the subnet has no hosts (e.g. `/32`).
-#[must_use]
-pub fn derive_bridge_ip(subnet: Ipv4Net) -> Ipv4Addr {
-    subnet.hosts().next().unwrap_or_else(|| subnet.addr())
 }
 
 #[derive(Debug, Clone)]
@@ -187,7 +201,6 @@ struct AllocatedApp {
 
 /// Internal state that the DNS handler shares with the public surface.
 pub struct Egress {
-    config: EgressConfig,
     allocator: Mutex<IpAllocator>,
     apps: Mutex<std::collections::HashMap<String, AllocatedApp>>,
     /// IPs recovered from live `bugpot-*` netns at startup. Drained by
@@ -195,7 +208,6 @@ pub struct Egress {
     /// anything left over after reattach is an orphan netns (see #35).
     discovered_endpoints: Mutex<std::collections::HashMap<String, Ipv4Addr>>,
     registry: Arc<AppRegistry>,
-    nft_table: String,
     // Holding the server keeps the DNS task alive for the lifetime of Egress.
     _dns_server: Option<DnsServer<EgressDnsHandler<HickoryUpstream, NftAllowSet>>>,
 }
@@ -203,8 +215,9 @@ pub struct Egress {
 impl std::fmt::Debug for Egress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Egress")
-            .field("config", &self.config)
-            .field("nft_table", &self.nft_table)
+            .field("bridge", &BRIDGE_NAME)
+            .field("subnet", &subnet())
+            .field("nft_table", &NFT_TABLE)
             .finish_non_exhaustive()
     }
 }
@@ -213,9 +226,11 @@ impl Egress {
     /// Bring up the bridge, install the nftables ruleset, and start the DNS
     /// server. Requires root.
     pub async fn new(config: EgressConfig) -> anyhow::Result<Self> {
+        let subnet = subnet();
+        let bridge_ip = bridge_ip();
+
         // 1. bridge + sysctl
-        let bridge_cmds =
-            netns::render_setup_bridge(&config.bridge_name, config.bridge_ip, config.subnet);
+        let bridge_cmds = netns::render_setup_bridge(BRIDGE_NAME, bridge_ip, subnet);
         // Best-effort: ignore "already exists" by re-running individually.
         for cmd in bridge_cmds {
             let _ = netns::run_cmds(vec![cmd]).await;
@@ -223,12 +238,12 @@ impl Egress {
 
         // 2. nftables ruleset
         let nft_cfg = NftConfig {
-            table: config.nft_table.clone(),
-            bridge: config.bridge_name.clone(),
-            subnet: config.subnet,
-            bridge_ip: config.bridge_ip,
-            dns_port: config.dns_port,
-            allow_ttl_secs: config.allow_ttl_secs,
+            table: NFT_TABLE.to_owned(),
+            bridge: BRIDGE_NAME.to_owned(),
+            subnet,
+            bridge_ip,
+            dns_port: DNS_PORT,
+            allow_ttl_secs: ALLOW_TTL_SECS,
         };
         nft::run_script(&nft::render_bootstrap(&nft_cfg))
             .await
@@ -238,12 +253,11 @@ impl Egress {
         let registry = Arc::new(AppRegistry::new());
         let upstream = Arc::new(HickoryUpstream::new(&config.dns_upstream)?);
         let allow_set = Arc::new(NftAllowSet {
-            table: config.nft_table.clone(),
+            table: NFT_TABLE.to_owned(),
         });
-        let handler =
-            EgressDnsHandler::new(registry.clone(), upstream, allow_set, config.allow_ttl_secs);
+        let handler = EgressDnsHandler::new(registry.clone(), upstream, allow_set, ALLOW_TTL_SECS);
         let mut server = DnsServer::new(handler);
-        let bind_addr = SocketAddr::from((config.bridge_ip, config.dns_port));
+        let bind_addr = SocketAddr::from((bridge_ip, DNS_PORT));
         let udp = UdpSocket::bind(bind_addr)
             .await
             .with_context(|| format!("bind DNS UDP {bind_addr}"))?;
@@ -253,7 +267,7 @@ impl Egress {
             .with_context(|| format!("bind DNS TCP {bind_addr}"))?;
         server.register_listener(tcp, std::time::Duration::from_secs(5), 4096);
 
-        let mut allocator = IpAllocator::new(config.subnet, config.bridge_ip)?;
+        let mut allocator = IpAllocator::new(subnet, bridge_ip)?;
         // Sanity allocate-and-release to prove the subnet works.
         let probe = allocator.allocate()?;
         allocator.release(probe);
@@ -270,8 +284,6 @@ impl Egress {
         }
 
         Ok(Self {
-            nft_table: config.nft_table.clone(),
-            config,
             allocator: Mutex::new(allocator),
             apps: Mutex::new(std::collections::HashMap::new()),
             discovered_endpoints: Mutex::new(discovered),
@@ -290,7 +302,7 @@ impl EgressOps for Egress {
     ) -> anyhow::Result<Endpoint> {
         let parsed = Allowlist::parse(allowlist)?;
         let container_ip = self.allocator.lock().allocate()?;
-        let plan = EndpointLayout::new(name, container_ip, self.config.subnet);
+        let plan = EndpointLayout::new(name, container_ip, subnet());
 
         // Defensive pre-detach: a prior `release_endpoint` may have
         // bailed mid-way and left a netns + veth named the way we're
@@ -298,11 +310,8 @@ impl EgressOps for Egress {
         // exists — so this only does anything on the leaked-state path.
         netns::force_detach_endpoint(&plan).await;
 
-        if let Err(e) = netns::run_cmds(netns::render_attach_endpoint(
-            &self.config.bridge_name,
-            &plan,
-        ))
-        .await
+        if let Err(e) =
+            netns::run_cmds(netns::render_attach_endpoint(BRIDGE_NAME, &plan)).await
         {
             // Roll back: tear down any partial state from a failed
             // attach (e.g. netns add succeeded but veth move failed),
@@ -338,7 +347,7 @@ impl EgressOps for Egress {
             return Ok(None);
         };
         let parsed = Allowlist::parse(allowlist)?;
-        let plan = EndpointLayout::new(name, container_ip, self.config.subnet);
+        let plan = EndpointLayout::new(name, container_ip, subnet());
         let ep = Endpoint {
             container_ip,
             netns_path: plan.ns_path.clone(),
@@ -368,13 +377,13 @@ impl EgressOps for Egress {
         // Best-effort: drop any allow-set entries left over from the
         // previous bugpot run for *this* container IP. Entries also
         // TTL out, so a failure here is non-fatal.
-        let _ = nft::flush_src(&self.nft_table, container_ip).await;
+        let _ = nft::flush_src(NFT_TABLE,container_ip).await;
         // Use force-detach so a missing veth (e.g. host side already
         // gone) doesn't prevent deleting the netns. The netns name +
         // host veth name derive deterministically from the app name,
         // so this works even though we never called
         // `allocate_endpoint` for this app in this process.
-        let plan = netns::EndpointLayout::new(name, container_ip, self.config.subnet);
+        let plan = netns::EndpointLayout::new(name, container_ip, subnet());
         netns::force_detach_endpoint(&plan).await;
         self.allocator.lock().release(container_ip);
         Ok(())
@@ -396,7 +405,7 @@ impl EgressOps for Egress {
         // 60s TTL is a backstop). Only entries matching *this* src IP
         // are removed — previous behaviour flushed the whole set, which
         // briefly broke egress for every other running app.
-        let _ = nft::flush_src(&self.nft_table, app.container_ip).await;
+        let _ = nft::flush_src(NFT_TABLE,app.container_ip).await;
         netns::run_cmds(netns::render_detach_endpoint(&app.plan)).await?;
         Ok(())
     }
@@ -483,30 +492,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_config_is_sane() {
-        let c = EgressConfig::default();
-        assert_eq!(c.bridge_name, "bugpot0");
-        assert!(c.subnet.contains(&c.bridge_ip));
-        assert_eq!(c.allow_ttl_secs, 60);
-        assert!(!c.dns_upstream.is_empty());
-        c.validate().expect("default config validates");
+    fn host_constants_are_consistent() {
+        // Bridge IP must live inside the bridge subnet; this is the one
+        // invariant that used to be checked by `EgressConfig::validate`
+        // and is now enforced by the type-level constants.
+        assert!(subnet().contains(&bridge_ip()));
+        assert_eq!(BRIDGE_NAME, "bugpot0");
+        assert_eq!(NFT_TABLE, "bugpot");
+        assert_eq!(DNS_PORT, 53);
+        assert_eq!(ALLOW_TTL_SECS, 60);
     }
 
     #[test]
-    fn validate_rejects_bridge_ip_outside_subnet() {
-        let c = EgressConfig {
-            bridge_ip: "10.0.0.1".parse().unwrap(),
-            ..EgressConfig::default()
-        };
-        let err = c.validate().unwrap_err().to_string();
-        assert!(err.contains("not within subnet"), "got: {err}");
+    fn default_config_is_sane() {
+        let c = EgressConfig::default();
+        assert!(!c.dns_upstream.is_empty());
+        c.validate().expect("default config validates");
     }
 
     #[test]
     fn validate_rejects_empty_dns_upstream() {
         let c = EgressConfig {
             dns_upstream: vec![],
-            ..EgressConfig::default()
         };
         let err = c.validate().unwrap_err().to_string();
         assert!(err.contains("dns_upstream"), "got: {err}");
@@ -537,19 +544,4 @@ mod tests {
         assert!(parse_dns_upstream("1.1.1.1").is_err());
     }
 
-    #[test]
-    fn derive_bridge_ip_picks_first_host() {
-        let subnet: Ipv4Net = "10.0.0.0/24".parse().unwrap();
-        assert_eq!(
-            derive_bridge_ip(subnet),
-            "10.0.0.1".parse::<Ipv4Addr>().unwrap()
-        );
-
-        let subnet: Ipv4Net = "192.168.5.0/22".parse().unwrap();
-        // /22 starts at 192.168.4.0, first host is 192.168.4.1
-        assert_eq!(
-            derive_bridge_ip(subnet),
-            "192.168.4.1".parse::<Ipv4Addr>().unwrap()
-        );
-    }
 }
