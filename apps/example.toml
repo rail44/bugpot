@@ -1,4 +1,4 @@
-# Example app spec. Used by `cargo run -p bugpot` as a default demo.
+# Example app spec. Used by `cargo run -p bugpotd` as a default demo.
 image = "ghcr.io/library/hello-world:latest"
 port = 8080
 

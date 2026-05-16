@@ -26,7 +26,7 @@ VM as needed. Run `just` (or `just --list`) for the full menu. Selected
 recipes:
 
 ```sh
-just build            # cargo build -p bugpot (in VM)
+just build            # cargo build -p bugpotd (in VM)
 just test             # cargo test --workspace (in VM)
 just clippy
 just smoke-infra      # scripts/smoke-infra.sh under sudo
@@ -48,12 +48,12 @@ changes.
 ### Mac-native fast paths
 
 Most cargo commands have to run inside Lima because `bugpot-runtime`,
-`bugpot-egress`, `bugpot-controller`, `bugpot-admin`, and `cmd/bugpot`
+`bugpot-egress`, `bugpot-controller`, `bugpot-admin`, and `cmd/bugpotd`
 all transitively depend on Linux-only crates (`libcontainer`,
-`procfs`, `nix::sched`, `inotify`). Three crates are pure Rust and
+`procfs`, `nix::sched`, `inotify`). Four crates are pure Rust and
 compile on macOS directly:
 
-- `bugpot-config`, `bugpot-router`, `bugpot-metrics`
+- `bugpot-config`, `bugpot-router`, `bugpot-metrics`, `cmd/bugpot` (CLI)
 
 For those crates and for `cargo fmt`, the justfile exposes
 `-host` / `fmt` recipes that skip the Lima round-trip entirely:
@@ -141,18 +141,19 @@ Env vars (read by bugpot directly):
 `bugpot-admin` exposes a minimal CRUD surface for runtime app management.
 Listener is whatever `BUGPOT_ADMIN_LISTEN` points at.
 
-The pure-Rust **`bp` CLI** (`cmd/bugpot-cli`, binary name `bp`) wraps the
-endpoints below for daily use: `bp apps list / get / create / update /
-delete`, `bp rollouts list <app>`, `bp rollout <app> <tag>`,
-`bp deploy-key <app>`. Reads `BUGPOT_ADMIN_URL` / `BUGPOT_ADMIN_TOKEN[_FILE]`
-(plus `BUGPOT_DEPLOY_TOKEN[_FILE]` for the rollout plane) from env;
-default `BUGPOT_ADMIN_URL` is `http://127.0.0.1:8081`. Pass `--json` on
-any command to forward the raw API response verbatim — useful for
-piping into `jq` from a self-hosted CI runner.
+The pure-Rust **`bugpot` CLI** (`cmd/bugpot`) wraps the endpoints below
+for daily use under a `<noun> <verb>` grammar:
+`bugpot apps {list,get,create,update,delete,deploy-key}` and
+`bugpot rollouts {list,push}`. Reads `BUGPOT_ADMIN_URL` /
+`BUGPOT_ADMIN_TOKEN[_FILE]` (plus `BUGPOT_DEPLOY_TOKEN[_FILE]` for the
+rollouts plane) from env; default `BUGPOT_ADMIN_URL` is
+`http://127.0.0.1:8081`. Pass `--json` on any command to forward the
+raw API response verbatim — useful for piping into `jq` from a
+self-hosted CI runner.
 
-`bp` is intentionally pure-Rust and dep-free of `bugpot-runtime` /
+The CLI is intentionally pure-Rust and dep-free of `bugpot-runtime` /
 `bugpot-controller` / `bugpot-admin` so it compiles on macOS too;
-operators can run it from their laptop against a remote bugpot.
+operators can run it from their laptop against a remote `bugpotd`.
 
 Bearer-token auth is **mandatory** (`BUGPOT_ADMIN_TOKEN_FILE` preferred,
 `BUGPOT_ADMIN_TOKEN` env var as fallback). bugpot refuses to start
@@ -227,10 +228,11 @@ works correctly.
 
 ## Architecture
 
-Library crates assembled by a single binary:
+Library crates assembled by two binaries (`bugpotd` daemon and
+`bugpot` CLI):
 
 ```
-cmd/bugpot (main: wires everything; no business logic)
+cmd/bugpotd (main: wires everything; no business logic)
    │
    ├─► bugpot-config     : parses apps/*.toml → AppSpec
    ├─► bugpot-egress     : bridge + netns + nft + DNS allowlist
@@ -239,6 +241,8 @@ cmd/bugpot (main: wires everything; no business logic)
    ├─► bugpot-controller : AppHandle state machine + cold-start orchestration + idle reaper
    ├─► bugpot-admin      : admin HTTP API (CRUD over AppController), bearer auth
    └─► bugpot-metrics    : Prometheus recorder + /metrics + /healthz listener
+
+cmd/bugpot (CLI; pure-Rust, also builds on macOS — talks to bugpotd's admin API)
 ```
 
 `experiments/youki-sandbox` is a standalone playground for oci-client/libcontainer experiments; it isn't part of the runtime path.
@@ -316,8 +320,8 @@ The Lima VM provisioning sets `kernel.perf_event_paranoid = -1` and `kernel.kptr
 
 ```sh
 just shell                                          # inside the VM
-cargo build --release -p bugpot
-samply record -- ./target/release/bugpot           # ^C to stop and upload to Firefox Profiler
+cargo build --release -p bugpotd
+samply record -- ./target/release/bugpotd          # ^C to stop and upload to Firefox Profiler
 ```
 
 Samply pops a browser tab on the macOS host (via port forward) with a call tree / stack chart / CPU history. Symbolisation is automatic from DWARF.
@@ -326,19 +330,19 @@ Samply pops a browser tab on the macOS host (via port forward) with a call tree 
 
 ```sh
 sudo bpftrace -e 'tracepoint:syscalls:sys_enter_execve { printf("%s -> %s\n", comm, str(args.filename)); }'
-sudo bpftrace -e 'kprobe:do_unlinkat /comm == "bugpot"/ { @ = count(); }'
+sudo bpftrace -e 'kprobe:do_unlinkat /comm == "bugpotd"/ { @ = count(); }'
 ```
 
 Useful for nftables / netns / libcontainer `clone` cost questions that the in-process profilers can't see.
 
 **Live task / runtime debugger (tokio-console):**
 
-Bugpot has an opt-in `tokio-console` cargo feature on `cmd/bugpot`. The feature gates `console-subscriber` and also unblocks the `tokio_unstable`-only portion of the `bugpot_tokio_*` Prometheus metric set in `bugpot-metrics`. The `tokio_unstable` cfg has to be set at build time — both `just build-console` and `just run-console` set `RUSTFLAGS="--cfg tokio_unstable"` for you:
+Bugpot has an opt-in `tokio-console` cargo feature on `cmd/bugpotd`. The feature gates `console-subscriber` and also unblocks the `tokio_unstable`-only portion of the `bugpot_tokio_*` Prometheus metric set in `bugpot-metrics`. The `tokio_unstable` cfg has to be set at build time — both `just build-console` and `just run-console` set `RUSTFLAGS="--cfg tokio_unstable"` for you:
 
 ```sh
-just run-console                                    # foreground bugpot with the console layer enabled
+just run-console                                    # foreground bugpotd with the console layer enabled
 just shell                                          # in a separate terminal, inside the VM
-tokio-console http://127.0.0.1:6669                 # attach to the running bugpot
+tokio-console http://127.0.0.1:6669                 # attach to the running bugpotd
 ```
 
 The console UI lists every tokio task with its busy / idle ratio and the longest `.await` poll. Useful when cold-start latency is dominated by a single stall and you don't know which one. The default build does **not** include the console layer or its overhead — only the on-demand `--features tokio-console` build does.

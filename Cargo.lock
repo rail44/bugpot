@@ -220,19 +220,12 @@ name = "bugpot"
 version = "0.0.1"
 dependencies = [
  "anyhow",
- "bugpot-admin",
- "bugpot-config",
- "bugpot-controller",
- "bugpot-egress",
- "bugpot-metrics",
- "bugpot-router",
- "bugpot-runtime",
- "console-subscriber",
- "ipnet",
- "metrics",
+ "clap",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
  "tokio",
- "tracing",
- "tracing-subscriber",
+ "toml",
 ]
 
 [[package]]
@@ -257,19 +250,6 @@ dependencies = [
  "tower-http",
  "tracing",
  "zeroize",
-]
-
-[[package]]
-name = "bugpot-cli"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "clap",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "tokio",
- "toml",
 ]
 
 [[package]]
@@ -385,6 +365,26 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+]
+
+[[package]]
+name = "bugpotd"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bugpot-admin",
+ "bugpot-config",
+ "bugpot-controller",
+ "bugpot-egress",
+ "bugpot-metrics",
+ "bugpot-router",
+ "bugpot-runtime",
+ "console-subscriber",
+ "ipnet",
+ "metrics",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

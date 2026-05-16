@@ -41,14 +41,14 @@ bugpot needs Linux 5.x+ with `nftables`, `iproute2`, and cgroup v2.
 Run it as a **non-root user (`bugpot`)** with only the kernel
 capabilities it actually exercises — never as full root. A
 hardened systemd unit is shipped at
-[`examples/bugpot.service`](../examples/bugpot.service).
+[`examples/bugpotd.service`](../examples/bugpotd.service).
 
 ### Install
 
 ```sh
 # 1. Build the release binary on the target host (or copy in).
-cargo build --release -p bugpot
-sudo install -m 0755 target/release/bugpot /usr/local/bin/bugpot
+cargo build --release -p bugpotd
+sudo install -m 0755 target/release/bugpotd /usr/local/bin/bugpotd
 
 # 2. Create the unprivileged user the daemon will run as.
 sudo useradd --system --home-dir /var/lib/bugpot --shell /sbin/nologin bugpot
@@ -67,14 +67,14 @@ sudo sh -c 'openssl rand -base64 32 > /etc/bugpot/admin-token'
 sudo sh -c 'openssl rand -base64 32 > /etc/bugpot/deploy-secret'
 
 # 5. Drop in the systemd unit and start.
-sudo install -m 0644 examples/bugpot.service /etc/systemd/system/bugpot.service
+sudo install -m 0644 examples/bugpotd.service /etc/systemd/system/bugpotd.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now bugpot
+sudo systemctl enable --now bugpotd
 ```
 
 ### What the unit gives you
 
-The shipped `bugpot.service` runs the daemon with only the
+The shipped `bugpotd.service` runs the daemon with only the
 capabilities it actually exercises (`CAP_NET_ADMIN`,
 `CAP_SYS_ADMIN`, `CAP_NET_BIND_SERVICE`, `CAP_SETUID`,
 `CAP_SETGID`, `CAP_SYS_CHROOT`, `CAP_KILL`, `CAP_CHOWN`,
@@ -83,8 +83,8 @@ knobs: `NoNewPrivileges`, `ProtectSystem=strict`,
 `ProtectHome`, `PrivateTmp`, `ProtectKernel*`, `ProtectProc=invisible`,
 `MemoryDenyWriteExecute`, `RestrictAddressFamilies`,
 `SystemCallFilter`, and `Delegate=yes` for cgroup access.
-`KillSignal=SIGINT` triggers bugpot's graceful teardown so
-`systemctl stop bugpot` releases endpoints cleanly.
+`KillSignal=SIGINT` triggers bugpotd's graceful teardown so
+`systemctl stop bugpotd` releases endpoints cleanly.
 
 Override environment variables (anything in CLAUDE.md's env-var
 list) by dropping a file at `/etc/bugpot/env` — the unit's

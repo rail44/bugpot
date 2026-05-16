@@ -2,7 +2,7 @@
 resolver = "3"
 members = [
     "cmd/bugpot",
-    "cmd/bugpot-cli",
+    "cmd/bugpotd",
     "crates/bugpot-admin",
     "crates/bugpot-config",
     "crates/bugpot-controller",

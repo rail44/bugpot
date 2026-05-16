@@ -12,8 +12,8 @@ minimumLimaVersion: 2.0.0
 #   limactl start bugpot
 #   limactl shell bugpot
 #   cd /Users/gam0282/src/github.com/rail44/bugpot
-#   cargo build -p bugpot
-#   sudo -E ./target/debug/bugpot          # or any scripts/smoke-*.sh
+#   cargo build -p bugpotd
+#   sudo -E ./target/debug/bugpotd         # or any scripts/smoke-*.sh
 
 base:
 - template:_images/ubuntu-24.04
@@ -89,7 +89,7 @@ provision:
     done
 - mode: user
   # CPU profiler. Sampling tool that uploads to Firefox Profiler. Used
-  # via `samply record -- ./target/release/bugpot ...` then opens the
+  # via `samply record -- ./target/release/bugpotd ...` then opens the
   # browser. `--locked` keeps the install reproducible. ~2 min compile
   # at first provision; idempotent thereafter.
   script: |

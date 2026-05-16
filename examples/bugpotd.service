@@ -1,12 +1,12 @@
 [Unit]
-Description=bugpot — internal Heroku-like PaaS for experimental apps
+Description=bugpotd — bugpot daemon for the internal Heroku-like PaaS
 Documentation=https://github.com/rail44/bugpot
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=exec
-ExecStart=/usr/local/bin/bugpot
+ExecStart=/usr/local/bin/bugpotd
 Restart=on-failure
 RestartSec=5s
 

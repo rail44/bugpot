@@ -24,9 +24,9 @@ shell:
 
 # --- Build / test (inside the VM) ---
 
-# Build the bugpot binary.
+# Build the bugpotd daemon binary.
 build:
-    limactl shell bugpot -- bash -lc 'cargo build -p bugpot'
+    limactl shell bugpot -- bash -lc 'cargo build -p bugpotd'
 
 # cargo check across the workspace.
 check:
@@ -77,17 +77,17 @@ clippy-host:
 
 # --- tokio-console workflow ---
 
-# Build bugpot with the tokio-console feature. Sets `RUSTFLAGS` so
+# Build bugpotd with the tokio-console feature. Sets `RUSTFLAGS` so
 # `console-subscriber` and the unstable-only `bugpot_tokio_*`
 # metric fields compile in. Use with `just run-console` (foreground)
-# or `just shell` + manual `./target/debug/bugpot`.
+# or `just shell` + manual `./target/debug/bugpotd`.
 build-console:
-    limactl shell bugpot -- bash -lc 'RUSTFLAGS="--cfg tokio_unstable" cargo build -p bugpot --features tokio-console'
+    limactl shell bugpot -- bash -lc 'RUSTFLAGS="--cfg tokio_unstable" cargo build -p bugpotd --features tokio-console'
 
 # Foreground run with tokio-console enabled. Attach from another
 # shell inside the VM: `tokio-console http://127.0.0.1:6669`.
 run-console:
-    limactl shell bugpot -- bash -lc 'RUSTFLAGS="--cfg tokio_unstable" sudo -E env "PATH=$PATH" cargo run -p bugpot --features tokio-console'
+    limactl shell bugpot -- bash -lc 'RUSTFLAGS="--cfg tokio_unstable" sudo -E env "PATH=$PATH" cargo run -p bugpotd --features tokio-console'
 
 # --- Microbenchmarks (divan) ---
 

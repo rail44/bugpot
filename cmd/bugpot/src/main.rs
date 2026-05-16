@@ -1,429 +1,574 @@
-//! `bugpot` entrypoint.
+//! `bugpot` — admin CLI for the `bugpotd` daemon.
 //!
-//! Loads `apps/*.toml`, brings up the egress stack (bridge / DNS / nftables),
-//! initialises the runtime, and starts the router. Apps are deployed
-//! lazily by the [`AppController`] on first request, except those that
-//! explicitly opt out of scale-to-zero (`scaling.idle_timeout = "0"`),
-//! which are started eagerly on bring-up.
+//! Talks to a running `bugpotd` instance's admin API (the binding of
+//! `BUGPOT_ADMIN_LISTEN`). Auth via bearer token sourced from env:
+//! `BUGPOT_ADMIN_TOKEN` (literal) or `BUGPOT_ADMIN_TOKEN_FILE`
+//! (path; trimmed contents). Exactly one of the two must be set.
 //!
-//! On SIGINT, every running app is stopped and its endpoint released. The
-//! bridge / nftables ruleset persist across runs; `Egress::new` re-applies
-//! them atomically.
+//! Endpoint is `BUGPOT_ADMIN_URL`, default `http://127.0.0.1:8081`.
+//!
+//! Output is tabular / human-readable by default; pass `--json` to
+//! forward the raw API response to stdout instead.
+//!
+//! Intentionally pure-Rust: this crate compiles on macOS so an
+//! operator can run `bugpot` against a remote `bugpotd` from their
+//! laptop without the Linux-only daemon-side deps.
 
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::path::PathBuf;
 
-use anyhow::{Context, Result};
-use bugpot_admin::AdminAuth;
-use bugpot_controller::AppController;
-use bugpot_egress::{Egress, EgressConfig, EgressOps};
-use bugpot_router::UpstreamResolver;
-use bugpot_runtime::{Runtime, RuntimeOps};
-use tokio::task::JoinHandle;
-use tracing::{error, info, warn};
-use tracing_subscriber::EnvFilter;
+use anyhow::{Context, Result, anyhow, bail};
+use clap::{Parser, Subcommand};
+use reqwest::{Client, StatusCode};
+use serde::{Deserialize, Serialize};
 
-const DEFAULT_LISTEN: &str = "127.0.0.1:8080";
-const DEFAULT_ADMIN_LISTEN: &str = "127.0.0.1:8081";
-const DEFAULT_APPS_DIR: &str = "./apps";
-const DEFAULT_AUTH_FILE: &str = "/etc/bugpot/auth.toml";
-/// Cadence for the controller's lifecycle sweep (crash detection +
-/// scale-to-zero idle stop). 30 s strikes the balance for a 1 vCPU
-/// host: granular enough that idle-stop happens within a minute of
-/// the configured timeout, but not so aggressive that the sweep
-/// itself wakes the CPU twelve times a minute for nothing.
-const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+const DEFAULT_ADMIN_URL: &str = "http://127.0.0.1:8081";
 
-// Metrics: the Prometheus recorder is *always* installed so callsites
-// emit successfully; the HTTP listener is only spawned when
-// `BUGPOT_METRICS_LISTEN` is set, keeping the surface area opt-in.
+// ---- CLI surface ----------------------------------------------------------
 
-#[derive(Debug)]
-struct Config {
-    apps_dir: PathBuf,
-    listen: SocketAddr,
-    admin_listen: SocketAddr,
-    auth_file: PathBuf,
-    egress: EgressConfig,
+#[derive(Parser, Debug)]
+#[command(
+    name = "bugpot",
+    version,
+    about = "bugpot admin client",
+    long_about = "CLI front-end for bugpotd's admin API.\n\
+                  Set BUGPOT_ADMIN_URL + BUGPOT_ADMIN_TOKEN[_FILE]."
+)]
+struct Cli {
+    /// Output as JSON (raw API response) instead of human-readable.
+    #[arg(long, global = true)]
+    json: bool,
+
+    #[command(subcommand)]
+    cmd: Cmd,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    init_tracing();
-    let metrics_handle = bugpot_metrics::install_recorder().context("install metrics recorder")?;
+/// Top-level groups are plural nouns (`apps`, `rollouts`); the verb
+/// always comes second. Avoids the older `bugpot rollout` /
+/// `bugpot deploy-key` shape where some actions sat at the root and
+/// others under a noun.
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    /// App config plane.
+    #[command(subcommand)]
+    Apps(AppsCmd),
 
-    // Capability-based start gate. bugpot doesn't actually require
-    // uid=0 — only `CAP_NET_ADMIN` (bridge / veth / nftables) plus
-    // a handful of others libcontainer needs. The shipped systemd
-    // unit (examples/bugpot.service) grants exactly that set via
-    // `AmbientCapabilities` to an unprivileged `bugpot` user.
-    if !has_cap_net_admin() {
-        anyhow::bail!(
-            "bugpot needs CAP_NET_ADMIN (and the libcontainer set) — \
-             bridge / veth / netns / nftables setup will fail without it.\n\
-             Install via the shipped systemd unit (examples/bugpot.service) \
-             or, for development, run under `sudo`. See docs/deploy.md."
-        );
+    /// Rollouts plane (history + push).
+    #[command(subcommand)]
+    Rollouts(RolloutsCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum AppsCmd {
+    /// List all registered apps.
+    List,
+    /// Inspect a single app.
+    Get {
+        /// App name.
+        name: String,
+    },
+    /// Register a new app from a TOML spec file.
+    Create {
+        /// Path to the app's `<name>.toml`. Required field `name`
+        /// must match the intended app name (the admin API has no
+        /// filename context).
+        #[arg(short = 'f', long)]
+        file: PathBuf,
+    },
+    /// Replace mutable fields of an app from a TOML spec file
+    /// (server-side semantics: PATCH).
+    Update {
+        /// App name to update.
+        name: String,
+        /// Path to the updated `<name>.toml`. Same shape as `create`;
+        /// `name` and `subdomain` are immutable and must match the
+        /// existing app or the server returns 400.
+        #[arg(short = 'f', long)]
+        file: PathBuf,
+    },
+    /// Stop and remove an app.
+    Delete {
+        /// App name.
+        name: String,
+    },
+    /// Issue a deploy key for an app (one-time output — the token is
+    /// not retrievable afterwards).
+    DeployKey {
+        /// App name.
+        name: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum RolloutsCmd {
+    /// List rollout history for an app (oldest first).
+    List {
+        /// App name.
+        app: String,
+    },
+    /// Push a new rollout (pull + restart). Uses the per-app deploy
+    /// token from `$BUGPOT_DEPLOY_TOKEN` or `$BUGPOT_DEPLOY_TOKEN_FILE`.
+    Push {
+        /// App name.
+        app: String,
+        /// Image tag (e.g. `v1.2.3` or a git SHA).
+        tag: String,
+    },
+}
+
+// ---- Wire types (mirror of bugpot-admin / bugpot-controller) --------------
+//
+// These are the *client* view. We don't share the server crate's structs
+// because pulling in `bugpot-controller` would drag the Linux-only
+// libcontainer dependency tree into the CLI.
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct AppView {
+    name: String,
+    subdomain: String,
+    repo: String,
+    port: u16,
+    /// `stopped` | `starting` | `running` | `stopping` — kept as a
+    /// String for forward-compat with future server-side additions.
+    state: String,
+    #[serde(default)]
+    current_rollout: Option<Rollout>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct Rollout {
+    tag: String,
+    created_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeployKeyResponse {
+    token: String,
+}
+
+// ---- Config ---------------------------------------------------------------
+
+struct AdminConfig {
+    base_url: String,
+    token: String,
+}
+
+impl AdminConfig {
+    fn from_env() -> Result<Self> {
+        let base_url =
+            std::env::var("BUGPOT_ADMIN_URL").unwrap_or_else(|_| DEFAULT_ADMIN_URL.to_string());
+        let token = read_token("admin")?;
+        Ok(Self { base_url, token })
     }
+}
 
-    let cfg = parse_config()?;
+struct DeployConfig {
+    base_url: String,
+    token: String,
+}
 
-    let apps = bugpot_config::load_apps(&cfg.apps_dir)?;
-    info!(count = apps.len(), dir = %cfg.apps_dir.display(), "loaded apps");
+impl DeployConfig {
+    fn from_env() -> Result<Self> {
+        let base_url =
+            std::env::var("BUGPOT_ADMIN_URL").unwrap_or_else(|_| DEFAULT_ADMIN_URL.to_string());
+        let token = read_token("deploy")?;
+        Ok(Self { base_url, token })
+    }
+}
 
-    let auth = bugpot_config::load_auth(&cfg.auth_file).context("load auth.toml")?;
-    info!(
-        file = %cfg.auth_file.display(),
-        registries = auth.registries.len(),
-        "loaded registry auth",
-    );
+/// Read a bearer token from `BUGPOT_<KIND>_TOKEN` (literal) or
+/// `BUGPOT_<KIND>_TOKEN_FILE` (trimmed file contents). The file path
+/// is preferred for production; the literal exists for convenience.
+fn read_token(kind: &str) -> Result<String> {
+    let kind_upper = kind.to_ascii_uppercase();
+    let direct_var = format!("BUGPOT_{kind_upper}_TOKEN");
+    let file_var = format!("BUGPOT_{kind_upper}_TOKEN_FILE");
+    let direct = std::env::var(&direct_var).ok();
+    let file_path = std::env::var(&file_var).ok();
+    resolve_token(
+        direct.as_deref(),
+        file_path.as_deref(),
+        &direct_var,
+        &file_var,
+    )
+}
 
-    // Egress (bridge + DNS + nftables): idempotent across runs.
-    info!(
-        bridge = %bugpot_egress::BRIDGE_NAME,
-        subnet = %bugpot_egress::subnet(),
-        bridge_ip = %bugpot_egress::bridge_ip(),
-        "bringing up egress"
-    );
-    let egress = Arc::new(
-        Egress::new(cfg.egress)
-            .await
-            .context("init egress (bridge/DNS/nftables)")?,
-    );
-
-    // Runtime (image cache + libcontainer state).
-    let state_dir = Runtime::default_state_dir();
-    info!(state_dir = %state_dir.display(), "init runtime");
-    let runtime = Arc::new(Runtime::new(state_dir).context("init runtime")?);
-
-    // Reclaim image cache dirs whose digest no bundle references and
-    // any orphan `.tmp.*` / incomplete-pull dirs. Safe before pulls
-    // because nothing else has started yet.
-    match runtime.gc_unused_images() {
-        Ok(removed) if removed > 0 => {
-            info!(removed, "image cache GC");
-            metrics::counter!("bugpot_images_gc_total").increment(removed as u64);
+/// Pure resolution logic, split out from `read_token` so unit tests
+/// can exercise it without mutating the process environment.
+fn resolve_token(
+    direct: Option<&str>,
+    file_path: Option<&str>,
+    direct_var: &str,
+    file_var: &str,
+) -> Result<String> {
+    if let Some(v) = direct {
+        let trimmed = v.trim();
+        if trimmed.is_empty() {
+            bail!("${direct_var} is set but empty");
         }
-        Ok(_) => {}
-        Err(e) => warn!(error = ?e, "image cache GC failed (continuing)"),
+        return Ok(trimmed.to_owned());
     }
-
-    // Controller owns per-app lifecycle.
-    let controller = Arc::new(AppController::new(
-        runtime,
-        egress,
-        cfg.apps_dir.clone(),
-        auth,
-        apps,
-    ));
-    // Reclaim any containers + endpoints that survived a previous bugpot
-    // process (e.g. a crash, or a planned binary upgrade in a later
-    // version). Done before deploy_always_on so eager-start sees these
-    // apps already Running and skips them.
-    controller.reattach_running().await;
-
-    // Anything left in egress's discovered set has no current TOML —
-    // tear it down so its IP doesn't sit allocated forever and the
-    // netns / nft entries don't linger.
-    controller.cleanup_orphans().await;
-
-    if let Err(e) = controller.deploy_always_on().await {
-        error!(error = ?e, "eager-start failed; rolling back");
-        controller.teardown().await;
-        return Err(e);
+    if let Some(p) = file_path {
+        let s = std::fs::read_to_string(p).with_context(|| format!("read {p}"))?;
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            bail!("${file_var} points at an empty file");
+        }
+        return Ok(trimmed.to_owned());
     }
+    bail!("Neither ${direct_var} nor ${file_var} is set")
+}
 
-    let sweep_task = spawn_sweep(&controller);
-    let serve_task = spawn_router(cfg.listen, &controller)?;
+// ---- Entry point ----------------------------------------------------------
 
-    // Sample the tokio runtime every 10s and emit `bugpot_tokio_*`
-    // gauges / counters. Unconditional — the cost is negligible
-    // (a single background task with one `Handle::current()`
-    // snapshot per tick) and the metrics are no-op when the
-    // recorder's listener is disabled, just like every other
-    // emission point.
-    bugpot_metrics::spawn_runtime_monitor(std::time::Duration::from_secs(10));
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let client = Client::new();
 
-    // Metrics HTTP listener (optional). The recorder is installed
-    // unconditionally above so emission paths stay no-op-safe even when
-    // the listener is disabled.
-    let metrics_task = if let Ok(raw) = std::env::var("BUGPOT_METRICS_LISTEN") {
-        let addr: SocketAddr = raw.parse().context("parse BUGPOT_METRICS_LISTEN")?;
-        Some(tokio::spawn(async move {
-            if let Err(e) = bugpot_metrics::serve(addr, metrics_handle).await {
-                error!(error = %e, "metrics endpoint exited with error");
+    match cli.cmd {
+        Cmd::Apps(op) => run_apps(&client, op, cli.json).await,
+        Cmd::Rollouts(op) => run_rollouts(&client, op, cli.json).await,
+    }
+}
+
+// ---- Apps subcommands -----------------------------------------------------
+
+async fn run_apps(client: &Client, op: AppsCmd, json: bool) -> Result<()> {
+    let cfg = AdminConfig::from_env()?;
+    match op {
+        AppsCmd::List => {
+            let v: Vec<AppView> = http_get_json(client, &cfg.base_url, "/apps", &cfg.token).await?;
+            if json {
+                print_json(&v)?;
+            } else {
+                print_apps_table(&v);
             }
-        }))
-    } else {
-        info!("BUGPOT_METRICS_LISTEN unset; /metrics endpoint disabled");
-        drop(metrics_handle);
-        None
-    };
-
-    let admin_task = spawn_admin(cfg.admin_listen, &controller)?;
-
-    info!(listen = %cfg.listen, admin_listen = %cfg.admin_listen, "bugpot up; press Ctrl+C to shut down");
-    if let Err(e) = tokio::signal::ctrl_c().await {
-        error!(error = %e, "failed to wait for SIGINT");
+        }
+        AppsCmd::Get { name } => {
+            let v: AppView =
+                http_get_json(client, &cfg.base_url, &format!("/apps/{name}"), &cfg.token).await?;
+            if json {
+                print_json(&v)?;
+            } else {
+                print_app_human(&v);
+            }
+        }
+        AppsCmd::Create { file } => {
+            let body = std::fs::read_to_string(&file)
+                .with_context(|| format!("read {}", file.display()))?;
+            let v: AppView = http_post_toml(client, &cfg.base_url, "/apps", &cfg.token, &body)
+                .await
+                .context("POST /apps")?;
+            if json {
+                print_json(&v)?;
+            } else {
+                eprintln!("created");
+                print_app_human(&v);
+            }
+        }
+        AppsCmd::Update { name, file } => {
+            let body = std::fs::read_to_string(&file)
+                .with_context(|| format!("read {}", file.display()))?;
+            let v: AppView = http_patch_toml(
+                client,
+                &cfg.base_url,
+                &format!("/apps/{name}"),
+                &cfg.token,
+                &body,
+            )
+            .await
+            .context("PATCH /apps")?;
+            if json {
+                print_json(&v)?;
+            } else {
+                eprintln!("updated");
+                print_app_human(&v);
+            }
+        }
+        AppsCmd::Delete { name } => {
+            http_delete(client, &cfg.base_url, &format!("/apps/{name}"), &cfg.token).await?;
+            if !json {
+                eprintln!("deleted {name}");
+            }
+        }
+        AppsCmd::DeployKey { name } => {
+            let v: DeployKeyResponse = http_post_json(
+                client,
+                &cfg.base_url,
+                &format!("/apps/{name}/deploy-keys"),
+                &cfg.token,
+                &serde_json::json!({}),
+            )
+            .await?;
+            if json {
+                // The wire format is `{"token": "bp1..."}` — pass through.
+                println!("{}", serde_json::json!({ "token": v.token }));
+            } else {
+                // Token is unrecoverable after this print — flag it loudly.
+                eprintln!(
+                    "deploy key for {name} (record this NOW — server does not retain the plaintext):"
+                );
+                println!("{}", v.token);
+            }
+        }
     }
-    info!("shutdown signal received; tearing down");
-
-    serve_task.abort();
-    admin_task.abort();
-    if let Some(t) = metrics_task {
-        t.abort();
-    }
-    sweep_task.abort();
-    controller.teardown().await;
-
     Ok(())
 }
 
-fn parse_config() -> Result<Config> {
-    let apps_dir = std::env::var("BUGPOT_APPS_DIR")
-        .map_or_else(|_| PathBuf::from(DEFAULT_APPS_DIR), PathBuf::from);
+// ---- Rollouts subcommands -------------------------------------------------
 
-    let listen: SocketAddr = std::env::var("BUGPOT_LISTEN")
-        .unwrap_or_else(|_| DEFAULT_LISTEN.to_owned())
-        .parse()
-        .context("parse BUGPOT_LISTEN")?;
-
-    let admin_listen: SocketAddr = std::env::var("BUGPOT_ADMIN_LISTEN")
-        .unwrap_or_else(|_| DEFAULT_ADMIN_LISTEN.to_owned())
-        .parse()
-        .context("parse BUGPOT_ADMIN_LISTEN")?;
-
-    let auth_file = std::env::var("BUGPOT_AUTH_FILE")
-        .map_or_else(|_| PathBuf::from(DEFAULT_AUTH_FILE), PathBuf::from);
-
-    let egress = parse_egress_config()?;
-
-    Ok(Config {
-        apps_dir,
-        listen,
-        admin_listen,
-        auth_file,
-        egress,
-    })
-}
-
-/// Build an `EgressConfig` from env. The only deployment-variable knob
-/// left is the upstream DNS server list (corporate networks routinely
-/// run their own resolver); the bridge address / subnet / nft table are
-/// fixed at the type level — see `bugpot_egress::{BRIDGE_NAME, subnet,
-/// bridge_ip, NFT_TABLE, DNS_PORT, ALLOW_TTL_SECS}`.
-///
-/// Recognised env vars:
-///   - `BUGPOT_EGRESS_DNS_UPSTREAM` — comma-separated socket addrs
-///     (default `1.1.1.1:53,8.8.8.8:53`)
-fn parse_egress_config() -> Result<EgressConfig> {
-    let mut cfg = EgressConfig::default();
-    if let Ok(raw) = std::env::var("BUGPOT_EGRESS_DNS_UPSTREAM") {
-        cfg.dns_upstream =
-            bugpot_egress::parse_dns_upstream(&raw).context("parse BUGPOT_EGRESS_DNS_UPSTREAM")?;
-    }
-    cfg.validate().context("validate egress config")?;
-    Ok(cfg)
-}
-
-fn spawn_sweep<R: RuntimeOps, E: EgressOps>(
-    controller: &Arc<AppController<R, E>>,
-) -> JoinHandle<()> {
-    let c = Arc::clone(controller);
-    tokio::spawn(c.sweep_loop(SWEEP_INTERVAL))
-}
-
-fn spawn_router<R: RuntimeOps, E: EgressOps>(
-    listen: SocketAddr,
-    controller: &Arc<AppController<R, E>>,
-) -> Result<JoinHandle<()>> {
-    let resolver: Arc<dyn UpstreamResolver> = controller.clone();
-    let router_cfg = parse_router_config()?;
-    Ok(tokio::spawn(async move {
-        if let Err(e) = bugpot_router::serve(listen, resolver, router_cfg).await {
-            error!(error = %e, "router exited with error");
-        }
-    }))
-}
-
-/// Build a `bugpot_router::RouterConfig` from optional env vars.
-///
-/// `BUGPOT_TRUSTED_PROXIES` is a comma-separated CIDR list. Peers
-/// outside this set have their incoming `X-Forwarded-For` discarded
-/// so an attacker cannot spoof an upstream chain. Empty / unset →
-/// behave as the historical proxy (always append).
-///
-/// `BUGPOT_FORWARDED_PROTO` overrides the value bugpot writes into
-/// `X-Forwarded-Proto`. Set to `https` when bugpot sits behind a
-/// TLS-terminating front; default is `http`.
-fn parse_router_config() -> Result<bugpot_router::RouterConfig> {
-    let mut cfg = bugpot_router::RouterConfig::defaults();
-    if let Ok(raw) = std::env::var("BUGPOT_TRUSTED_PROXIES") {
-        for token in raw.split(',') {
-            let trimmed = token.trim();
-            if trimmed.is_empty() {
-                continue;
+async fn run_rollouts(client: &Client, op: RolloutsCmd, json: bool) -> Result<()> {
+    let cfg = DeployConfig::from_env()?;
+    match op {
+        RolloutsCmd::List { app } => {
+            let v: Vec<Rollout> = http_get_json(
+                client,
+                &cfg.base_url,
+                &format!("/apps/{app}/rollouts"),
+                &cfg.token,
+            )
+            .await?;
+            if json {
+                print_json(&v)?;
+            } else {
+                print_rollouts_table(&v);
             }
-            let net: ipnet::IpNet = trimmed
-                .parse()
-                .with_context(|| format!("parse BUGPOT_TRUSTED_PROXIES entry '{trimmed}'"))?;
-            cfg.trusted_proxies.push(net);
+        }
+        RolloutsCmd::Push { app, tag } => {
+            let body = serde_json::json!({ "tag": tag });
+            let v: Rollout = http_post_json(
+                client,
+                &cfg.base_url,
+                &format!("/apps/{app}/rollouts"),
+                &cfg.token,
+                &body,
+            )
+            .await?;
+            if json {
+                print_json(&v)?;
+            } else {
+                eprintln!("rolled out {app} → {}", v.tag);
+                eprintln!("  created_at: {}", v.created_at);
+            }
         }
     }
-    if let Ok(raw) = std::env::var("BUGPOT_FORWARDED_PROTO") {
-        let trimmed = raw.trim();
-        if !trimmed.is_empty() {
-            trimmed.clone_into(&mut cfg.forwarded_proto);
-        }
-    }
-    Ok(cfg)
+    Ok(())
 }
 
-fn spawn_admin<R: RuntimeOps, E: EgressOps>(
-    admin_listen: SocketAddr,
-    controller: &Arc<AppController<R, E>>,
-) -> Result<JoinHandle<()>> {
-    let token = read_admin_token()?;
-    let admin_auth = Arc::new(AdminAuth::from_token(token));
-    info!("admin API bearer token loaded");
-    let deploy_secret = Arc::new(read_deploy_secret()?);
-    info!("deploy-key secret loaded");
-    let admin_controller = Arc::clone(controller);
-    Ok(tokio::spawn(async move {
-        if let Err(e) =
-            bugpot_admin::serve(admin_listen, admin_controller, admin_auth, deploy_secret).await
-        {
-            error!(error = %e, "admin api exited with error");
-        }
-    }))
+// ---- HTTP helpers ---------------------------------------------------------
+
+async fn http_get_json<T>(client: &Client, base: &str, path: &str, token: &str) -> Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let url = format!("{base}{path}");
+    let resp = client
+        .get(&url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    check_status(&url, resp.status(), resp).await
 }
 
-/// Read the admin token from env or file. A token is required —
-/// the admin API has no "trust the listener" path (that turned out
-/// to be too easy to defeat by an accidental `0.0.0.0` bind).
-///
-/// Precedence: `BUGPOT_ADMIN_TOKEN_FILE` first, then `BUGPOT_ADMIN_TOKEN`
-/// as a fallback. The file path is preferred — its strict mode
-/// requirement (`chmod 600`) keeps the secret out of `/proc/PID/environ`,
-/// `ps auxe`, and shell history. The env-var path remains for dev
-/// convenience but logs a warning.
-fn read_admin_token() -> Result<String> {
-    if let Ok(path) = std::env::var("BUGPOT_ADMIN_TOKEN_FILE") {
-        return read_admin_token_from_file(&path);
+async fn http_post_json<T>(
+    client: &Client,
+    base: &str,
+    path: &str,
+    token: &str,
+    body: &serde_json::Value,
+) -> Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let url = format!("{base}{path}");
+    let resp = client
+        .post(&url)
+        .bearer_auth(token)
+        .json(body)
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
+    check_status(&url, resp.status(), resp).await
+}
+
+async fn http_post_toml<T>(
+    client: &Client,
+    base: &str,
+    path: &str,
+    token: &str,
+    body: &str,
+) -> Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let url = format!("{base}{path}");
+    let resp = client
+        .post(&url)
+        .bearer_auth(token)
+        .header("content-type", "application/toml")
+        .body(body.to_owned())
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
+    check_status(&url, resp.status(), resp).await
+}
+
+async fn http_patch_toml<T>(
+    client: &Client,
+    base: &str,
+    path: &str,
+    token: &str,
+    body: &str,
+) -> Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let url = format!("{base}{path}");
+    let resp = client
+        .patch(&url)
+        .bearer_auth(token)
+        .header("content-type", "application/toml")
+        .body(body.to_owned())
+        .send()
+        .await
+        .with_context(|| format!("PATCH {url}"))?;
+    check_status(&url, resp.status(), resp).await
+}
+
+async fn http_delete(client: &Client, base: &str, path: &str, token: &str) -> Result<()> {
+    let url = format!("{base}{path}");
+    let resp = client
+        .delete(&url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .with_context(|| format!("DELETE {url}"))?;
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(());
     }
-    if let Ok(raw) = std::env::var("BUGPOT_ADMIN_TOKEN") {
-        let trimmed = raw.trim();
-        if !trimmed.is_empty() {
-            warn!(
-                "admin token loaded from BUGPOT_ADMIN_TOKEN; the env-var \
-                 path is visible in /proc/<pid>/environ. Prefer \
-                 BUGPOT_ADMIN_TOKEN_FILE for production deployments.",
-            );
-            return Ok(trimmed.to_owned());
-        }
+    let body = resp.text().await.unwrap_or_default();
+    Err(anyhow!("{url} → {status}: {}", body.trim()))
+}
+
+async fn check_status<T>(url: &str, status: StatusCode, resp: reqwest::Response) -> Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("{url} → {status}: {}", body.trim()));
     }
-    anyhow::bail!(
-        "admin token is required: set BUGPOT_ADMIN_TOKEN_FILE (preferred) or BUGPOT_ADMIN_TOKEN"
+    resp.json::<T>()
+        .await
+        .with_context(|| format!("parse response from {url}"))
+}
+
+// ---- Output formatting ----------------------------------------------------
+
+fn print_json<T: Serialize>(v: &T) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(v)?);
+    Ok(())
+}
+
+fn print_apps_table(apps: &[AppView]) {
+    if apps.is_empty() {
+        eprintln!("(no apps registered)");
+        return;
+    }
+    println!(
+        "NAME                 SUBDOMAIN            STATE      REPO                                     ROLLOUT"
     );
-}
-
-/// Read the admin token from `path` after asserting it (and all of
-/// its ancestor directories) is accessible only by the bugpot owner.
-/// Delegates the permissions check to `bugpot_config::require_owner_only`
-/// so both the admin token and `auth.toml` share one enforcement path.
-fn read_admin_token_from_file(path: &str) -> Result<String> {
-    bugpot_config::require_owner_only(std::path::Path::new(path))?;
-    let body =
-        std::fs::read_to_string(path).with_context(|| format!("read admin token from {path}"))?;
-    let trimmed = body.trim();
-    if trimmed.is_empty() {
-        anyhow::bail!("admin token file {path} is empty");
+    for a in apps {
+        let rollout = a.current_rollout.as_ref().map_or("-", |r| r.tag.as_str());
+        println!(
+            "{:<20} {:<20} {:<10} {:<40} {rollout}",
+            a.name, a.subdomain, a.state, a.repo,
+        );
     }
-    Ok(trimmed.to_owned())
 }
 
-/// Read the HMAC secret used to derive per-app deploy tokens. Same
-/// shape as the admin token: a file path (preferred) or an env var
-/// fallback that logs a warning. The secret is purely a server-side
-/// derivation key — leaking it lets an attacker mint a deploy token
-/// for any app, so the same `chmod 600` + ancestor-permission rules
-/// apply.
-fn read_deploy_secret() -> Result<bugpot_admin::DeployKeySecret> {
-    if let Ok(path) = std::env::var("BUGPOT_DEPLOY_SECRET_FILE") {
-        return read_deploy_secret_from_file(&path);
+fn print_app_human(a: &AppView) {
+    println!("name      : {}", a.name);
+    println!("subdomain : {}", a.subdomain);
+    println!("repo      : {}", a.repo);
+    println!("port      : {}", a.port);
+    println!("state     : {}", a.state);
+    if let Some(r) = &a.current_rollout {
+        println!("rollout   : {} (at {})", r.tag, r.created_at);
+    } else {
+        println!("rollout   : (none — app registered but never deployed)");
     }
-    if let Ok(raw) = std::env::var("BUGPOT_DEPLOY_SECRET") {
-        let trimmed = raw.trim();
-        if !trimmed.is_empty() {
-            warn!(
-                "deploy-key secret loaded from BUGPOT_DEPLOY_SECRET; the \
-                 env-var path is visible in /proc/<pid>/environ. Prefer \
-                 BUGPOT_DEPLOY_SECRET_FILE for production deployments.",
-            );
-            return Ok(bugpot_admin::DeployKeySecret::from_bytes(
-                trimmed.as_bytes().to_vec(),
-            ));
-        }
+}
+
+fn print_rollouts_table(rollouts: &[Rollout]) {
+    if rollouts.is_empty() {
+        eprintln!("(no rollouts)");
+        return;
     }
-    anyhow::bail!(
-        "deploy-key secret is required: set BUGPOT_DEPLOY_SECRET_FILE (preferred) or BUGPOT_DEPLOY_SECRET"
-    );
-}
-
-fn read_deploy_secret_from_file(path: &str) -> Result<bugpot_admin::DeployKeySecret> {
-    bugpot_config::require_owner_only(std::path::Path::new(path))?;
-    let body = std::fs::read_to_string(path)
-        .with_context(|| format!("read deploy-key secret from {path}"))?;
-    let trimmed = body.trim();
-    if trimmed.is_empty() {
-        anyhow::bail!("deploy-key secret file {path} is empty");
+    println!("CREATED_AT               TAG");
+    for r in rollouts {
+        println!("{:<24} {}", r.created_at, r.tag);
     }
-    Ok(bugpot_admin::DeployKeySecret::from_bytes(
-        trimmed.as_bytes().to_vec(),
-    ))
 }
 
-/// Returns `true` iff the current process has `CAP_NET_ADMIN` in its
-/// effective set. Reads `/proc/self/status` so it covers both the
-/// "running as root" path and the "non-root with ambient cap" path
-/// (`AmbientCapabilities` in a systemd unit).
-fn has_cap_net_admin() -> bool {
-    // include/uapi/linux/capability.h: CAP_NET_ADMIN = 12
-    const CAP_NET_ADMIN_BIT: u64 = 1 << 12;
-    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
-        return false;
-    };
-    let Some(hex) = status
-        .lines()
-        .find_map(|l| l.strip_prefix("CapEff:").map(str::trim))
-    else {
-        return false;
-    };
-    u64::from_str_radix(hex, 16).is_ok_and(|bits| bits & CAP_NET_ADMIN_BIT != 0)
-}
+// ---- Unit tests -----------------------------------------------------------
 
-fn init_tracing() {
-    use tracing_subscriber::Layer as _;
-    use tracing_subscriber::layer::SubscriberExt as _;
-    use tracing_subscriber::util::SubscriberInitExt as _;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new(
-            "bugpot=info,bugpot_admin=info,bugpot_router=info,bugpot_runtime=info,bugpot_egress=info,bugpot_controller=info",
-        )
-    });
-    let fmt_layer = tracing_subscriber::fmt::layer().with_filter(filter);
+    #[test]
+    fn token_literal_takes_precedence_and_trims() {
+        let got = resolve_token(Some("  secret  "), None, "DIRECT", "FILE").unwrap();
+        assert_eq!(got, "secret");
+    }
 
-    // When the `tokio-console` cargo feature is on, also wire up
-    // console-subscriber's `Console` layer so `tokio-console
-    // http://127.0.0.1:6669` can attach. The console layer
-    // deliberately has no `EnvFilter` — it watches
-    // `tokio::task` / `runtime::resource` targets directly and
-    // filtering them out would break the UI.
-    #[cfg(feature = "tokio-console")]
-    let console_layer = console_subscriber::spawn();
+    #[test]
+    fn token_literal_rejects_empty() {
+        let err = resolve_token(Some("   "), None, "DIRECT", "FILE")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("empty"), "{err}");
+        assert!(err.contains("DIRECT"), "{err}");
+    }
 
-    let registry = tracing_subscriber::registry().with(fmt_layer);
-    #[cfg(feature = "tokio-console")]
-    let registry = registry.with(console_layer);
-    registry.init();
+    #[test]
+    fn token_missing_both_errors_clearly() {
+        let err = resolve_token(None, None, "DIRECT", "FILE")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("DIRECT"), "{err}");
+        assert!(err.contains("FILE"), "{err}");
+    }
+
+    #[test]
+    fn token_file_path_is_read() {
+        let dir = std::env::temp_dir();
+        let p = dir.join(format!("bugpot-cli-token-test-{}.tok", std::process::id()));
+        std::fs::write(&p, "  filetoken  \n").unwrap();
+        let got = resolve_token(None, p.to_str(), "DIRECT", "FILE").unwrap();
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(got, "filetoken");
+    }
+
+    #[test]
+    fn appview_round_trips_through_json() {
+        let v = AppView {
+            name: "alpha".into(),
+            subdomain: "alpha".into(),
+            repo: "ghcr.io/x/y".into(),
+            port: 8080,
+            state: "running".into(),
+            current_rollout: Some(Rollout {
+                tag: "v1".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+            }),
+        };
+        let s = serde_json::to_string(&v).unwrap();
+        let back: AppView = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.name, "alpha");
+        assert_eq!(back.current_rollout.as_ref().unwrap().tag, "v1");
+    }
 }

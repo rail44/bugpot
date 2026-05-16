@@ -27,7 +27,7 @@ Dockerfile → automated rollouts via GitHub Actions).
 
 ## Architecture
 
-`cmd/bugpot` is a thin wiring layer over seven library crates:
+`cmd/bugpotd` is a thin wiring layer over seven library crates:
 
 - **`bugpot-config`** — parses `apps/*.toml` into `AppSpec`
 - **`bugpot-egress`** — bridge + netns + nftables + DNS allowlist
@@ -36,6 +36,9 @@ Dockerfile → automated rollouts via GitHub Actions).
 - **`bugpot-controller`** — per-app state machine, cold-start, idle reaper
 - **`bugpot-admin`** — admin HTTP API (CRUD over the controller)
 - **`bugpot-metrics`** — Prometheus recorder + `/metrics`, `/healthz`
+
+`cmd/bugpot` is the operator CLI (`bugpot apps …`, `bugpot rollouts …`) —
+pure-Rust so it also builds on macOS for laptop-side use.
 
 ## License
 
