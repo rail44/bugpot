@@ -22,9 +22,9 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-BIN="$WORKDIR/target/debug/bugpot"
+BIN="$WORKDIR/target/debug/bugpotd"
 if [ ! -x "$BIN" ]; then
-    echo "binary not built. run: cargo build -p bugpot" >&2
+    echo "binary not built. run: cargo build -p bugpotd" >&2
     exit 1
 fi
 

@@ -25,7 +25,7 @@ STATE_DIR=/var/lib/bugpot-dev
 LISTEN=127.0.0.1:8080
 IMAGE_REPO=${BUGPOT_DEV_REPO:-gcr.io/google-samples/hello-app}
 IMAGE_TAG=${BUGPOT_DEV_TAG:-1.0}
-BIN="$(pwd)/target/debug/bugpot"
+BIN="$(pwd)/target/debug/bugpotd"
 
 is_active() {
     sudo systemctl is-active --quiet "$UNIT" 2>/dev/null

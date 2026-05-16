@@ -1,0 +1,42 @@
+[package]
+name = "bugpotd"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "bugpotd"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+console-subscriber = { version = "0.5", optional = true }
+ipnet = "2"
+metrics.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+bugpot-admin.workspace = true
+bugpot-config.workspace = true
+bugpot-controller.workspace = true
+bugpot-egress.workspace = true
+bugpot-metrics.workspace = true
+bugpot-router.workspace = true
+bugpot-runtime.workspace = true
+
+[features]
+# Opt-in tokio-console + the richer `bugpot_tokio_*` metric set. The
+# build needs `RUSTFLAGS="--cfg tokio_unstable"` because both
+# `console-subscriber` and the unstable-only fields on
+# `tokio_metrics::RuntimeMetrics` are gated on that cfg. Use the
+# `just build-console` / `just run-console` recipes which set the
+# flag for you.
+tokio-console = ["dep:console-subscriber"]
+
+[lints]
+workspace = true
