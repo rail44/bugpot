@@ -28,7 +28,6 @@ bugpot-egress.workspace = true
 bugpot-metrics.workspace = true
 bugpot-router.workspace = true
 bugpot-runtime.workspace = true
-nix = { workspace = true, features = ["user"] }
 
 [features]
 # Opt-in tokio-console + the richer `bugpot_tokio_*` metric set. The

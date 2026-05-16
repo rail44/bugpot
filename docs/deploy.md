@@ -37,28 +37,67 @@ The split keeps things separate that should be separate:
 
 ## Step 1 — bugpot on a Linux host
 
-Out of scope for this guide; CLAUDE.md has the full operations
-detail. The short version:
+bugpot needs Linux 5.x+ with `nftables`, `iproute2`, and cgroup v2.
+Run it as a **non-root user (`bugpot`)** with only the kernel
+capabilities it actually exercises — never as full root. A
+hardened systemd unit is shipped at
+[`examples/bugpot.service`](../examples/bugpot.service).
+
+### Install
 
 ```sh
-# build & install (or run from target/release/bugpot)
+# 1. Build the release binary on the target host (or copy in).
 cargo build --release -p bugpot
+sudo install -m 0755 target/release/bugpot /usr/local/bin/bugpot
 
-# minimum env to start
-export BUGPOT_APPS_DIR=/var/lib/bugpot/apps
-export BUGPOT_STATE_DIR=/var/lib/bugpot
-export BUGPOT_LISTEN=127.0.0.1:8080
-export BUGPOT_ADMIN_LISTEN=127.0.0.1:8081
-# one of these is required (file is preferred for production)
-export BUGPOT_ADMIN_TOKEN_FILE=/etc/bugpot/admin-token
-# same shape; rotates all deploy tokens when rotated
-export BUGPOT_DEPLOY_SECRET_FILE=/etc/bugpot/deploy-secret
+# 2. Create the unprivileged user the daemon will run as.
+sudo useradd --system --home-dir /var/lib/bugpot --shell /sbin/nologin bugpot
 
-sudo -E ./target/release/bugpot
+# 3. Create state and config directories with the right ownership.
+sudo install -d -o bugpot -g bugpot -m 0750 /var/lib/bugpot /var/lib/bugpot/apps
+sudo install -d -o root   -g bugpot -m 0750 /etc/bugpot
+
+# 4. Generate the two token files. Owned by bugpot itself (mode 0600)
+#    so the daemon can read them without elevated privileges. To
+#    rotate later, write a new value via `install` and the new file
+#    inherits the right ownership in one step.
+sudo sh -c 'install -o bugpot -g bugpot -m 0600 /dev/null /etc/bugpot/admin-token'
+sudo sh -c 'install -o bugpot -g bugpot -m 0600 /dev/null /etc/bugpot/deploy-secret'
+sudo sh -c 'openssl rand -base64 32 > /etc/bugpot/admin-token'
+sudo sh -c 'openssl rand -base64 32 > /etc/bugpot/deploy-secret'
+
+# 5. Drop in the systemd unit and start.
+sudo install -m 0644 examples/bugpot.service /etc/systemd/system/bugpot.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now bugpot
 ```
 
-Both token files must be `chmod 600` and owned by the bugpot
-user; bugpot refuses to start otherwise.
+### What the unit gives you
+
+The shipped `bugpot.service` runs the daemon with only the
+capabilities it actually exercises (`CAP_NET_ADMIN`,
+`CAP_SYS_ADMIN`, `CAP_NET_BIND_SERVICE`, `CAP_SETUID`,
+`CAP_SETGID`, `CAP_SYS_CHROOT`, `CAP_KILL`, `CAP_CHOWN`,
+`CAP_FOWNER`, `CAP_FSETID`) plus the standard systemd hardening
+knobs: `NoNewPrivileges`, `ProtectSystem=strict`,
+`ProtectHome`, `PrivateTmp`, `ProtectKernel*`, `ProtectProc=invisible`,
+`MemoryDenyWriteExecute`, `RestrictAddressFamilies`,
+`SystemCallFilter`, and `Delegate=yes` for cgroup access.
+`KillSignal=SIGINT` triggers bugpot's graceful teardown so
+`systemctl stop bugpot` releases endpoints cleanly.
+
+Override environment variables (anything in CLAUDE.md's env-var
+list) by dropping a file at `/etc/bugpot/env` — the unit's
+`EnvironmentFile=-/etc/bugpot/env` picks it up if it exists.
+
+### Token retrieval
+
+The `BUGPOT_ADMIN_TOKEN` you'll paste into the ops-repo secret
+in Step 3 is the file's contents:
+
+```sh
+sudo cat /etc/bugpot/admin-token
+```
 
 ## Step 2 — reachability (operator's concern)
 
