@@ -571,12 +571,13 @@ fn extract_layer_inner(
 fn unpack_tar(rootfs: &Path, data: &[u8]) -> Result<()> {
     let mut archive = tar::Archive::new(data);
     archive.set_preserve_permissions(true);
-    // Preserving ownerships requires `CAP_CHOWN` and only makes sense for
-    // a rootful container runtime. When bugpot is run as non-root (e.g. in
-    // unit tests on a dev box) we skip it so layer extraction still works
-    // — file owners will default to the running uid, which is correct for
-    // the dev workflow.
-    archive.set_preserve_ownerships(is_root());
+    // Preserving ownerships calls `chown(2)` on every extracted entry —
+    // which needs `CAP_CHOWN`. Both the rootful path (uid=0) and the
+    // shipped systemd unit's unprivileged path (ambient `CAP_CHOWN`)
+    // satisfy this; everything else (e.g. a dev test run as a regular
+    // user) falls back to "files owned by the running uid", which is
+    // still correct for the dev workflow.
+    archive.set_preserve_ownerships(can_chown());
     // OCI whiteouts are encoded with `.wh.` prefixed filenames. We do not
     // yet implement the overlay-style deletion semantics; for the typical
     // single-layer or strictly additive multi-layer images this is fine.
@@ -587,9 +588,26 @@ fn unpack_tar(rootfs: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn is_root() -> bool {
-    // SAFETY: `getuid` has no preconditions and is always-safe.
-    nix::unistd::Uid::effective().is_root()
+/// Returns `true` iff the current process can `chown(2)` arbitrary
+/// uids/gids — either because it runs as root or because it holds
+/// `CAP_CHOWN` (the shipped systemd unit grants it via
+/// `AmbientCapabilities`).
+///
+/// Reads the effective capability mask from `/proc/self/status`;
+/// returns `false` on any failure to read or parse so the caller
+/// safely skips ownership preservation rather than tripping a
+/// surprising `EPERM` mid-extraction.
+fn can_chown() -> bool {
+    // include/uapi/linux/capability.h: CAP_CHOWN = 0
+    const CAP_CHOWN_BIT: u64 = 1 << 0;
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return false;
+    };
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("CapEff:").map(str::trim))
+        .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+        .is_some_and(|bits| bits & CAP_CHOWN_BIT != 0)
 }
 
 #[cfg(test)]
