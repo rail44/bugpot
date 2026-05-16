@@ -310,9 +310,7 @@ impl EgressOps for Egress {
         // exists — so this only does anything on the leaked-state path.
         netns::force_detach_endpoint(&plan).await;
 
-        if let Err(e) =
-            netns::run_cmds(netns::render_attach_endpoint(BRIDGE_NAME, &plan)).await
-        {
+        if let Err(e) = netns::run_cmds(netns::render_attach_endpoint(BRIDGE_NAME, &plan)).await {
             // Roll back: tear down any partial state from a failed
             // attach (e.g. netns add succeeded but veth move failed),
             // then return the IP to the allocator.
@@ -377,7 +375,7 @@ impl EgressOps for Egress {
         // Best-effort: drop any allow-set entries left over from the
         // previous bugpot run for *this* container IP. Entries also
         // TTL out, so a failure here is non-fatal.
-        let _ = nft::flush_src(NFT_TABLE,container_ip).await;
+        let _ = nft::flush_src(NFT_TABLE, container_ip).await;
         // Use force-detach so a missing veth (e.g. host side already
         // gone) doesn't prevent deleting the netns. The netns name +
         // host veth name derive deterministically from the app name,
@@ -405,7 +403,7 @@ impl EgressOps for Egress {
         // 60s TTL is a backstop). Only entries matching *this* src IP
         // are removed — previous behaviour flushed the whole set, which
         // briefly broke egress for every other running app.
-        let _ = nft::flush_src(NFT_TABLE,app.container_ip).await;
+        let _ = nft::flush_src(NFT_TABLE, app.container_ip).await;
         netns::run_cmds(netns::render_detach_endpoint(&app.plan)).await?;
         Ok(())
     }
@@ -543,5 +541,4 @@ mod tests {
         // No port: rejected (SocketAddr requires :port)
         assert!(parse_dns_upstream("1.1.1.1").is_err());
     }
-
 }
