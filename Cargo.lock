@@ -186,7 +186,6 @@ dependencies = [
  "console-subscriber",
  "ipnet",
  "metrics",
- "nix 0.29.0",
  "tokio",
  "tracing",
  "tracing-subscriber",

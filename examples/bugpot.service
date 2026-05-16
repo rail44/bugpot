@@ -1,0 +1,109 @@
+[Unit]
+Description=bugpot — internal Heroku-like PaaS for experimental apps
+Documentation=https://github.com/rail44/bugpot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/bugpot
+Restart=on-failure
+RestartSec=5s
+
+# --- Identity ---------------------------------------------------------------
+# bugpot itself does not need a uid of zero; the host capabilities below
+# are sufficient. Create the user once:
+#   useradd --system --home-dir /var/lib/bugpot --shell /sbin/nologin bugpot
+User=bugpot
+Group=bugpot
+
+# --- Capabilities -----------------------------------------------------------
+# Minimum set bugpot's host-side code paths exercise:
+#   CAP_NET_ADMIN          bridge / veth / netns / nftables
+#   CAP_SYS_ADMIN          libcontainer (namespaces, mount, pivot_root)
+#   CAP_NET_BIND_SERVICE   DNS server on :53
+#   CAP_SETUID, CAP_SETGID libcontainer uid/gid configuration
+#   CAP_SYS_CHROOT         libcontainer pivot_root
+#   CAP_KILL               send signals to container processes
+#   CAP_CHOWN, CAP_FOWNER, CAP_FSETID
+#                          rootfs ownership manipulation
+#
+# Containers themselves drop everything except the moby defaults via
+# the seccomp profile in `bugpot-runtime`, so this set governs only
+# the bugpot daemon — not the apps it spawns.
+AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_NET_BIND_SERVICE CAP_SETUID CAP_SETGID CAP_SYS_CHROOT CAP_KILL CAP_CHOWN CAP_FOWNER CAP_FSETID
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_NET_BIND_SERVICE CAP_SETUID CAP_SETGID CAP_SYS_CHROOT CAP_KILL CAP_CHOWN CAP_FOWNER CAP_FSETID
+NoNewPrivileges=yes
+
+# --- Filesystem -------------------------------------------------------------
+# /usr, /boot, /etc are read-only. /var stays writable as usual but
+# we whitelist the specific paths bugpot touches so future systemd
+# defaults don't tighten more than we expect.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/bugpot /run/netns
+
+# --- Kernel & process surface ----------------------------------------------
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+# ProtectControlGroups must stay disabled: libcontainer writes to the
+# delegated cgroup subtree (`Delegate=yes` below). Keep this explicit
+# so a future systemd default flip doesn't silently break us.
+ProtectControlGroups=no
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+
+# --- Network ----------------------------------------------------------------
+# AF_INET / AF_INET6: HTTP listeners + DNS server.
+# AF_UNIX: libcontainer notify-socket + admin token socket plumbing.
+# AF_NETLINK: rtnetlink for bridge / veth (the `ip` shell-out path).
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+IPAddressAllow=any
+
+# --- Syscall filter ---------------------------------------------------------
+SystemCallArchitectures=native
+SystemCallFilter=@system-service @sandbox @mount @network-io
+SystemCallFilter=~@privileged @resources
+
+# --- cgroup -----------------------------------------------------------------
+# Hand bugpot a delegated subtree so libcontainer can create per-app
+# cgroups without CAP_SYS_ADMIN against the host's cgroup root.
+Delegate=yes
+
+# --- Devices ----------------------------------------------------------------
+# libcontainer needs /dev/null, /dev/urandom, etc. when constructing
+# container rootfs; PrivateDevices=yes would strip those.
+PrivateDevices=no
+
+# --- Shutdown ---------------------------------------------------------------
+# bugpot's graceful teardown listens on SIGINT (stops containers and
+# releases endpoints before exiting); SIGTERM would skip that path.
+KillSignal=SIGINT
+TimeoutStopSec=60s
+
+# --- Environment ------------------------------------------------------------
+# Read environment overrides from /etc/bugpot/env if it exists. The
+# file is optional; leave it absent to take defaults compiled into
+# bugpot. Token files (admin / deploy) live next to it under
+# /etc/bugpot/ with 0640 root:bugpot.
+EnvironmentFile=-/etc/bugpot/env
+Environment=BUGPOT_APPS_DIR=/var/lib/bugpot/apps
+Environment=BUGPOT_STATE_DIR=/var/lib/bugpot
+Environment=BUGPOT_ADMIN_TOKEN_FILE=/etc/bugpot/admin-token
+Environment=BUGPOT_DEPLOY_SECRET_FILE=/etc/bugpot/deploy-secret
+
+# --- Logging ----------------------------------------------------------------
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -130,7 +130,7 @@ Env vars (read by bugpot directly):
 - `BUGPOT_STATE_DIR` (default `/var/lib/bugpot`)
 - `BUGPOT_LISTEN` — public HTTP router (default `127.0.0.1:8080`)
 - `BUGPOT_ADMIN_LISTEN` — admin HTTP API (default `127.0.0.1:8081`)
-- `BUGPOT_ADMIN_TOKEN_FILE` — **required** unless `BUGPOT_ADMIN_TOKEN` is set. Path to a file whose trimmed contents are the bearer token. The file must be `0600` (any group/other permission bit set causes bugpot to refuse to start, ssh-key style). Typical layout: `/etc/bugpot/admin-token` with `root:root 0600`.
+- `BUGPOT_ADMIN_TOKEN_FILE` — **required** unless `BUGPOT_ADMIN_TOKEN` is set. Path to a file whose trimmed contents are the bearer token. The file must be `0600` (any group/other permission bit set causes bugpot to refuse to start, ssh-key style). Typical layout when bugpot runs as the unprivileged `bugpot` user (the shipped systemd unit's setup): `/etc/bugpot/admin-token` with `bugpot:bugpot 0600`.
 - `BUGPOT_ADMIN_TOKEN` — fallback bearer token for development. **Logs a warning** when used because env vars are visible in `/proc/<pid>/environ` and shell history; prefer `BUGPOT_ADMIN_TOKEN_FILE` in production. bugpot refuses to start unless one of these two is set.
 - `BUGPOT_AUTH_FILE` — registry-auth TOML (default `/etc/bugpot/auth.toml`, missing file = anonymous)
 - `BUGPOT_METRICS_LISTEN` — opt-in Prometheus listener (e.g. `127.0.0.1:9090`). Unset = `/metrics` + `/healthz` disabled.

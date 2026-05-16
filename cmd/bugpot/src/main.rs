@@ -51,10 +51,17 @@ async fn main() -> Result<()> {
     init_tracing();
     let metrics_handle = bugpot_metrics::install_recorder().context("install metrics recorder")?;
 
-    if !nix::unistd::Uid::effective().is_root() {
+    // Capability-based start gate. bugpot doesn't actually require
+    // uid=0 — only `CAP_NET_ADMIN` (bridge / veth / nftables) plus
+    // a handful of others libcontainer needs. The shipped systemd
+    // unit (examples/bugpot.service) grants exactly that set via
+    // `AmbientCapabilities` to an unprivileged `bugpot` user.
+    if !has_cap_net_admin() {
         anyhow::bail!(
-            "bugpot must run as root: bridge/netns/nftables setup requires CAP_NET_ADMIN.\n\
-             Try `sudo -E ./target/debug/bugpot`."
+            "bugpot needs CAP_NET_ADMIN (and the libcontainer set) — \
+             bridge / veth / netns / nftables setup will fail without it.\n\
+             Install via the shipped systemd unit (examples/bugpot.service) \
+             or, for development, run under `sudo`. See docs/deploy.md."
         );
     }
 
@@ -373,6 +380,25 @@ fn read_deploy_secret_from_file(path: &str) -> Result<bugpot_admin::DeployKeySec
     Ok(bugpot_admin::DeployKeySecret::from_bytes(
         trimmed.as_bytes().to_vec(),
     ))
+}
+
+/// Returns `true` iff the current process has `CAP_NET_ADMIN` in its
+/// effective set. Reads `/proc/self/status` so it covers both the
+/// "running as root" path and the "non-root with ambient cap" path
+/// (`AmbientCapabilities` in a systemd unit).
+fn has_cap_net_admin() -> bool {
+    // include/uapi/linux/capability.h: CAP_NET_ADMIN = 12
+    const CAP_NET_ADMIN_BIT: u64 = 1 << 12;
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return false;
+    };
+    let Some(hex) = status
+        .lines()
+        .find_map(|l| l.strip_prefix("CapEff:").map(str::trim))
+    else {
+        return false;
+    };
+    u64::from_str_radix(hex, 16).is_ok_and(|bits| bits & CAP_NET_ADMIN_BIT != 0)
 }
 
 fn init_tracing() {
