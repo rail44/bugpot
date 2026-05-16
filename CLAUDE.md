@@ -141,6 +141,19 @@ Env vars (read by bugpot directly):
 `bugpot-admin` exposes a minimal CRUD surface for runtime app management.
 Listener is whatever `BUGPOT_ADMIN_LISTEN` points at.
 
+The pure-Rust **`bp` CLI** (`cmd/bugpot-cli`, binary name `bp`) wraps the
+endpoints below for daily use: `bp apps list / get / create / update /
+delete`, `bp rollouts list <app>`, `bp rollout <app> <tag>`,
+`bp deploy-key <app>`. Reads `BUGPOT_ADMIN_URL` / `BUGPOT_ADMIN_TOKEN[_FILE]`
+(plus `BUGPOT_DEPLOY_TOKEN[_FILE]` for the rollout plane) from env;
+default `BUGPOT_ADMIN_URL` is `http://127.0.0.1:8081`. Pass `--json` on
+any command to forward the raw API response verbatim — useful for
+piping into `jq` from a self-hosted CI runner.
+
+`bp` is intentionally pure-Rust and dep-free of `bugpot-runtime` /
+`bugpot-controller` / `bugpot-admin` so it compiles on macOS too;
+operators can run it from their laptop against a remote bugpot.
+
 Bearer-token auth is **mandatory** (`BUGPOT_ADMIN_TOKEN_FILE` preferred,
 `BUGPOT_ADMIN_TOKEN` env var as fallback). bugpot refuses to start
 without one — there is no "trust delegated to the listener binding"
