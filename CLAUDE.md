@@ -242,10 +242,12 @@ cmd/bugpot (main: wires everything; no business logic)
 
 Sized against a public-internet client. Whatever reachability layer the operator picks in front of bugpot is a deployment convenience, never a trust boundary. The router applies (constants in `crates/bugpot-router/src/lib.rs`):
 
-- Request-side: `MAX_BODY_BYTES` (10 MiB inbound cap), `HEADER_READ_TIMEOUT` (10 s slowloris guard), `REQUEST_TIMEOUT` (30 s time-to-headers cap), `MAX_CONCURRENT_REQUESTS` (1024 in-flight via `tower::ConcurrencyLimitLayer`).
-- Response-side: every response body is wrapped in `GuardedBody`, which enforces `RESPONSE_FRAME_TIMEOUT` (1 min per-frame idle — closes slow-reading clients) and `MAX_RESPONSE_BODY_BYTES` (1 GiB total — stops runaway upstream payloads from monopolising a connection or host bandwidth).
-- Upgrades (WebSocket): `MAX_CONCURRENT_UPGRADES` (256 simultaneous spliced sockets, enforced via `Arc<Semaphore>`; saturation returns `503`) and `UPGRADE_IDLE_TIMEOUT` (5 min of silence in **both** directions tears the splice down via `splice_with_idle`).
-- HTTP/2: `H2_MAX_CONCURRENT_STREAMS = 64` so a single h2 client cannot exhaust `MAX_CONCURRENT_REQUESTS` with one connection.
+Values sized for the "many small apps on a cheap VM (e2-micro / e2-small)" scenario — small enough that `MAX_BODY_BYTES * MAX_CONCURRENT_REQUESTS` (current floor 256 MiB of inbound bookkeeping) fits on a 1 GiB host with room to spare.
+
+- Request-side: `MAX_BODY_BYTES` (4 MiB inbound cap), `HEADER_READ_TIMEOUT` (10 s slowloris guard), `REQUEST_TIMEOUT` (30 s time-to-headers cap), `MAX_CONCURRENT_REQUESTS` (64 in-flight via `tower::ConcurrencyLimitLayer`).
+- Response-side: every response body is wrapped in `GuardedBody`, which enforces `RESPONSE_FRAME_TIMEOUT` (1 min per-frame idle — closes slow-reading clients) and `MAX_RESPONSE_BODY_BYTES` (64 MiB total — stops runaway upstream payloads from monopolising a connection or host bandwidth; larger responses should stream out-of-band via presigned URLs or similar).
+- Upgrades (WebSocket): `MAX_CONCURRENT_UPGRADES` (32 simultaneous spliced sockets, enforced via `Arc<Semaphore>`; saturation returns `503`) and `UPGRADE_IDLE_TIMEOUT` (5 min of silence in **both** directions tears the splice down via `splice_with_idle`).
+- HTTP/2: `H2_MAX_CONCURRENT_STREAMS = 16` so a single h2 client cannot exhaust `MAX_CONCURRENT_REQUESTS` with one connection.
 - Hop-by-hop headers (RFC 7230 §6.1 + Connection-listed extras) are stripped both ways. The Upgrade path is exempt for the request because `Connection: Upgrade` must reach the upstream; the response is no-op here because hyper has already consumed it for the upgrade.
 - `X-Forwarded-For` is rewritten per `RouterConfig::trusted_proxies`: untrusted peers see their chain discarded; the empty default list preserves the historical "trust everyone" behaviour, but real deployments should populate it.
 
@@ -291,7 +293,7 @@ bugpot delegates image-index resolution to oci-client's default `current_platfor
 - Cold-start instrumentation: `bugpot_cold_start_seconds{phase=endpoint|pull|start|readiness}` (controller, success-only), `bugpot_image_pull_seconds{step=…}` (runtime), `bugpot_container_start_seconds{step=…}` (runtime).
 - Container stdout/stderr lands in `<state>/logs/<app>/{stdout,stderr}.log` (container fd 1 / 2 opened `O_APPEND`). A per-stream task tails each file via inotify (`IN_MODIFY`) and re-emits each new line through `tracing` under target `bugpot::app` with fields `app` and `stream` — filter with `RUST_LOG=bugpot::app=info`.
 - The tail opens at offset 0, not EOF: on bugpot restart, anything still in the file (incl. bytes the app wrote during the interregnum) replays through tracing once. The replay window is bounded by the truncation cap below, so a restart costs at most one cap-worth of duplicate emissions.
-- **Log volume bound (#21):** when any of those files grows past `MAX_LOG_BYTES` (10 MiB), the tail truncates it in place via `ftruncate(0)`. The container's existing fd keeps working — its `O_APPEND` semantics make the next write seek to the new end (= 0). Bytes written between the size check and the truncate may be lost on disk; everything before that point was already emitted through tracing, so the loss is only visible to operators reading the file directly. No generations / no rotation files; if richer retention is needed, run an external collector (vector / otel-collector / fluent-bit) against the same files.
+- **Log volume bound (#21):** when any of those files grows past `MAX_LOG_BYTES` (1 MiB), the tail truncates it in place via `ftruncate(0)`. The container's existing fd keeps working — its `O_APPEND` semantics make the next write seek to the new end (= 0). Bytes written between the size check and the truncate may be lost on disk; everything before that point was already emitted through tracing, so the loss is only visible to operators reading the file directly. No generations / no rotation files; if richer retention is needed, run an external collector (vector / otel-collector / fluent-bit) against the same files.
 
 ### Performance profiling (development)
 

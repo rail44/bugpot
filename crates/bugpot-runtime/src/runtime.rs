@@ -26,7 +26,12 @@ use tracing::{debug, info, warn};
 /// check and the truncate may be lost; the tracing pipeline already
 /// emitted everything before the truncate point, so the loss only
 /// matters for operators reading the file directly.
-const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024; // 10 MiB
+// Per-stream cap on the container log file before it gets truncated
+// in place. Sized for "small disk on cheap VM": with N apps × 2
+// streams, total log floor is N × 2 MiB even when truncation kicks
+// in continuously, which fits comfortably on a 10 GiB host. Bump if
+// running a chatty app needs more pre-truncation history.
+const MAX_LOG_BYTES: u64 = 1024 * 1024; // 1 MiB
 
 use crate::auth::Auth;
 use crate::error::{Result, RuntimeError};

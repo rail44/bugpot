@@ -134,9 +134,11 @@ const READINESS_POLL: Duration = Duration::from_millis(100);
 
 /// Cap on the per-app rollout history retained in memory + on disk.
 /// Older rollouts are dropped (popped from the front of the deque) as
-/// new ones land. Hard-coded for v1; promote to a config knob once
-/// bugpot's settings model is established.
-const MAX_ROLLOUT_HISTORY: usize = 4;
+/// new ones land. Two = live rollout + one immediate-rollback target,
+/// which matches the realistic recovery window for an internal-tool
+/// deployment cadence and keeps stale image references from defeating
+/// the image GC on cheap-VM hosts.
+const MAX_ROLLOUT_HISTORY: usize = 2;
 
 #[derive(Debug)]
 struct AppHandle {
@@ -1249,7 +1251,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Mutex as StdMutex;
 
-    use bugpot_config::{AppSpec, EgressSpec, Readiness, Resources, RuntimeSpec, Scaling};
+    use bugpot_config::{AppSpec, EgressSpec, Readiness, Resources, Scaling};
     use bugpot_egress::{EgressOps, Endpoint};
     use bugpot_runtime::{Auth, ImageId, ResourceUsage, RunningApp, RuntimeOps};
 
@@ -1466,7 +1468,6 @@ mod tests {
             scaling: Scaling::default(),
             readiness: Readiness::default(),
             resources: Resources::default(),
-            runtime: RuntimeSpec::default(),
             source_path: PathBuf::new(),
         }
     }

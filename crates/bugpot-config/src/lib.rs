@@ -58,8 +58,6 @@ pub struct AppSpec {
     pub readiness: Readiness,
     #[serde(default, skip_serializing_if = "Resources::is_empty")]
     pub resources: Resources,
-    #[serde(default, skip_serializing_if = "RuntimeSpec::is_empty")]
-    pub runtime: RuntimeSpec,
     #[serde(skip)]
     pub source_path: PathBuf,
 }
@@ -149,24 +147,31 @@ pub struct Resources {
 }
 
 impl Resources {
+    /// Hard memory ceiling applied when an app spec omits `[resources]
+    /// memory`. Sized for the "many small apps on a cheap VM" scenario
+    /// — without a default an unbounded app can OOM-kill the host.
+    pub const DEFAULT_MEMORY: &'static str = "128MB";
+    /// Default CPU share when `[resources] cpu` is omitted: half a core.
+    /// Two apps can comfortably share one vCPU at this default.
+    pub const DEFAULT_CPU: &'static str = "0.5";
+
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.memory.is_none() && self.cpu.is_none()
     }
-}
 
-/// `[runtime]` section of an app TOML. The name distinguishes the
-/// configuration shape from the engine struct in `bugpot-runtime`.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct RuntimeSpec {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub isolation: Option<String>,
-}
-
-impl RuntimeSpec {
+    /// Memory limit string actually applied at start time.
+    /// Falls back to [`Self::DEFAULT_MEMORY`] when not specified.
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.isolation.is_none()
+    pub fn effective_memory(&self) -> &str {
+        self.memory.as_deref().unwrap_or(Self::DEFAULT_MEMORY)
+    }
+
+    /// CPU share string actually applied at start time. Falls back to
+    /// [`Self::DEFAULT_CPU`] when not specified.
+    #[must_use]
+    pub fn effective_cpu(&self) -> &str {
+        self.cpu.as_deref().unwrap_or(Self::DEFAULT_CPU)
     }
 }
 
@@ -683,9 +688,6 @@ mod tests {
             [resources]
             memory = "256MB"
             cpu = "0.5"
-
-            [runtime]
-            isolation = "crun"
         "#;
         let spec: AppSpec = toml::from_str(body).unwrap();
         assert_eq!(spec.name(), "myapp");
@@ -841,7 +843,6 @@ port = 80
         assert!(!body.contains("[env]"), "got: {body}");
         assert!(!body.contains("[scaling]"), "got: {body}");
         assert!(!body.contains("[resources]"), "got: {body}");
-        assert!(!body.contains("[runtime]"), "got: {body}");
     }
 
     #[test]

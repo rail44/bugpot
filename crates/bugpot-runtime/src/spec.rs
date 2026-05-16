@@ -292,26 +292,25 @@ fn build_namespaces(netns_path: Option<&Path>) -> Result<Vec<LinuxNamespace>> {
 }
 
 fn build_resources(spec: &AppSpec) -> Result<oci_spec::runtime::LinuxResources> {
-    let mut builder = LinuxResourcesBuilder::default();
+    // Always apply both limits. Defaults come from
+    // `Resources::effective_*` so an app omitting `[resources]` is
+    // still capped — important on small VMs where one unbounded app
+    // can take the host out.
+    let bytes = resources::parse_memory(spec.resources.effective_memory())?;
+    let mem_cfg = LinuxMemoryBuilder::default()
+        .limit(i64::try_from(bytes).unwrap_or(i64::MAX))
+        .build()?;
 
-    if let Some(mem) = &spec.resources.memory {
-        let bytes = resources::parse_memory(mem)?;
-        let mem_cfg = LinuxMemoryBuilder::default()
-            .limit(i64::try_from(bytes).unwrap_or(i64::MAX))
-            .build()?;
-        builder = builder.memory(mem_cfg);
-    }
+    let (quota, period) = resources::parse_cpu(spec.resources.effective_cpu())?;
+    let cpu_cfg = LinuxCpuBuilder::default()
+        .quota(quota)
+        .period(period)
+        .build()?;
 
-    if let Some(cpu) = &spec.resources.cpu {
-        let (quota, period) = resources::parse_cpu(cpu)?;
-        let cpu_cfg = LinuxCpuBuilder::default()
-            .quota(quota)
-            .period(period)
-            .build()?;
-        builder = builder.cpu(cpu_cfg);
-    }
-
-    Ok(builder.build()?)
+    Ok(LinuxResourcesBuilder::default()
+        .memory(mem_cfg)
+        .cpu(cpu_cfg)
+        .build()?)
 }
 
 fn build_mounts() -> Vec<Mount> {

@@ -27,8 +27,11 @@ const DEFAULT_ADMIN_LISTEN: &str = "127.0.0.1:8081";
 const DEFAULT_APPS_DIR: &str = "./apps";
 const DEFAULT_AUTH_FILE: &str = "/etc/bugpot/auth.toml";
 /// Cadence for the controller's lifecycle sweep (crash detection +
-/// scale-to-zero idle stop).
-const SWEEP_INTERVAL: Duration = Duration::from_secs(10);
+/// scale-to-zero idle stop). 30 s strikes the balance for a 1 vCPU
+/// host: granular enough that idle-stop happens within a minute of
+/// the configured timeout, but not so aggressive that the sweep
+/// itself wakes the CPU twelve times a minute for nothing.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
 // Metrics: the Prometheus recorder is *always* installed so callsites
 // emit successfully; the HTTP listener is only spawned when
@@ -69,9 +72,9 @@ async fn main() -> Result<()> {
 
     // Egress (bridge + DNS + nftables): idempotent across runs.
     info!(
-        bridge = %cfg.egress.bridge_name,
-        subnet = %cfg.egress.subnet,
-        bridge_ip = %cfg.egress.bridge_ip,
+        bridge = %bugpot_egress::BRIDGE_NAME,
+        subnet = %bugpot_egress::subnet(),
+        bridge_ip = %bugpot_egress::bridge_ip(),
         "bringing up egress"
     );
     let egress = Arc::new(
@@ -196,39 +199,21 @@ fn parse_config() -> Result<Config> {
     })
 }
 
-/// Build an `EgressConfig`, layering env-var overrides on top of defaults.
+/// Build an `EgressConfig` from env. The only deployment-variable knob
+/// left is the upstream DNS server list (corporate networks routinely
+/// run their own resolver); the bridge address / subnet / nft table are
+/// fixed at the type level — see `bugpot_egress::{BRIDGE_NAME, subnet,
+/// bridge_ip, NFT_TABLE, DNS_PORT, ALLOW_TTL_SECS}`.
 ///
 /// Recognised env vars:
-///
-/// - `BUGPOT_EGRESS_SUBNET` (e.g. `10.10.0.0/24`)
-/// - `BUGPOT_EGRESS_BRIDGE_IP` (e.g. `10.10.0.1`)
-/// - `BUGPOT_EGRESS_DNS_UPSTREAM` (comma-separated socket addrs)
-///
-/// When only the subnet is set, the bridge IP defaults to the first host
-/// of that subnet — so a single override changes both consistently.
-/// Setting the bridge IP without the subnet, or any inconsistent
-/// combination, fails `EgressConfig::validate`.
+///   - `BUGPOT_EGRESS_DNS_UPSTREAM` — comma-separated socket addrs
+///     (default `1.1.1.1:53,8.8.8.8:53`)
 fn parse_egress_config() -> Result<EgressConfig> {
     let mut cfg = EgressConfig::default();
-
-    let subnet_env = std::env::var("BUGPOT_EGRESS_SUBNET").ok();
-    let bridge_ip_env = std::env::var("BUGPOT_EGRESS_BRIDGE_IP").ok();
-
-    if let Some(s) = subnet_env {
-        cfg.subnet = s.parse().context("parse BUGPOT_EGRESS_SUBNET")?;
-        if bridge_ip_env.is_none() {
-            cfg.bridge_ip = bugpot_egress::derive_bridge_ip(cfg.subnet);
-        }
-    }
-    if let Some(ip) = bridge_ip_env {
-        cfg.bridge_ip = ip.parse().context("parse BUGPOT_EGRESS_BRIDGE_IP")?;
-    }
-
     if let Ok(raw) = std::env::var("BUGPOT_EGRESS_DNS_UPSTREAM") {
         cfg.dns_upstream =
             bugpot_egress::parse_dns_upstream(&raw).context("parse BUGPOT_EGRESS_DNS_UPSTREAM")?;
     }
-
     cfg.validate().context("validate egress config")?;
     Ok(cfg)
 }
