@@ -106,6 +106,81 @@ pub(crate) enum AppState {
     Stopping,
 }
 
+/// Outcome of inspecting [`HandleInner::state`] at the entry to a
+/// start request. Returned by [`HandleInner::claim_start_slot`] so
+/// `ensure_running` can keep its state-machine knowledge in one
+/// place and dispatch on the result.
+#[derive(Debug)]
+pub(crate) enum StartClaim {
+    /// Container is already serving; return its IP.
+    Ready(Ipv4Addr),
+    /// Another caller owns the in-flight start. Wait on this `Notify`
+    /// (a clone of the one inside the `Starting` variant) and
+    /// re-inspect when woken — the start may have succeeded, failed,
+    /// or been superseded.
+    Coalesce(Arc<Notify>),
+    /// Mid-teardown. Brief back-off then re-inspect; no `Notify`
+    /// here because `stop` flips to `Stopped` synchronously after the
+    /// teardown future resolves, not via wake-up.
+    WaitForStopping,
+    /// Caller now owns the `Starting` slot. `notify` is the in-state
+    /// `Notify` (cloned out before the transition so the start
+    /// initiator keeps a live handle to wake waiters with even after
+    /// the post-work commit drops the in-state `Arc`). `resume_from`
+    /// is `Some(ip)` when the prior state was `Frozen` (call
+    /// `do_resume`) and `None` when it was `Stopped` (call
+    /// `do_start`).
+    Claimed {
+        notify: Arc<Notify>,
+        resume_from: Option<Ipv4Addr>,
+    },
+}
+
+impl HandleInner {
+    /// Bump `last_access` and decide what the caller should do based
+    /// on the current state. On `Stopped` / `Frozen` this *transitions*
+    /// the handle into `Starting`, atomically reserving the slot —
+    /// hence "claim". Other branches return a request for the caller
+    /// to wait or back off; the state is left untouched.
+    pub(crate) fn claim_start_slot(&mut self) -> StartClaim {
+        self.last_access = Instant::now();
+        match &self.state {
+            AppState::Running { container_ip } => StartClaim::Ready(*container_ip),
+            AppState::Starting { notify } => StartClaim::Coalesce(notify.clone()),
+            AppState::Stopping => StartClaim::WaitForStopping,
+            AppState::Stopped => {
+                let n = Arc::new(Notify::new());
+                self.state = AppState::Starting { notify: n.clone() };
+                StartClaim::Claimed {
+                    notify: n,
+                    resume_from: None,
+                }
+            }
+            AppState::Frozen { container_ip } => {
+                let ip = *container_ip;
+                let n = Arc::new(Notify::new());
+                self.state = AppState::Starting { notify: n.clone() };
+                StartClaim::Claimed {
+                    notify: n,
+                    resume_from: Some(ip),
+                }
+            }
+        }
+    }
+
+    /// Transition out of `Starting` after the cold-start / resume
+    /// future resolves. On success: `Running { container_ip }`. On
+    /// failure: `Stopped`, so the next request triggers a fresh
+    /// attempt rather than re-using a half-broken endpoint.
+    pub(crate) fn finish_start<E>(&mut self, result: &std::result::Result<Ipv4Addr, E>) {
+        self.state = result
+            .as_ref()
+            .map_or(AppState::Stopped, |ip| AppState::Running {
+                container_ip: *ip,
+            });
+    }
+}
+
 impl AppState {
     /// `Running` — the container is up and accepting traffic. Distinct
     /// from "has a live container" (`needs_teardown`); this is the
