@@ -123,6 +123,12 @@ smoke-freeze:
 smoke-volume:
     limactl shell bugpot -- sudo bash scripts/smoke-volume.sh
 
+# HTTP readiness end-to-end (<30s; no freeze cycle). Two apps in
+# parallel: one with a passing 2xx path, one with a non-2xx path
+# that must fail the cold start.
+smoke-readiness:
+    limactl shell bugpot -- sudo bash scripts/smoke-readiness.sh
+
 # Long-running interactive demo (foreground; Ctrl+C to stop).
 run:
     limactl shell bugpot -- sudo bash scripts/run-local.sh
