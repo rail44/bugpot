@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// One image-rollout event for an app.
@@ -58,8 +58,38 @@ pub struct AppSpec {
     pub readiness: Readiness,
     #[serde(default, skip_serializing_if = "Resources::is_empty")]
     pub resources: Resources,
+    /// Persistent volumes bind-mounted from
+    /// `<state>/volumes/<app>/<name>/` into the container at the
+    /// declared path. Survives `idle` freeze, memory-pressure
+    /// eviction, and rollouts; cleared only on `DELETE /apps/<name>`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<VolumeSpec>,
     #[serde(skip)]
     pub source_path: PathBuf,
+}
+
+/// One persistent bind mount into a container.
+///
+/// **Permissions trap.** Containers commonly run as a non-root user
+/// (Linkding uid=33, Vaultwarden uid=1000, …). The host-side directory
+/// inherits root ownership at creation, so the app gets EACCES on
+/// first write. Set `user` to the container's expected UID and bugpot
+/// chowns the directory at start time; leave it `None` only if the
+/// image runs as root or pre-chowns the path itself.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct VolumeSpec {
+    /// Volume identifier, unique within an app. Maps to the host
+    /// directory `<state>/volumes/<app>/<name>/`. Must be a strict
+    /// DNS label (same alphabet as `name` / `subdomain`) so it can't
+    /// path-escape its parent.
+    pub name: String,
+    /// Absolute mount point inside the container.
+    pub path: PathBuf,
+    /// Optional UID to `chown` the host directory to at start time
+    /// (also used as the GID, mirroring how most container images
+    /// stage `user:user 0755` dirs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<u32>,
 }
 
 /// `[egress]` section of an app TOML. The name distinguishes the
@@ -257,8 +287,73 @@ impl AppSpec {
         // common case. When explicitly set it gets the same check.
         validate_dns_label("subdomain", self.subdomain())?;
         validate_repo(&self.repo)?;
+        validate_volumes(&self.volumes)?;
         Ok(())
     }
+}
+
+/// Reserved mount points: bugpot or libcontainer already binds something
+/// here, so user volumes that target the same path would shadow or
+/// conflict. Compared as path strings (trailing slashes normalised away).
+const RESERVED_MOUNT_PATHS: &[&str] = &[
+    "/",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/dev/pts",
+    "/dev/shm",
+    "/dev/mqueue",
+    "/etc/resolv.conf",
+];
+
+fn validate_volumes(volumes: &[VolumeSpec]) -> Result<(), InvalidSpec> {
+    let mut seen_names: HashSet<&str> = HashSet::new();
+    let mut seen_paths: HashSet<PathBuf> = HashSet::new();
+    for v in volumes {
+        validate_dns_label("volumes.name", &v.name)?;
+        let path = &v.path;
+        if !path.is_absolute() {
+            return Err(InvalidSpec {
+                field: "volumes.path",
+                value: path.display().to_string(),
+                reason: "must be an absolute container-internal path",
+            });
+        }
+        let normalised: PathBuf = path
+            .components()
+            .filter(|c| !matches!(c, std::path::Component::CurDir))
+            .collect();
+        let s = normalised.to_string_lossy();
+        if s.contains("..") {
+            return Err(InvalidSpec {
+                field: "volumes.path",
+                value: path.display().to_string(),
+                reason: "must not contain '..' segments",
+            });
+        }
+        if RESERVED_MOUNT_PATHS.iter().any(|r| *r == s) {
+            return Err(InvalidSpec {
+                field: "volumes.path",
+                value: path.display().to_string(),
+                reason: "collides with a path bugpot or libcontainer already mounts",
+            });
+        }
+        if !seen_names.insert(v.name.as_str()) {
+            return Err(InvalidSpec {
+                field: "volumes.name",
+                value: v.name.clone(),
+                reason: "duplicate volume name within app",
+            });
+        }
+        if !seen_paths.insert(normalised) {
+            return Err(InvalidSpec {
+                field: "volumes.path",
+                value: path.display().to_string(),
+                reason: "duplicate mount point within app",
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Reason an `AppSpec` field failed validation. Surface this to the
@@ -926,5 +1021,123 @@ port = 80
         let parsed: AppSpec = toml::from_str(&body).unwrap();
         assert_eq!(parsed.egress.allow, vec!["api.openai.com"]);
         assert_eq!(parsed.scaling.idle_timeout.as_deref(), Some("30s"));
+    }
+
+    #[test]
+    fn volumes_parse_and_validate() {
+        let spec: AppSpec = toml::from_str(
+            r#"
+            repo = "ghcr.io/org/app"
+            port = 80
+            name = "alpha"
+
+            [[volumes]]
+            name = "data"
+            path = "/data"
+            user = 33
+
+            [[volumes]]
+            name = "cache"
+            path = "/var/cache/app"
+            "#,
+        )
+        .expect("parse");
+        spec.validate().expect("validate");
+        assert_eq!(spec.volumes.len(), 2);
+        assert_eq!(spec.volumes[0].name, "data");
+        assert_eq!(spec.volumes[0].user, Some(33));
+        assert!(spec.volumes[1].user.is_none());
+    }
+
+    #[test]
+    fn volumes_reject_relative_paths() {
+        let mut spec: AppSpec = toml::from_str(
+            r#"
+            repo = "x"
+            port = 80
+            name = "alpha"
+            "#,
+        )
+        .unwrap();
+        spec.volumes = vec![VolumeSpec {
+            name: "data".into(),
+            path: PathBuf::from("data"),
+            user: None,
+        }];
+        let err = spec.validate().expect_err("relative path must fail");
+        assert_eq!(err.field, "volumes.path");
+    }
+
+    #[test]
+    fn volumes_reject_reserved_mount_paths() {
+        let mut spec: AppSpec = toml::from_str(
+            r#"
+            repo = "x"
+            port = 80
+            name = "alpha"
+            "#,
+        )
+        .unwrap();
+        // /proc is a default OCI mount; user-mounting over it is a
+        // footgun (libcontainer's mount would shadow it).
+        spec.volumes = vec![VolumeSpec {
+            name: "p".into(),
+            path: PathBuf::from("/proc"),
+            user: None,
+        }];
+        let err = spec.validate().expect_err("reserved path must fail");
+        assert_eq!(err.field, "volumes.path");
+    }
+
+    #[test]
+    fn volumes_reject_duplicate_names() {
+        let mut spec: AppSpec = toml::from_str(
+            r#"
+            repo = "x"
+            port = 80
+            name = "alpha"
+            "#,
+        )
+        .unwrap();
+        spec.volumes = vec![
+            VolumeSpec {
+                name: "data".into(),
+                path: PathBuf::from("/a"),
+                user: None,
+            },
+            VolumeSpec {
+                name: "data".into(),
+                path: PathBuf::from("/b"),
+                user: None,
+            },
+        ];
+        let err = spec.validate().expect_err("dup name must fail");
+        assert_eq!(err.field, "volumes.name");
+    }
+
+    #[test]
+    fn volumes_reject_duplicate_paths() {
+        let mut spec: AppSpec = toml::from_str(
+            r#"
+            repo = "x"
+            port = 80
+            name = "alpha"
+            "#,
+        )
+        .unwrap();
+        spec.volumes = vec![
+            VolumeSpec {
+                name: "a".into(),
+                path: PathBuf::from("/data"),
+                user: None,
+            },
+            VolumeSpec {
+                name: "b".into(),
+                path: PathBuf::from("/data"),
+                user: None,
+            },
+        ];
+        let err = spec.validate().expect_err("dup path must fail");
+        assert_eq!(err.field, "volumes.path");
     }
 }
