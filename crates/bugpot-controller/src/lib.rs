@@ -656,7 +656,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         // when `repo` changes so the next pull rebuilds it against
         // the new registry path.
         if existing.repo != new_spec.repo {
-            *handle.image_digest.lock().await = None;
+            handle.inner.lock().await.image_digest = None;
         }
 
         if let Err(e) = self.persist_spec(&handle).await {
@@ -742,7 +742,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
             }
             inner.rollouts.push_back(rollout.clone());
         }
-        *handle.image_digest.lock().await = Some(resolved_digest);
+        handle.inner.lock().await.image_digest = Some(resolved_digest);
 
         // 3. Persist the rollout to its own state file. Spec doesn't
         // change here, so no spec rewrite needed.
@@ -996,8 +996,10 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         // manifest probe is skipped (`Puller::pull` short-circuits on
         // digest references). The cache invalidates only when the
         // handle is destroyed (operator redeploy or bugpot restart).
-        let image_ref =
-            digest_pinned_ref(&plain_image_ref, handle.image_digest.lock().await.as_ref());
+        let image_ref = digest_pinned_ref(
+            &plain_image_ref,
+            handle.inner.lock().await.image_digest.as_ref(),
+        );
         let image_id = match self
             .runtime
             .pull_image(&image_ref, self.resolve_auth(&spec.repo))
@@ -1013,9 +1015,9 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         // Subsequent cold-starts (within this process) will skip the
         // probe via the branch above.
         {
-            let mut slot = handle.image_digest.lock().await;
-            if slot.is_none() {
-                *slot = Some(image_id.clone());
+            let mut inner = handle.inner.lock().await;
+            if inner.image_digest.is_none() {
+                inner.image_digest = Some(image_id.clone());
             }
         }
         histogram!("bugpot_cold_start_seconds", "phase" => "pull")
@@ -1709,7 +1711,7 @@ mod tests {
             maps.by_name.get("alpha").cloned().unwrap()
         };
         // Seed the cache as if a prior start populated it.
-        *handle.image_digest.lock().await =
+        handle.inner.lock().await.image_digest =
             Some(bugpot_runtime::ImageId::new("sha256:oldcacheddigest"));
 
         let mut new_spec = spec_with_name("alpha");
@@ -1720,7 +1722,7 @@ mod tests {
             .expect("repo change PATCH succeeds");
 
         assert!(
-            handle.image_digest.lock().await.is_none(),
+            handle.inner.lock().await.image_digest.is_none(),
             "image_digest cache must clear on repo change"
         );
     }

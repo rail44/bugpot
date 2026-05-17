@@ -39,23 +39,6 @@ pub(crate) struct AppHandle {
     /// `subdomain` fields exist for TOML / JSON serialisation shape
     /// only — `identity` is the authoritative pair.
     pub(crate) spec: RwLock<AppSpec>,
-    /// Resolved image digest from the first successful pull. Pinning
-    /// at the handle level means subsequent cold-starts for this app
-    /// skip the `manifest_probe` round-trip (~1s on a remote registry)
-    /// and go straight to the cache-hit path inside `Puller::pull`.
-    ///
-    /// Invalidation is **deterministic** by construction:
-    ///
-    /// - `DELETE /apps/<name>` followed by `POST /apps` drops the
-    ///   handle entirely; the replacement starts at `None`.
-    /// - A bugpot process restart drops the in-memory map; the next
-    ///   start of each app re-probes once.
-    ///
-    /// Mutable tags (`:latest` etc.) therefore behave the same way
-    /// Kubernetes' `imagePullPolicy: IfNotPresent` does — an
-    /// operator-side redeploy is required to pick up an upstream
-    /// retag. No TTL.
-    pub(crate) image_digest: Mutex<Option<bugpot_runtime::ImageId>>,
     /// Per-app counter of HTTP/1.1 upgrades (WebSocket / SSE) currently
     /// spliced through the router. Incremented by the router on splice
     /// spawn, decremented when the splice task exits. The idle reaper
@@ -79,6 +62,18 @@ pub(crate) struct HandleInner {
     /// app is registered but not yet deployed, in which case
     /// `ensure_running` will fail.
     pub(crate) rollouts: VecDeque<Rollout>,
+    /// Resolved image digest from the first successful pull. Pinning
+    /// at the handle level means subsequent cold-starts for this app
+    /// skip the `manifest_probe` round-trip (~1s on a remote registry)
+    /// and go straight to the cache-hit path inside `Puller::pull`.
+    ///
+    /// Lives in `HandleInner` because invalidation is part of the
+    /// lifecycle: `update_app` clears it on `repo` change, and a
+    /// successful pull writes it. Mutable tags (`:latest` etc.)
+    /// therefore behave the way Kubernetes' `imagePullPolicy:
+    /// IfNotPresent` does — an operator-side redeploy is required
+    /// to pick up an upstream retag. No TTL.
+    pub(crate) image_digest: Option<bugpot_runtime::ImageId>,
     /// Last-seen cgroup `cpu_usec` for the running container, used to
     /// compute deltas for the `bugpot_app_cpu_microseconds_total`
     /// counter across sweeps. Lifetime matches the handle's running
@@ -182,12 +177,12 @@ pub(crate) fn make_handle_with_rollouts(
     Ok(Arc::new(AppHandle {
         identity,
         spec: RwLock::new(spec),
-        image_digest: Mutex::new(None),
         active_upgrades: Arc::new(AtomicUsize::new(0)),
         inner: Mutex::new(HandleInner {
             state: AppState::Stopped,
             last_access: Instant::now(),
             rollouts,
+            image_digest: None,
             cpu_baseline: 0,
         }),
     }))
