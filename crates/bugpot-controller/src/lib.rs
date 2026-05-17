@@ -418,7 +418,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         let mut candidate: Option<(Arc<AppHandle>, Instant)> = None;
         for handle in self.snapshot_handles().await {
             let inner = handle.inner.lock().await;
-            if matches!(inner.state, AppState::Frozen { .. }) {
+            if inner.state.is_frozen() {
                 match &candidate {
                     Some((_, oldest)) if inner.last_access >= *oldest => {}
                     _ => candidate = Some((handle.clone(), inner.last_access)),
@@ -457,8 +457,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         // Only look at apps we believe are running. Starting /
         // Stopping / Stopped handles are already in motion or
         // already-cleaned.
-        let is_running = matches!(handle.inner.lock().await.state, AppState::Running { .. });
-        if !is_running {
+        if !handle.inner.lock().await.state.is_running() {
             return;
         }
 
@@ -511,6 +510,10 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         for handle in self.snapshot_handles().await {
             let should_stop = {
                 let inner = handle.inner.lock().await;
+                // Frozen is deliberately excluded: on daemon shutdown
+                // we leave paused containers paused so `reattach_running`
+                // picks them back up after restart, rather than racing
+                // a fresh stop.
                 matches!(
                     inner.state,
                     AppState::Running { .. } | AppState::Starting { .. }
@@ -623,7 +626,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
 
         {
             let inner = handle.inner.lock().await;
-            if matches!(inner.state, AppState::Starting { .. } | AppState::Stopping) {
+            if inner.state.is_busy() {
                 return Err(UpdateError::Conflict(name.to_owned()));
             }
         }
@@ -640,7 +643,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
             return Ok(view_of(&handle).await);
         }
 
-        let was_running = matches!(handle.inner.lock().await.state, AppState::Running { .. });
+        let was_running = handle.inner.lock().await.state.is_running();
 
         // Replace under the write lock.
         {
@@ -711,7 +714,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         // we don't waste a registry round-trip on a doomed call.
         {
             let inner = handle.inner.lock().await;
-            if matches!(inner.state, AppState::Starting { .. } | AppState::Stopping) {
+            if inner.state.is_busy() {
                 return Err(RolloutError::Conflict(name.to_owned()));
             }
         }
@@ -749,7 +752,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
 
         // 4 + 5: bring the container to the new image. If it was
         // running, stop first so the start uses the new digest cache.
-        let was_running = matches!(handle.inner.lock().await.state, AppState::Running { .. });
+        let was_running = handle.inner.lock().await.state.is_running();
         if was_running && let Err(e) = self.stop(&handle).await {
             warn!(app = %name, error = ?e, "stop before rollout-restart failed");
         }
@@ -1116,10 +1119,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
     async fn stop(&self, handle: &Arc<AppHandle>) -> Result<()> {
         {
             let mut inner = handle.inner.lock().await;
-            if !matches!(
-                inner.state,
-                AppState::Running { .. } | AppState::Starting { .. } | AppState::Frozen { .. }
-            ) {
+            if !inner.state.needs_teardown() {
                 return Ok(());
             }
             inner.state = AppState::Stopping;
@@ -2001,7 +2001,7 @@ mod tests {
 
         let state = handle.inner.lock().await.state.clone();
         assert!(
-            matches!(state, AppState::Frozen { .. }),
+            state.is_frozen(),
             "expected Frozen after idle timeout, got {state:?}"
         );
         let rt_calls = controller.runtime.calls();
@@ -2035,7 +2035,7 @@ mod tests {
 
         let state = handle.inner.lock().await.state.clone();
         assert!(
-            matches!(state, AppState::Running { .. }),
+            state.is_running(),
             "expected freeze to be skipped (still Running), got {state:?}"
         );
         let rt_calls = controller.runtime.calls();
@@ -2131,7 +2131,7 @@ mod tests {
             "older alpha should be evicted, got {alpha_state:?}"
         );
         assert!(
-            matches!(beta_state, AppState::Frozen { .. }),
+            beta_state.is_frozen(),
             "newer beta should stay frozen, got {beta_state:?}"
         );
     }

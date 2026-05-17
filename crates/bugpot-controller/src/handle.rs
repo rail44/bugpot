@@ -108,6 +108,39 @@ pub(crate) enum AppState {
     Stopping,
 }
 
+impl AppState {
+    /// `Running` — the container is up and accepting traffic. Distinct
+    /// from "has a live container" (`needs_teardown`); this is the
+    /// strict "ready to serve" state.
+    pub(crate) const fn is_running(&self) -> bool {
+        matches!(self, Self::Running { .. })
+    }
+
+    /// `Frozen` — paused via cgroup freezer. RAM-resident, CPU 0.
+    pub(crate) const fn is_frozen(&self) -> bool {
+        matches!(self, Self::Frozen { .. })
+    }
+
+    /// Mid-transition (`Starting` or `Stopping`). Callers that need a
+    /// settled state typically return a 409-style "retry later"
+    /// rather than blocking.
+    pub(crate) const fn is_busy(&self) -> bool {
+        matches!(self, Self::Starting { .. } | Self::Stopping)
+    }
+
+    /// There is (or is about to be) a container associated with this
+    /// handle that bugpot is responsible for tearing down. Covers the
+    /// three variants whose teardown actually frees resources:
+    /// `Running`, `Frozen`, and `Starting` (a cold start in flight
+    /// must be interrupted).
+    pub(crate) const fn needs_teardown(&self) -> bool {
+        matches!(
+            self,
+            Self::Running { .. } | Self::Frozen { .. } | Self::Starting { .. }
+        )
+    }
+}
+
 /// Both registration maps under a single lock so insert / remove are
 /// atomic across the (name, subdomain) pair. Name is the primary key
 /// (used by `get_app` / `remove_app` / `cleanup`); subdomain is a
