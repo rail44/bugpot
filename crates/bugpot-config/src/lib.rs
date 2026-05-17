@@ -1251,4 +1251,40 @@ port = 80
         let err = spec.validate().expect_err("query string must fail");
         assert_eq!(err.field, "readiness.path");
     }
+
+    /// Every TOML shipped under `examples/self-hosted/` must parse and
+    /// validate cleanly. The directory is hand-edited and copied into
+    /// operator ops repos, so a silently-broken template would only
+    /// surface as a confusing admin-API 400 in production. Catch it
+    /// at the workspace level instead.
+    #[test]
+    fn self_hosted_examples_parse_and_validate() {
+        // Crate path: `crates/bugpot-config/`, two levels up to repo
+        // root, then into examples/self-hosted/.
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("examples")
+            .join("self-hosted");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).expect("read examples/self-hosted dir") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|s| s.to_str()) != Some("toml") {
+                continue;
+            }
+            let raw = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            let mut spec: AppSpec =
+                toml::from_str(&raw).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+            spec.source_path = path.clone();
+            spec.validate()
+                .unwrap_or_else(|e| panic!("validate {}: {e}", path.display()));
+            checked += 1;
+        }
+        assert!(
+            checked > 0,
+            "expected at least one example TOML under {}",
+            dir.display(),
+        );
+    }
 }
