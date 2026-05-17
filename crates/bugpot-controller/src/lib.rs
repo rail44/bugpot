@@ -987,6 +987,24 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         if let Err(e) = self.stop(&handle).await {
             warn!(app = %handle.identity.name, error = ?e, "stop failed during remove");
         }
+        // `stop()` only kills the container — it leaves the bundle dir
+        // and the per-app volume tree on disk. `cleanup_orphan_container`
+        // is what knows how to reclaim those (it's also the entry
+        // point for the startup orphan sweep), so route through it
+        // here too. Otherwise persistent-volume apps leak data on
+        // DELETE — the volume dir survives until the operator runs a
+        // restart-with-missing-TOML cycle.
+        if let Err(e) = self
+            .runtime
+            .cleanup_orphan_container(&handle.identity.name)
+            .await
+        {
+            warn!(
+                app = %handle.identity.name,
+                error = ?e,
+                "cleanup_orphan_container failed during remove; bundle / volume dir may leak",
+            );
+        }
         let toml_path = self.apps_dir.join(format!("{}.toml", handle.identity.name));
         if toml_path.exists()
             && let Err(e) = tokio::fs::remove_file(&toml_path).await
@@ -2515,5 +2533,27 @@ mod tests {
             .await
             .expect_err("5xx must not be ready");
         assert!(err.to_string().contains("503"), "got {err}");
+    }
+
+    /// `DELETE /apps/<name>` (which lands in `remove_app`) must also
+    /// route through the runtime's `cleanup_orphan_container` so the
+    /// bundle dir + per-app volume tree are reclaimed — otherwise
+    /// persistent-volume apps leak data on every remove, surfaced as
+    /// "stale `/var/lib/bugpot/volumes/<name>/`" weeks later.
+    #[tokio::test]
+    async fn remove_app_runs_cleanup_orphan_container() {
+        let tmp = tempfile::tempdir().unwrap();
+        let controller =
+            make_controller(vec![stored_with_name("alpha", "v1")], tmp.path().to_owned());
+
+        controller.remove_app("alpha").await.expect("remove_app");
+
+        let rt_calls = controller.runtime.calls();
+        assert!(
+            rt_calls
+                .iter()
+                .any(|c| c == "cleanup_orphan_container(alpha)"),
+            "remove_app must trigger cleanup_orphan_container; got {rt_calls:?}"
+        );
     }
 }
