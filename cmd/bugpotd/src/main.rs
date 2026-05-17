@@ -24,7 +24,6 @@ use tracing_subscriber::EnvFilter;
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:8080";
 const DEFAULT_ADMIN_LISTEN: &str = "127.0.0.1:8081";
-const DEFAULT_APPS_DIR: &str = "./apps";
 const DEFAULT_AUTH_FILE: &str = "/etc/bugpot/auth.toml";
 /// Cadence for the controller's lifecycle sweep (crash detection +
 /// scale-to-zero idle stop). 30 s strikes the balance for a 1 vCPU
@@ -56,7 +55,6 @@ const MEM_PRESSURE_HI_DEFAULT: u64 = 250 * 1024 * 1024;
 
 #[derive(Debug)]
 struct Config {
-    apps_dir: PathBuf,
     listen: SocketAddr,
     admin_listen: SocketAddr,
     auth_file: PathBuf,
@@ -84,9 +82,6 @@ async fn main() -> Result<()> {
 
     let cfg = parse_config()?;
 
-    let apps = bugpot_config::load_apps(&cfg.apps_dir)?;
-    info!(count = apps.len(), dir = %cfg.apps_dir.display(), "loaded apps");
-
     let auth = bugpot_config::load_auth(&cfg.auth_file).context("load auth.toml")?;
     info!(
         file = %cfg.auth_file.display(),
@@ -110,7 +105,7 @@ async fn main() -> Result<()> {
     // Runtime (image cache + libcontainer state).
     let state_dir = Runtime::default_state_dir();
     info!(state_dir = %state_dir.display(), "init runtime");
-    let runtime = Arc::new(Runtime::new(state_dir).context("init runtime")?);
+    let runtime = Arc::new(Runtime::new(state_dir.clone()).context("init runtime")?);
 
     // Reclaim image cache dirs whose digest no bundle references and
     // any orphan `.tmp.*` / incomplete-pull dirs. Safe before pulls
@@ -124,14 +119,13 @@ async fn main() -> Result<()> {
         Err(e) => warn!(error = ?e, "image cache GC failed (continuing)"),
     }
 
-    // Controller owns per-app lifecycle.
-    let controller = Arc::new(AppController::new(
-        runtime,
-        egress,
-        cfg.apps_dir.clone(),
-        auth,
-        apps,
-    ));
+    // Controller owns per-app lifecycle. It rehydrates AppSpecs and
+    // rollouts from its own state directory (`<state>/apps/` and
+    // `<state>/rollouts/`) — operators do not feed it specs from a
+    // separate directory; admin API is the only entry point.
+    let controller = Arc::new(
+        AppController::new(runtime, egress, state_dir.clone(), auth).context("init controller")?,
+    );
     // Reclaim any containers + endpoints that survived a previous bugpot
     // process (e.g. a crash, or a planned binary upgrade in a later
     // version). Done before deploy_always_on so eager-start sees these
@@ -200,9 +194,6 @@ async fn main() -> Result<()> {
 }
 
 fn parse_config() -> Result<Config> {
-    let apps_dir = std::env::var("BUGPOT_APPS_DIR")
-        .map_or_else(|_| PathBuf::from(DEFAULT_APPS_DIR), PathBuf::from);
-
     let listen: SocketAddr = std::env::var("BUGPOT_LISTEN")
         .unwrap_or_else(|_| DEFAULT_LISTEN.to_owned())
         .parse()
@@ -219,7 +210,6 @@ fn parse_config() -> Result<Config> {
     let egress = parse_egress_config()?;
 
     Ok(Config {
-        apps_dir,
         listen,
         admin_listen,
         auth_file,

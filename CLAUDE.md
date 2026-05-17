@@ -126,8 +126,7 @@ they're explicit single-shot tests. The dev-server intentionally does not.
 
 Env vars (read by bugpot directly):
 
-- `BUGPOT_APPS_DIR` (default `./apps`)
-- `BUGPOT_STATE_DIR` (default `/var/lib/bugpot`)
+- `BUGPOT_STATE_DIR` (default `/var/lib/bugpot`). All daemon-managed state — image cache, container bundles, persisted `AppSpec`s (`<state>/apps/<name>.toml`), rollout history (`<state>/rollouts/<name>.toml`), per-app volumes — lives here. Specs are *only* set via the admin API; bugpotd does not read TOMLs from any operator-controlled directory.
 - `BUGPOT_LISTEN` — public HTTP router (default `127.0.0.1:8080`)
 - `BUGPOT_ADMIN_LISTEN` — admin HTTP API (default `127.0.0.1:8081`)
 - `BUGPOT_ADMIN_TOKEN_FILE` — **required** unless `BUGPOT_ADMIN_TOKEN` is set. Path to a file whose trimmed contents are the bearer token. The file must be `0600` (any group/other permission bit set causes bugpot to refuse to start, ssh-key style). Typical layout when bugpot runs as the unprivileged `bugpot` user (the shipped systemd unit's setup): `/etc/bugpot/admin-token` with `bugpot:bugpot 0600`.

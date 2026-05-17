@@ -1,10 +1,10 @@
 # Vaultwarden — Rust-based Bitwarden-compatible server.
 #
-# Usage: copy this file into your ops repo's `apps/` directory (or
-# adapt verbatim for `BUGPOT_APPS_DIR`), set ADMIN_TOKEN below, push.
-# The matching app repo's CI handles image rollouts; the image
-# vaultwarden/server is published by the upstream project on
-# Docker Hub.
+# Usage: copy this file into your ops repo's `apps/` directory, set
+# ADMIN_TOKEN below, and arrange for your CI to register the spec
+# via `bugpot apps create -f vaultwarden.toml`. The matching app
+# repo's CI handles image rollouts; the image vaultwarden/server is
+# published by the upstream project on Docker Hub.
 
 name = "vaultwarden"
 

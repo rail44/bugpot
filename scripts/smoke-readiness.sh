@@ -43,7 +43,6 @@ if [ ! -x "$BIN" ]; then
     exit 1
 fi
 
-APPS_DIR=$(mktemp -d)
 STATE_DIR=$(mktemp -d)
 LOG=$(mktemp)
 RESP=$(mktemp)
@@ -69,40 +68,15 @@ cleanup() {
     done
     nft delete table inet bugpot 2>/dev/null
     ip link delete bugpot0 2>/dev/null
-    rm -rf "$APPS_DIR" "$STATE_DIR"
+    rm -rf "$STATE_DIR"
     echo
     echo "(script exit=$rc; bugpotd log=$LOG resp=$RESP kept for inspection)"
     return $rc
 }
 trap cleanup EXIT INT TERM
 
-cat >"$APPS_DIR/good.toml" <<EOF
-repo = "$IMAGE_REPO"
-port = 80
-subdomain = "good"
-[readiness]
-path = "/"
-timeout = "$READINESS_TIMEOUT"
-[rollout]
-tag = "$IMAGE_TAG"
-created_at = "1970-01-01T00:00:00Z"
-EOF
-
-cat >"$APPS_DIR/bad.toml" <<EOF
-repo = "$IMAGE_REPO"
-port = 80
-subdomain = "bad"
-[readiness]
-path = "/no-such-path"
-timeout = "$READINESS_TIMEOUT"
-[rollout]
-tag = "$IMAGE_TAG"
-created_at = "1970-01-01T00:00:00Z"
-EOF
-
 launch_bugpot() {
     LOG_OFFSET=$(wc -l <"$LOG" 2>/dev/null | awk '{print $1}')
-    BUGPOT_APPS_DIR="$APPS_DIR" \
     BUGPOT_STATE_DIR="$STATE_DIR" \
     BUGPOT_LISTEN="$LISTEN" \
     BUGPOT_ADMIN_LISTEN="$ADMIN_LISTEN" \
@@ -111,6 +85,29 @@ launch_bugpot() {
     RUST_LOG="bugpot=info,bugpot_controller=debug,bugpot_router=info,bugpot_runtime=info,bugpot_egress=info" \
         "$BIN" >>"$LOG" 2>&1 &
     PID=$!
+}
+
+register_app() {
+    body=$1
+    curl -fsS -X POST \
+        -H "Authorization: Bearer $ADMIN_TOKEN" \
+        -H "Content-Type: application/toml" \
+        --data-binary "$body" \
+        "http://$ADMIN_LISTEN/apps" >/dev/null
+}
+
+push_rollout() {
+    name=$1
+    tag=$2
+    deploy_token=$(curl -fsS -X POST \
+        -H "Authorization: Bearer $ADMIN_TOKEN" \
+        "http://$ADMIN_LISTEN/apps/$name/deploy-keys" \
+        | sed 's/.*"token":[ ]*"\([^"]*\)".*/\1/')
+    curl -fsS -X POST \
+        -H "Authorization: Bearer $deploy_token" \
+        -H "Content-Type: application/json" \
+        -d "{\"tag\":\"$tag\"}" \
+        "http://$ADMIN_LISTEN/apps/$name/rollouts" >/dev/null
 }
 
 wait_for_up() {
@@ -145,14 +142,35 @@ hit_app() {
 
 echo "=== preflight ==="
 echo "bin       : $BIN"
-echo "apps_dir  : $APPS_DIR"
+echo "state_dir : $STATE_DIR"
 echo "log       : $LOG"
 echo
 
-echo "=== launching bugpotd ==="
+echo "=== launching bugpotd + registering apps ==="
 launch_bugpot
 wait_for_up || exit 1
 echo "pid=$PID"
+
+for spec in \
+    "good /" \
+    "bad /no-such-path"; do
+    name=$(echo "$spec" | awk '{print $1}')
+    path=$(echo "$spec" | awk '{print $2}')
+    register_app "$(cat <<EOF
+name = "$name"
+repo = "$IMAGE_REPO"
+port = 80
+subdomain = "$name"
+[readiness]
+path = "$path"
+timeout = "$READINESS_TIMEOUT"
+EOF
+)"
+    push_rollout "$name" "$IMAGE_TAG" || true
+done
+# push_rollout for `bad` may surface a server-side error (the
+# readiness probe deliberately fails). The pull / start ran, so the
+# subsequent HTTP test is what actually exercises the failure path.
 
 echo
 echo "=== 1. 'good' app (readiness path = / → 200) ==="

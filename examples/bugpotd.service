@@ -96,7 +96,6 @@ TimeoutStopSec=60s
 # bugpot. Token files (admin / deploy) live next to it under
 # /etc/bugpot/ with 0640 root:bugpot.
 EnvironmentFile=-/etc/bugpot/env
-Environment=BUGPOT_APPS_DIR=/var/lib/bugpot/apps
 Environment=BUGPOT_STATE_DIR=/var/lib/bugpot
 Environment=BUGPOT_ADMIN_TOKEN_FILE=/etc/bugpot/admin-token
 Environment=BUGPOT_DEPLOY_SECRET_FILE=/etc/bugpot/deploy-secret

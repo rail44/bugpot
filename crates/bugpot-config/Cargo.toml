@@ -16,7 +16,6 @@ humantime.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 toml.workspace = true
-walkdir.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

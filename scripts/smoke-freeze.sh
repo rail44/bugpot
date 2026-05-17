@@ -41,7 +41,10 @@ if [ ! -x "$BIN" ]; then
     exit 1
 fi
 
-APPS_DIR=$(mktemp -d)
+# A single state dir survives across the bugpotd restart in step 4 —
+# that's the whole point of the reattach assertion. Specs + rollouts
+# persist there; we register the app once on the first launch and
+# expect it to come back on its own.
 STATE_DIR=$(mktemp -d)
 LOG=$(mktemp)
 RESP=$(mktemp)
@@ -67,30 +70,15 @@ cleanup() {
     done
     nft delete table inet bugpot 2>/dev/null
     ip link delete bugpot0 2>/dev/null
-    rm -rf "$APPS_DIR" "$STATE_DIR"
+    rm -rf "$STATE_DIR"
     echo
     echo "(script exit=$rc; bugpotd log=$LOG resp=$RESP kept for inspection)"
     return $rc
 }
 trap cleanup EXIT INT TERM
 
-cat >"$APPS_DIR/$APP_NAME.toml" <<EOF
-repo = "$IMAGE_REPO"
-port = 8080
-subdomain = "$SUBDOMAIN"
-[scaling]
-idle_timeout = "$IDLE_TIMEOUT"
-[rollout]
-tag = "$IMAGE_TAG"
-created_at = "1970-01-01T00:00:00Z"
-EOF
-
-# Capture log offset before launching so `wait_for_up` can match the
-# *new* daemon's "bugpot up" line on restart instead of the previous
-# run's line that still lives in the same file.
 launch_bugpot() {
     LOG_OFFSET=$(wc -l <"$LOG" 2>/dev/null | awk '{print $1}')
-    BUGPOT_APPS_DIR="$APPS_DIR" \
     BUGPOT_STATE_DIR="$STATE_DIR" \
     BUGPOT_LISTEN="$LISTEN" \
     BUGPOT_ADMIN_LISTEN="$ADMIN_LISTEN" \
@@ -117,8 +105,29 @@ wait_for_up() {
     return 1
 }
 
-# Parse the AppView JSON's "state" field. Keeping the matcher
-# permissive on whitespace lets the script survive a future pretty-print.
+register_app() {
+    body=$1
+    curl -fsS -X POST \
+        -H "Authorization: Bearer $ADMIN_TOKEN" \
+        -H "Content-Type: application/toml" \
+        --data-binary "$body" \
+        "http://$ADMIN_LISTEN/apps" >/dev/null
+}
+
+push_rollout() {
+    name=$1
+    tag=$2
+    deploy_token=$(curl -fsS -X POST \
+        -H "Authorization: Bearer $ADMIN_TOKEN" \
+        "http://$ADMIN_LISTEN/apps/$name/deploy-keys" \
+        | sed 's/.*"token":[ ]*"\([^"]*\)".*/\1/')
+    curl -fsS -X POST \
+        -H "Authorization: Bearer $deploy_token" \
+        -H "Content-Type: application/json" \
+        -d "{\"tag\":\"$tag\"}" \
+        "http://$ADMIN_LISTEN/apps/$name/rollouts" >/dev/null
+}
+
 state_of() {
     curl -sS -H "Authorization: Bearer $ADMIN_TOKEN" \
         "http://$ADMIN_LISTEN/apps/$APP_NAME" \
@@ -127,7 +136,7 @@ state_of() {
 }
 
 hit_app() {
-    curl -sS -o "$RESP" -w "%{http_code} %{time_total}\n" -m 10 \
+    curl -sS -o "$RESP" -w "%{http_code} %{time_total}\n" -m 60 \
         -H "Host: $SUBDOMAIN.bugpot.example" "http://$LISTEN/"
 }
 
@@ -157,16 +166,26 @@ assert_http_200() {
 
 echo "=== preflight ==="
 echo "bin       : $BIN"
-echo "apps_dir  : $APPS_DIR"
 echo "state_dir : $STATE_DIR"
 echo "idle      : $IDLE_TIMEOUT"
 echo "log       : $LOG"
 echo
 
-echo "=== launching bugpotd ==="
+echo "=== launching bugpotd + registering app ==="
 launch_bugpot
 wait_for_up || exit 1
 echo "pid=$PID"
+
+register_app "$(cat <<EOF
+name = "$APP_NAME"
+repo = "$IMAGE_REPO"
+port = 8080
+subdomain = "$SUBDOMAIN"
+[scaling]
+idle_timeout = "$IDLE_TIMEOUT"
+EOF
+)"
+push_rollout "$APP_NAME" "$IMAGE_TAG"
 
 echo
 echo "=== 1. cold start (first hit) ==="
@@ -202,6 +221,9 @@ wait "$PID" 2>/dev/null || true
 PID=""
 echo "  bugpotd stopped"
 
+# Reuse the same STATE_DIR — the spec + rollout are persisted there
+# and rehydrate at boot. No re-register needed; that's the whole
+# reattach guarantee.
 launch_bugpot
 wait_for_up || exit 1
 echo "  pid=$PID (restarted)"

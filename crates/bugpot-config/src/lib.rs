@@ -21,19 +21,6 @@ pub struct Rollout {
     pub created_at: String,
 }
 
-/// On-disk persisted form: an app's config plus its current rollout.
-///
-/// bugpot writes one of these per app under `<state>/apps/<name>.toml`;
-/// a `[rollout]` table being absent means the app is registered but
-/// not yet deployed.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct StoredApp {
-    #[serde(flatten)]
-    pub spec: AppSpec,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rollout: Option<Rollout>,
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppSpec {
     /// OCI image repository without tag or digest, e.g.
@@ -583,38 +570,6 @@ pub fn registry_host(image_ref: &str) -> &str {
     } else {
         "docker.io"
     }
-}
-
-/// Load every `<dir>/*.toml` as a [`StoredApp`] (an [`AppSpec`] plus
-/// an optional `[rollout]` table). The spec is validated; the rollout
-/// (when present) is trusted as bugpot's own previous write.
-pub fn load_apps(dir: impl AsRef<Path>) -> Result<Vec<StoredApp>> {
-    let dir = dir.as_ref();
-    anyhow::ensure!(dir.exists(), "apps directory not found: {}", dir.display());
-
-    let mut apps = Vec::new();
-    for entry in walkdir::WalkDir::new(dir)
-        .max_depth(1)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|e| {
-            e.file_type().is_file() && e.path().extension().and_then(|s| s.to_str()) == Some("toml")
-        })
-    {
-        let path = entry.path();
-        let body = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        let mut stored: StoredApp =
-            toml::from_str(&body).with_context(|| format!("failed to parse {}", path.display()))?;
-        stored.spec.source_path = path.to_path_buf();
-        stored
-            .spec
-            .validate()
-            .with_context(|| format!("invalid spec in {}", path.display()))?;
-        apps.push(stored);
-    }
-    apps.sort_by(|a, b| a.spec.name().cmp(b.spec.name()));
-    Ok(apps)
 }
 
 #[cfg(test)]

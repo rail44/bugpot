@@ -1,7 +1,8 @@
 #!/bin/sh
-# Step 2 smoke test: launch bugpot with a single 12-factor app spec, verify
-# the image is pulled, the container starts inside a per-app netns, the
-# router proxies HTTP to the container, then tear everything down.
+# Step 2 smoke test: launch bugpot, register a single 12-factor app via
+# the admin API, verify the image is pulled, the container starts inside
+# a per-app netns, the router proxies HTTP to the container, then tear
+# everything down.
 #
 # Usage:
 #   sudo /home/satoshi/src/github.com/rail44/bugpot/scripts/smoke-app.sh
@@ -14,6 +15,8 @@ WORKDIR=$(pwd)
 APP_NAME=hello
 DOMAIN="${APP_NAME}.bugpot.example"
 LISTEN=127.0.0.1:8080
+ADMIN_LISTEN=127.0.0.1:8081
+ADMIN_TOKEN="smoke-only-do-not-deploy"
 IMAGE_REPO="gcr.io/google-samples/hello-app"
 IMAGE_TAG="1.0"
 
@@ -28,7 +31,6 @@ if [ ! -x "$BIN" ]; then
     exit 1
 fi
 
-APPS_DIR=$(mktemp -d)
 STATE_DIR=$(mktemp -d)
 LOG=$(mktemp)
 RESP=$(mktemp)
@@ -39,7 +41,6 @@ cleanup() {
     set +e
     if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
         kill -INT "$PID"
-        # bugpot has no shutdown reconcile yet, so wait briefly only
         for _ in $(seq 1 20); do
             kill -0 "$PID" 2>/dev/null || break
             sleep 0.5
@@ -47,8 +48,6 @@ cleanup() {
         kill -KILL "$PID" 2>/dev/null
         wait "$PID" 2>/dev/null
     fi
-    # Best-effort container / netns cleanup. The agent's netns naming is
-    # observed at runtime; we delete anything that looks ours.
     ip -all netns list 2>/dev/null | awk '{print $1}' | while read -r ns; do
         case "$ns" in
             bugpot-*) ip netns del "$ns" 2>/dev/null ;;
@@ -56,41 +55,60 @@ cleanup() {
     done
     nft delete table inet bugpot 2>/dev/null
     ip link delete bugpot0 2>/dev/null
-    rm -rf "$APPS_DIR" "$STATE_DIR"
+    rm -rf "$STATE_DIR"
     echo
     echo "(script exit=$rc; bugpot log=$LOG resp=$RESP kept for inspection)"
     return $rc
 }
 trap cleanup EXIT INT TERM
 
-cat >"$APPS_DIR/$APP_NAME.toml" <<EOF
-repo = "$IMAGE_REPO"
-port = 8080
-[rollout]
-tag = "$IMAGE_TAG"
-created_at = "1970-01-01T00:00:00Z"
-EOF
+# Register an app by posting its TOML body. Mirrors what an ops repo's
+# apply.yml workflow does: spec mutations are admin-token-authenticated.
+register_app() {
+    body=$1
+    curl -fsS -X POST \
+        -H "Authorization: Bearer $ADMIN_TOKEN" \
+        -H "Content-Type: application/toml" \
+        --data-binary "$body" \
+        "http://$ADMIN_LISTEN/apps" >/dev/null
+}
+
+# Mint a per-app deploy key (admin-scoped one-shot), then use it to push
+# a rollout. The two-step is the production shape — rollouts use a
+# narrower token than spec management. The mint endpoint returns a JSON
+# `{"token": "bp1.<hex>"}` body.
+push_rollout() {
+    name=$1
+    tag=$2
+    deploy_token=$(curl -fsS -X POST \
+        -H "Authorization: Bearer $ADMIN_TOKEN" \
+        "http://$ADMIN_LISTEN/apps/$name/deploy-keys" \
+        | sed 's/.*"token":[ ]*"\([^"]*\)".*/\1/')
+    curl -fsS -X POST \
+        -H "Authorization: Bearer $deploy_token" \
+        -H "Content-Type: application/json" \
+        -d "{\"tag\":\"$tag\"}" \
+        "http://$ADMIN_LISTEN/apps/$name/rollouts" >/dev/null
+}
 
 echo "=== preflight ==="
 echo "bin       : $BIN"
-echo "apps_dir  : $APPS_DIR"
 echo "state_dir : $STATE_DIR"
 echo "image     : $IMAGE_REPO:$IMAGE_TAG"
 echo "log       : $LOG"
 echo
 
-echo "=== launching bugpot (image pull may take 30s) ==="
-BUGPOT_APPS_DIR="$APPS_DIR" \
+echo "=== launching bugpot ==="
 BUGPOT_STATE_DIR="$STATE_DIR" \
 BUGPOT_LISTEN="$LISTEN" \
-BUGPOT_ADMIN_TOKEN="smoke-only-do-not-deploy" \
+BUGPOT_ADMIN_LISTEN="$ADMIN_LISTEN" \
+BUGPOT_ADMIN_TOKEN="$ADMIN_TOKEN" \
 BUGPOT_DEPLOY_SECRET="smoke-only-deploy-secret" \
 RUST_LOG="bugpot=info,bugpot_router=info,bugpot_runtime=info,bugpot_egress=info" \
     "$BIN" >"$LOG" 2>&1 &
 PID=$!
 echo "pid=$PID"
 
-# Wait for "bugpot up" (or early failure).
 ok=0
 for _ in $(seq 1 240); do
     if grep -q "bugpot up" "$LOG" 2>/dev/null; then
@@ -113,6 +131,17 @@ if [ "$ok" -ne 1 ]; then
 fi
 
 echo
+echo "=== registering app + rollout via admin API ==="
+register_app "$(cat <<EOF
+name = "$APP_NAME"
+repo = "$IMAGE_REPO"
+port = 8080
+EOF
+)"
+push_rollout "$APP_NAME" "$IMAGE_TAG"
+echo "registered + rolled out (image pull may take ~30s on the request below)"
+
+echo
 echo "=== environment after bring-up ==="
 ip -brief link show bugpot0 || true
 ip -brief addr show bugpot0 || true
@@ -123,7 +152,7 @@ ip -brief link show | awk '/veth|bugpot/' | head -10 || true
 
 echo
 echo "=== HTTP smoke test ==="
-status=$(curl -sS -o "$RESP" -w "%{http_code}" -m 10 -H "Host: $DOMAIN" "http://$LISTEN/" || echo "curl-failed")
+status=$(curl -sS -o "$RESP" -w "%{http_code}" -m 60 -H "Host: $DOMAIN" "http://$LISTEN/" || echo "curl-failed")
 echo "HTTP status : $status"
 echo "Body:"
 sed 's/^/    /' "$RESP" | head -20
@@ -140,7 +169,6 @@ echo
 echo "=== tail of log ==="
 tail -20 "$LOG"
 
-# Result assertions (after the success-or-skip path).
 if [ "$status" != "200" ]; then
     echo
     echo "FAIL: expected HTTP 200, got $status"
