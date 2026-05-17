@@ -23,12 +23,15 @@
 #![allow(clippy::redundant_pub_crate)]
 
 mod auth;
+mod cgroup_stats;
 mod error;
 mod image;
+mod logs;
 mod resources;
 mod runtime;
 mod seccomp;
 mod spec;
+mod volumes;
 
 pub use auth::Auth;
 pub use error::RuntimeError;
