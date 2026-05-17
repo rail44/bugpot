@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Bugpot is an internal Heroku-like PaaS for running experimental apps as OCI containers behind a Host-header–routed reverse proxy with per-app network isolation, DNS-driven egress allowlists, and scale-to-zero. Rust workspace targeting Linux only (uses libcontainer/youki, nftables, netns).
+Bugpot is an internal Heroku-like PaaS for running experimental apps and self-hosted tools as OCI containers behind a Host-header–routed reverse proxy with per-app network isolation, DNS-driven egress allowlists, and **freezer-based scale-to-zero** (idle apps are cgroup-paused, not stopped — next request resumes in sub-ms; a memory-pressure handler evicts oldest-frozen to free RAM under load). Rust workspace targeting Linux only (uses libcontainer/youki, nftables, netns, cgroup v2 freezer).
 
 ## Development environment (macOS host)
 
@@ -134,6 +134,8 @@ Env vars (read by bugpot directly):
 - `BUGPOT_ADMIN_TOKEN` — fallback bearer token for development. **Logs a warning** when used because env vars are visible in `/proc/<pid>/environ` and shell history; prefer `BUGPOT_ADMIN_TOKEN_FILE` in production. bugpot refuses to start unless one of these two is set.
 - `BUGPOT_AUTH_FILE` — registry-auth TOML (default `/etc/bugpot/auth.toml`, missing file = anonymous)
 - `BUGPOT_METRICS_LISTEN` — opt-in Prometheus listener (e.g. `127.0.0.1:9090`). Unset = `/metrics` + `/healthz` disabled.
+- `BUGPOT_FREEZE_ENABLED` — `true` (default) or `false`. When on, `idle_timeout` freezes the container (cgroup v2 freezer) instead of stopping it, keeping RAM resident so the next request resumes in sub-ms. The memory-pressure handler evicts oldest-frozen apps to `Stopped` under low memory; see the two knobs below. Off restores pre-freeze behavior (idle = stop).
+- `BUGPOT_FREEZE_MEM_LO` / `BUGPOT_FREEZE_MEM_HI` — bytes of `MemAvailable` that trigger / release the eviction handler (hysteresis pair, defaults 150 MiB / 250 MiB sized for e2-micro). Bump for larger VMs. `LO < HI` is enforced; the daemon refuses to start otherwise.
 - `RUST_LOG`
 
 ### Admin HTTP API
@@ -285,7 +287,9 @@ A user namespace was investigated and **deferred**: libcontainer creates the use
 
 ### Scale-to-zero
 
-`scaling.idle_timeout` in app TOML: `"0"` / `""` / missing → always-on (eagerly started at bring-up); `"30s"` / `"5m"` / `"2h"` → reclaimed by `idle_stopper_loop` once `last_access` is older than the timeout. Default 5m. The state-transition logic lives in `crates/bugpot-controller`.
+`scaling.idle_timeout` in app TOML: `"0"` / `""` / missing → always-on (eagerly started at bring-up, never frozen); `"30s"` / `"5m"` / `"2h"` → freezer kicks in once `last_access` is older than the timeout. Default 5m. The state-transition logic lives in `crates/bugpot-controller`.
+
+**Freeze vs stop.** The default scale-to-zero path is **freeze, not stop** (cgroup v2 freezer). Frozen apps keep their full RSS resident but consume zero CPU; the next request resumes in sub-ms (no image pull, no libcontainer fork, no TCP readiness probe). The trade-off — RAM stays allocated — is bounded by a memory-pressure handler that polls `MemAvailable` and evicts oldest-frozen apps to `Stopped` when memory drops below `BUGPOT_FREEZE_MEM_LO`. This shifts the bottleneck from "cold-start CPU spike on every long-idle hit" to "RAM in steady state", which is what's wanted for the "many small self-hosted apps on a cheap VM" use case (Vaultwarden / Grafana / Linkding-class). Set `BUGPOT_FREEZE_ENABLED=false` to restore the pre-freeze idle = stop behavior. The router's `forward_upgrade` increments `AppHandle::active_upgrades` for the lifetime of every WebSocket / SSE splice, and the idle reaper refuses to freeze while that counter is non-zero — so long-lived upgraded connections survive idle gaps without being silently stranded.
 
 ### State directory
 
@@ -308,6 +312,7 @@ bugpot delegates image-index resolution to oci-client's default `current_platfor
 
 - `bugpot-metrics::install_recorder` is called unconditionally at startup so `metrics` macros always emit; the HTTP listener (`/metrics`, `/healthz`) only binds when `BUGPOT_METRICS_LISTEN` is set. No auth — bind to a trusted interface.
 - Cold-start instrumentation: `bugpot_cold_start_seconds{phase=endpoint|pull|start|readiness}` (controller, success-only), `bugpot_image_pull_seconds{step=…}` (runtime), `bugpot_container_start_seconds{step=…}` (runtime).
+- Freeze / resume instrumentation: `bugpot_freeze_seconds` (idle reaper, success-only), `bugpot_resume_seconds` (sub-ms cgroup unfreeze path through `ensure_running`), `bugpot_evictions_total` (counter — number of frozen apps the memory-pressure handler has dropped to `Stopped`).
 - Container stdout/stderr lands in `<state>/logs/<app>/{stdout,stderr}.log` (container fd 1 / 2 opened `O_APPEND`). A per-stream task tails each file via inotify (`IN_MODIFY`) and re-emits each new line through `tracing` under target `bugpot::app` with fields `app` and `stream` — filter with `RUST_LOG=bugpot::app=info`.
 - The tail opens at offset 0, not EOF: on bugpot restart, anything still in the file (incl. bytes the app wrote during the interregnum) replays through tracing once. The replay window is bounded by the truncation cap below, so a restart costs at most one cap-worth of duplicate emissions.
 - **Log volume bound (#21):** when any of those files grows past `MAX_LOG_BYTES` (1 MiB), the tail truncates it in place via `ftruncate(0)`. The container's existing fd keeps working — its `O_APPEND` semantics make the next write seek to the new end (= 0). Bytes written between the size check and the truncate may be lost on disk; everything before that point was already emitted through tracing, so the loss is only visible to operators reading the file directly. No generations / no rotation files; if richer retention is needed, run an external collector (vector / otel-collector / fluent-bit) against the same files.

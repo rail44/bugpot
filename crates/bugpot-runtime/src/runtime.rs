@@ -79,7 +79,19 @@ pub trait RuntimeOps: Send + Sync + std::fmt::Debug + 'static {
         netns_path: Option<&'a Path>,
     ) -> impl Future<Output = Result<RunningApp>> + Send + 'a;
     fn stop_app(&self, name: &str) -> impl Future<Output = Result<()>> + Send;
+    /// Suspend the container via cgroup v2 freezer. Memory stays
+    /// resident; CPU usage falls to zero. `unfreeze_app` restores the
+    /// process. Used by the controller's scale-to-zero path to keep
+    /// recently-active apps warm without consuming CPU.
+    fn freeze_app(&self, name: &str) -> impl Future<Output = Result<()>> + Send;
+    /// Restore a frozen container.
+    fn unfreeze_app(&self, name: &str) -> impl Future<Output = Result<()>> + Send;
     fn is_container_running(&self, name: &str) -> bool;
+    /// Did libcontainer save status `Paused` for this container? Used
+    /// at startup by `reattach_running` to recover the post-freeze
+    /// state across a bugpot restart (cgroup freezer state survives the
+    /// daemon process).
+    fn is_container_paused(&self, name: &str) -> bool;
     fn resource_usage(&self, name: &str) -> Option<ResourceUsage>;
     /// (Re)spawn log-tail tasks for `name`. Used by the controller after
     /// a successful reattach so the new bugpot's tracing pipeline picks
@@ -368,6 +380,40 @@ impl RuntimeOps for Runtime {
             memory_bytes: read_memory_bytes(&cgroup)?,
             cpu_usec: read_cpu_usec(&cgroup)?,
         })
+    }
+
+    /// Freeze the container's cgroup. Memory pages stay resident; CPU
+    /// drops to zero. libcontainer writes the cgroup `freeze` file and
+    /// records `ContainerStatus::Paused` so a bugpot restart can
+    /// recover the state.
+    #[allow(clippy::unused_async)]
+    async fn freeze_app(&self, name: &str) -> Result<()> {
+        let container_root = self.containers_dir.join(name);
+        if !container_root.exists() {
+            return Err(RuntimeError::AppNotFound(name.to_owned()));
+        }
+        let mut container = Container::load(container_root)?;
+        container.pause()?;
+        Ok(())
+    }
+
+    #[allow(clippy::unused_async)]
+    async fn unfreeze_app(&self, name: &str) -> Result<()> {
+        let container_root = self.containers_dir.join(name);
+        if !container_root.exists() {
+            return Err(RuntimeError::AppNotFound(name.to_owned()));
+        }
+        let mut container = Container::load(container_root)?;
+        container.resume()?;
+        Ok(())
+    }
+
+    fn is_container_paused(&self, name: &str) -> bool {
+        let container_root = self.containers_dir.join(name);
+        if !container_root.exists() {
+            return false;
+        }
+        Container::load(container_root).is_ok_and(|c| c.status() == ContainerStatus::Paused)
     }
 
     /// Stop and clean up a running container.

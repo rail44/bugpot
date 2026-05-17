@@ -6,7 +6,7 @@ A single-binary container PaaS for experimental apps.
 
 - **Host-header routing** — Multiple apps share one HTTP port; requests are dispatched by the Host header's subdomain.
 - **Per-app egress allowlist** — Each app can only reach the domains you declare, enforced via DNS.
-- **Scale-to-zero** — Idle apps stop automatically and cold-start on the next request.
+- **Freezer-based scale-to-zero** — Idle apps are cgroup-paused (RAM resident, CPU 0). Next request resumes in sub-ms — no cold start. A memory-pressure handler evicts oldest-frozen to `Stopped` when `MemAvailable` runs low.
 
 ## Requirements
 
