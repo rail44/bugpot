@@ -33,6 +33,23 @@ const DEFAULT_AUTH_FILE: &str = "/etc/bugpot/auth.toml";
 /// itself wakes the CPU twelve times a minute for nothing.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
+/// How often the memory-pressure handler polls `MemAvailable`. 500 ms
+/// is the sweet spot between "fast enough to evict before OOM on a
+/// 1 GiB VM" and "noise floor on `/proc/meminfo` read cost".
+const MEM_PRESSURE_POLL: Duration = Duration::from_millis(500);
+
+/// Default low-water mark for memory pressure (bytes of `MemAvailable`).
+/// Below this, the controller starts evicting frozen apps LRU-first.
+/// 150 MiB is comfortable for an e2-micro (1 GiB); operators on a
+/// larger VM can override via `BUGPOT_FREEZE_MEM_LO`.
+const MEM_PRESSURE_LO_DEFAULT: u64 = 150 * 1024 * 1024;
+
+/// Default high-water mark (bytes). Eviction halts once `MemAvailable`
+/// rises back to this level — the hysteresis gap keeps the handler
+/// from flap-flipping at the threshold edge. Override via
+/// `BUGPOT_FREEZE_MEM_HI`.
+const MEM_PRESSURE_HI_DEFAULT: u64 = 250 * 1024 * 1024;
+
 // Metrics: the Prometheus recorder is *always* installed so callsites
 // emit successfully; the HTTP listener is only spawned when
 // `BUGPOT_METRICS_LISTEN` is set, keeping the surface area opt-in.
@@ -133,6 +150,7 @@ async fn main() -> Result<()> {
     }
 
     let sweep_task = spawn_sweep(&controller);
+    let pressure_task = spawn_memory_pressure(&controller)?;
     let serve_task = spawn_router(cfg.listen, &controller)?;
 
     // Sample the tokio runtime every 10s and emit `bugpot_tokio_*`
@@ -173,6 +191,9 @@ async fn main() -> Result<()> {
         t.abort();
     }
     sweep_task.abort();
+    if let Some(t) = pressure_task {
+        t.abort();
+    }
     controller.teardown().await;
 
     Ok(())
@@ -230,6 +251,60 @@ fn spawn_sweep<R: RuntimeOps, E: EgressOps>(
 ) -> JoinHandle<()> {
     let c = Arc::clone(controller);
     tokio::spawn(c.sweep_loop(SWEEP_INTERVAL))
+}
+
+/// Memory-pressure loop runs only when freeze is enabled. With freeze
+/// disabled there are no Frozen apps to evict and the loop would just
+/// burn cycles reading `/proc/meminfo`. Returns `Ok(None)` (a
+/// suppressed task) when disabled so the main waitlist still type-checks.
+///
+/// `BUGPOT_FREEZE_ENABLED` (default `true`) is the kill switch:
+/// flipping it off restores pre-freeze scale-to-zero behavior
+/// (idle apps stop, no RAM-resident pool).
+fn spawn_memory_pressure<R: RuntimeOps, E: EgressOps>(
+    controller: &Arc<AppController<R, E>>,
+) -> Result<Option<JoinHandle<()>>> {
+    if !parse_env_bool("BUGPOT_FREEZE_ENABLED", true)? {
+        info!("BUGPOT_FREEZE_ENABLED=false; memory-pressure handler disabled");
+        return Ok(None);
+    }
+    let lo = parse_env_bytes("BUGPOT_FREEZE_MEM_LO", MEM_PRESSURE_LO_DEFAULT)?;
+    let hi = parse_env_bytes("BUGPOT_FREEZE_MEM_HI", MEM_PRESSURE_HI_DEFAULT)?;
+    if hi <= lo {
+        anyhow::bail!(
+            "BUGPOT_FREEZE_MEM_HI ({hi}) must be greater than BUGPOT_FREEZE_MEM_LO ({lo})",
+        );
+    }
+    info!(
+        lo_bytes = lo,
+        hi_bytes = hi,
+        "memory-pressure handler enabled"
+    );
+    let c = Arc::clone(controller);
+    Ok(Some(tokio::spawn(c.memory_pressure_loop(
+        MEM_PRESSURE_POLL,
+        lo,
+        hi,
+    ))))
+}
+
+fn parse_env_bool(key: &str, default: bool) -> Result<bool> {
+    match std::env::var(key) {
+        Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" | "" => Ok(false),
+            other => anyhow::bail!("{key}: expected boolean, got '{other}'"),
+        },
+        Err(_) => Ok(default),
+    }
+}
+
+fn parse_env_bytes(key: &str, default: u64) -> Result<u64> {
+    std::env::var(key).map_or(Ok(default), |raw| {
+        raw.trim()
+            .parse::<u64>()
+            .with_context(|| format!("parse {key}"))
+    })
 }
 
 fn spawn_router<R: RuntimeOps, E: EgressOps>(

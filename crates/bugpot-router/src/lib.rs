@@ -24,7 +24,10 @@ use ipnet::IpNet;
 use metrics::counter;
 use std::{
     net::{IpAddr, SocketAddr},
-    sync::{Arc, LazyLock, Mutex},
+    sync::{
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant as StdInstant},
 };
 use tokio::{
@@ -174,6 +177,39 @@ impl RouteEntry {
     }
 }
 
+/// What `UpstreamResolver::resolve` returns for a successfully-resolved
+/// host: the upstream address plus an optional per-app counter the
+/// router will increment when it spawns a long-lived upgrade splice.
+///
+/// Resolvers that don't care about per-app upgrade tracking can leave
+/// `active_upgrades` set to `None` (e.g. the static `AppRouter` used in
+/// router-only tests); the in-bugpot `AppController` impl returns the
+/// `AppHandle`'s counter so the controller's idle reaper can defer
+/// freezing while an upgrade is mid-flight.
+#[derive(Debug, Clone)]
+pub struct Upstream {
+    pub addr: SocketAddr,
+    pub active_upgrades: Option<Arc<AtomicUsize>>,
+}
+
+impl Upstream {
+    #[must_use]
+    pub const fn new(addr: SocketAddr) -> Self {
+        Self {
+            addr,
+            active_upgrades: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_active_upgrades(addr: SocketAddr, counter: Arc<AtomicUsize>) -> Self {
+        Self {
+            addr,
+            active_upgrades: Some(counter),
+        }
+    }
+}
+
 /// Pluggable upstream resolver.
 ///
 /// The router calls this on every request to find out where to forward.
@@ -182,7 +218,7 @@ impl RouteEntry {
 /// drops the future.
 #[async_trait]
 pub trait UpstreamResolver: Send + Sync + std::fmt::Debug {
-    async fn resolve(&self, host: &str) -> Option<SocketAddr>;
+    async fn resolve(&self, host: &str) -> Option<Upstream>;
 }
 
 /// Convenience extractor used by both [`AppRouter`] and any custom
@@ -226,8 +262,8 @@ impl AppRouter {
 
 #[async_trait]
 impl UpstreamResolver for AppRouter {
-    async fn resolve(&self, host: &str) -> Option<SocketAddr> {
-        self.resolve(host).map(|d| d.upstream)
+    async fn resolve(&self, host: &str) -> Option<Upstream> {
+        self.resolve(host).map(|d| Upstream::new(d.upstream))
     }
 }
 
@@ -367,7 +403,7 @@ async fn handler(State(state): State<ProxyState>, req: Request) -> Response {
             // hit at the default level). Route hits are not
             // actionable operational signal — `bugpot_router_requests_total`
             // covers the same fact with no allocations per call.
-            debug!(host = %host, %upstream, "matched route");
+            debug!(host = %host, addr = %upstream.addr, "matched route");
             forward(&state, req, upstream, &host).await
         }
     };
@@ -386,7 +422,7 @@ async fn handler(State(state): State<ProxyState>, req: Request) -> Response {
 async fn forward(
     state: &ProxyState,
     mut req: Request,
-    upstream: SocketAddr,
+    upstream: Upstream,
     original_host: &str,
 ) -> Response {
     let is_upgrade = is_upgrade_request(req.headers());
@@ -401,7 +437,7 @@ async fn forward(
         .map(|c| c.0.ip());
 
     // Rewrite URI to point at the upstream.
-    let new_uri = match rewrite_uri(req.uri(), upstream) {
+    let new_uri = match rewrite_uri(req.uri(), upstream.addr) {
         Ok(u) => u,
         Err(e) => {
             warn!(error = %e, "failed to rewrite request URI");
@@ -420,7 +456,7 @@ async fn forward(
         // `Upgrade:` token to flow through to the upstream so it
         // returns 101. Skip the hop-by-hop strip here; the splice
         // takes over once both sides agree.
-        return forward_upgrade(state, req).await;
+        return forward_upgrade(state, req, upstream.active_upgrades).await;
     }
 
     strip_hop_by_hop_headers(req.headers_mut());
@@ -465,7 +501,16 @@ async fn forward(
 
 /// Forward an HTTP/1.1 upgrade request (e.g. WebSocket) by splicing the two
 /// upgraded byte streams together.
-async fn forward_upgrade(state: &ProxyState, mut req: Request) -> Response {
+///
+/// `active_upgrades` (if provided) is an upstream-side counter the
+/// router increments when a successful upgrade enters splice and
+/// decrements when the splice task exits. The controller reads this
+/// counter to defer freezing while an upgrade is mid-flight.
+async fn forward_upgrade(
+    state: &ProxyState,
+    mut req: Request,
+    active_upgrades: Option<Arc<AtomicUsize>>,
+) -> Response {
     // Reserve a slot before promising the client we'll splice. If the
     // global cap is saturated we surface 503 instead of detaching yet
     // another task into the background.
@@ -514,10 +559,18 @@ async fn forward_upgrade(state: &ProxyState, mut req: Request) -> Response {
     // Capture the outbound upgrade future and detach a task that splices the
     // two halves once both are available.
     let server_upgrade = hyper::upgrade::on(&mut upstream_res);
+    // Increment the per-app upgrade counter *before* the splice task is
+    // detached, so a freeze decision racing with this upgrade observes
+    // the increment instead of an empty counter. The drop guard inside
+    // the task decrements on exit (normal close / error / panic), so
+    // the counter is balanced.
+    let upgrade_guard = active_upgrades.map(ActiveUpgradeGuard::new);
     tokio::spawn(async move {
         // `permit` is moved into this task; dropping it on exit
-        // releases the upgrade slot.
+        // releases the upgrade slot. `_guard` mirrors that for the
+        // per-app counter.
         let _permit = permit;
+        let _guard = upgrade_guard;
         match tokio::try_join!(client_upgrade, server_upgrade) {
             Ok((client_io, server_io)) => {
                 let client_io = TokioIo::new(client_io);
@@ -533,6 +586,26 @@ async fn forward_upgrade(state: &ProxyState, mut req: Request) -> Response {
     });
 
     upstream_res.map(Body::new)
+}
+
+/// RAII guard around the per-app `active_upgrades` counter. Construction
+/// increments; drop decrements. Held inside the splice task so the
+/// counter naturally reaches zero on normal exit, panic, or runtime
+/// shutdown — there's no separate "splice finished" callback to wire.
+#[derive(Debug)]
+struct ActiveUpgradeGuard(Arc<AtomicUsize>);
+
+impl ActiveUpgradeGuard {
+    fn new(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self(counter)
+    }
+}
+
+impl Drop for ActiveUpgradeGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Bidirectional copy with shared idle timeout and proper half-close

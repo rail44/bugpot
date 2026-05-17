@@ -17,7 +17,7 @@ use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
@@ -26,7 +26,7 @@ use bugpot_config::{
     AppIdentity, AppSpec, AuthConfig, RegistryCredential, Rollout, StoredApp, registry_host,
 };
 use bugpot_egress::EgressOps;
-use bugpot_router::{UpstreamResolver, subdomain_of};
+use bugpot_router::{Upstream, UpstreamResolver, subdomain_of};
 use bugpot_runtime::{Auth, ResourceUsage, RuntimeError, RuntimeOps};
 use metrics::{counter, gauge, histogram};
 use serde::Serialize;
@@ -177,6 +177,14 @@ struct AppHandle {
     /// registered but not yet deployed, in which case
     /// `ensure_running` will fail and the router returns 404.
     rollouts: Mutex<VecDeque<Rollout>>,
+    /// Per-app counter of HTTP/1.1 upgrades (WebSocket / SSE) currently
+    /// spliced through the router. Incremented by the router on splice
+    /// spawn, decremented when the splice task exits. The idle reaper
+    /// reads this **without taking `inner`'s lock** to decide whether
+    /// to freeze: freezing an app mid-WebSocket would silently strand
+    /// the connection, since the kernel keeps the listen socket up but
+    /// the user-space process can't process frames.
+    active_upgrades: Arc<AtomicUsize>,
     inner: Mutex<HandleInner>,
 }
 
@@ -206,6 +214,13 @@ enum AppState {
     Running {
         container_ip: Ipv4Addr,
     },
+    /// Container is suspended via cgroup freezer; netns + listen
+    /// socket are still alive. The `container_ip` is reused on resume —
+    /// no endpoint re-allocation needed. `ensure_running` transitions
+    /// Frozen → Starting → Running by unfreezing.
+    Frozen {
+        container_ip: Ipv4Addr,
+    },
     Stopping,
 }
 
@@ -228,6 +243,9 @@ pub enum AppStateView {
     Stopped,
     Starting,
     Running,
+    /// Container is paused (cgroup freezer). RAM resident, CPU 0.
+    /// Next request resumes it in sub-ms (no cold start).
+    Frozen,
     Stopping,
 }
 
@@ -347,7 +365,13 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         }
         for handle in self.snapshot_handles().await {
             let name = &handle.identity.name;
-            if !self.runtime.is_container_running(name) {
+            // Either Running or Paused (= frozen across the daemon
+            // restart) counts as a live container worth reattaching to.
+            // libcontainer persists `ContainerStatus::Paused` on disk
+            // and the cgroup freezer state is kernel-side, so a frozen
+            // container survives a bugpot crash transparently.
+            let is_paused = self.runtime.is_container_paused(name);
+            if !self.runtime.is_container_running(name) && !is_paused {
                 continue;
             }
             let allowlist = handle.spec.read().await.egress.allow.clone();
@@ -355,8 +379,14 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
                 Ok(Some(ep)) => {
                     {
                         let mut inner = handle.inner.lock().await;
-                        inner.state = AppState::Running {
-                            container_ip: ep.container_ip,
+                        inner.state = if is_paused {
+                            AppState::Frozen {
+                                container_ip: ep.container_ip,
+                            }
+                        } else {
+                            AppState::Running {
+                                container_ip: ep.container_ip,
+                            }
                         };
                         inner.last_access = Instant::now();
                     }
@@ -368,7 +398,12 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
                     // interregnum replay through tracing once
                     // (bounded by `MAX_LOG_BYTES`).
                     self.runtime.ensure_log_tails(name);
-                    info!(app = %name, container_ip = %ep.container_ip, "reattached to running container");
+                    info!(
+                        app = %name,
+                        container_ip = %ep.container_ip,
+                        kind = if is_paused { "frozen" } else { "running" },
+                        "reattached to surviving container",
+                    );
                 }
                 Ok(None) => {
                     warn!(
@@ -495,6 +530,93 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         }
     }
 
+    /// Background task: poll system memory and evict frozen apps to
+    /// `Stopped` when available memory drops below `lo_bytes`. Stops
+    /// evicting once memory rebounds past `hi_bytes` (hysteresis).
+    ///
+    /// Frozen apps still occupy their full RSS, so a runtime that
+    /// freezes-by-default on idle would slowly fill memory. This loop
+    /// is the safety valve: it converts the cheapest-to-restart
+    /// (= least-recently-used) frozen apps back into proper Stopped
+    /// state, freeing their pages.
+    ///
+    /// Apps are evicted one per tick in LRU order; the loop re-reads
+    /// `MemAvailable` after each eviction so a single tick can release
+    /// just enough to clear pressure rather than thawing everything.
+    pub async fn memory_pressure_loop(
+        self: Arc<Self>,
+        tick: Duration,
+        lo_bytes: u64,
+        hi_bytes: u64,
+    ) {
+        let mut interval = tokio::time::interval(tick);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut evicting = false;
+        loop {
+            interval.tick().await;
+            let Some(avail) = read_mem_available() else {
+                continue;
+            };
+            // Hysteresis: cross lo to engage, cross hi to disengage.
+            // Between the two we keep evicting once started — that way
+            // a slow leak doesn't keep flap-flipping on the lo line.
+            if !evicting && avail < lo_bytes {
+                evicting = true;
+                info!(
+                    avail_bytes = avail,
+                    lo_bytes, "memory pressure: starting frozen-app eviction"
+                );
+            }
+            if evicting && avail >= hi_bytes {
+                evicting = false;
+                info!(avail_bytes = avail, hi_bytes, "memory pressure resolved");
+                continue;
+            }
+            if !evicting {
+                continue;
+            }
+            if !self.evict_lru_frozen().await {
+                // Nothing left to evict; pressure is from something
+                // outside bugpot's reach. Disengage so we don't spin.
+                debug!("no frozen apps to evict; disengaging pressure handler");
+                evicting = false;
+            }
+        }
+    }
+
+    /// Find the longest-idle Frozen app and transition it to Stopped.
+    /// Returns true if an eviction happened. Caller is the memory
+    /// pressure loop; per-tick semantics keep eviction proportional
+    /// to actual pressure.
+    async fn evict_lru_frozen(&self) -> bool {
+        let mut candidate: Option<(Arc<AppHandle>, Instant)> = None;
+        for handle in self.snapshot_handles().await {
+            let inner = handle.inner.lock().await;
+            if matches!(inner.state, AppState::Frozen { .. }) {
+                match &candidate {
+                    Some((_, oldest)) if inner.last_access >= *oldest => {}
+                    _ => candidate = Some((handle.clone(), inner.last_access)),
+                }
+            }
+        }
+        let Some((handle, _)) = candidate else {
+            return false;
+        };
+        info!(
+            app = %handle.identity.name,
+            "memory pressure: evicting frozen app"
+        );
+        counter!("bugpot_evictions_total").increment(1);
+        if let Err(e) = self.stop(&handle).await {
+            warn!(
+                app = %handle.identity.name,
+                error = ?e,
+                "eviction stop() failed",
+            );
+        }
+        true
+    }
+
     async fn sweep(&self) {
         // Per-app sweep work is independent (each handle has its own
         // lock + spec + runtime entry), so run all apps concurrently.
@@ -551,9 +673,9 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
             inner.last_access
         };
         if last_access.elapsed() >= timeout {
-            info!(app = %handle.identity.name, "idle timeout reached, stopping");
-            if let Err(e) = self.stop(&handle).await {
-                warn!(app = %handle.identity.name, error = ?e, "stop on idle failed");
+            info!(app = %handle.identity.name, "idle timeout reached, freezing");
+            if let Err(e) = self.freeze(&handle).await {
+                warn!(app = %handle.identity.name, error = ?e, "freeze on idle failed");
             }
         }
     }
@@ -900,7 +1022,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
             // The `Notify` lives inside the `Starting` variant so the
             // "starting state without a notify" footgun is gone at the
             // type level — no more `expect` here.
-            let own_notify = {
+            let (own_notify, resume_from) = {
                 let mut inner = handle.inner.lock().await;
                 inner.last_access = Instant::now();
                 match &inner.state {
@@ -920,13 +1042,29 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
                     AppState::Stopped => {
                         let n = Arc::new(Notify::new());
                         inner.state = AppState::Starting { notify: n.clone() };
-                        n
+                        drop(inner);
+                        (n, None)
+                    }
+                    AppState::Frozen { container_ip } => {
+                        // Resume from cgroup freezer. We still re-use
+                        // `Starting` here so concurrent callers coalesce
+                        // through the same `Notify` regardless of which
+                        // dormant state we were in.
+                        let n = Arc::new(Notify::new());
+                        let ip = *container_ip;
+                        inner.state = AppState::Starting { notify: n.clone() };
+                        drop(inner);
+                        (n, Some(ip))
                     }
                 }
             };
 
             // Phase 2: do the work outside the lock.
-            let result = self.do_start(handle).await;
+            let result = if let Some(ip) = resume_from {
+                self.do_resume(handle, ip).await
+            } else {
+                self.do_start(handle).await
+            };
 
             // Phase 3: commit state + wake waiters (after dropping the
             // lock so concurrent readers don't contend on `Notify`).
@@ -1052,12 +1190,64 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         Ok(endpoint.container_ip)
     }
 
+    /// Unfreeze a paused container. The endpoint and listen socket
+    /// survived the freeze, so this is cheap: a single cgroup write
+    /// (via libcontainer) wakes the process.
+    async fn do_resume(&self, handle: &AppHandle, container_ip: Ipv4Addr) -> Result<Ipv4Addr> {
+        let name = &handle.identity.name;
+        info!(app = %name, "resuming from frozen");
+        let phase_start = Instant::now();
+        self.runtime.unfreeze_app(name).await?;
+        histogram!("bugpot_resume_seconds").record(phase_start.elapsed().as_secs_f64());
+        Ok(container_ip)
+    }
+
+    /// Suspend a running app via cgroup freezer. Returns Ok and leaves
+    /// the handle in `Frozen { container_ip }` on success. No-op when
+    /// the app isn't in a freezable state (Stopped / Stopping / already
+    /// Frozen / Starting / has active upgraded connections).
+    async fn freeze(&self, handle: &Arc<AppHandle>) -> Result<()> {
+        let container_ip = {
+            let inner = handle.inner.lock().await;
+            match inner.state {
+                AppState::Running { container_ip } => container_ip,
+                _ => return Ok(()),
+            }
+        };
+        // Skip if a WebSocket / SSE upgrade is mid-flight. Freezing
+        // here would silently strand the connection (kernel keeps the
+        // listen socket up, but the user-space process can't process
+        // frames). The reaper will retry next tick.
+        let active = handle.active_upgrades.load(Ordering::Relaxed);
+        if active > 0 {
+            debug!(
+                app = %handle.identity.name,
+                active,
+                "skipping freeze: upgraded connections active",
+            );
+            return Ok(());
+        }
+        let name = &handle.identity.name;
+        let phase_start = Instant::now();
+        if let Err(e) = self.runtime.freeze_app(name).await {
+            warn!(app = %name, error = %e, "freeze_app failed");
+            return Err(e.into());
+        }
+        histogram!("bugpot_freeze_seconds").record(phase_start.elapsed().as_secs_f64());
+        {
+            let mut inner = handle.inner.lock().await;
+            inner.state = AppState::Frozen { container_ip };
+        }
+        info!(app = %name, "frozen");
+        Ok(())
+    }
+
     async fn stop(&self, handle: &Arc<AppHandle>) -> Result<()> {
         {
             let mut inner = handle.inner.lock().await;
             if !matches!(
                 inner.state,
-                AppState::Running { .. } | AppState::Starting { .. }
+                AppState::Running { .. } | AppState::Starting { .. } | AppState::Frozen { .. }
             ) {
                 return Ok(());
             }
@@ -1118,6 +1308,7 @@ fn make_handle(
         spec: RwLock::new(spec),
         image_digest: Mutex::new(None),
         rollouts: Mutex::new(rollouts),
+        active_upgrades: Arc::new(AtomicUsize::new(0)),
         inner: Mutex::new(HandleInner {
             state: AppState::Stopped,
             last_access: Instant::now(),
@@ -1160,6 +1351,7 @@ async fn view_of(handle: &Arc<AppHandle>) -> AppView {
         AppState::Stopped => AppStateView::Stopped,
         AppState::Starting { .. } => AppStateView::Starting,
         AppState::Running { .. } => AppStateView::Running,
+        AppState::Frozen { .. } => AppStateView::Frozen,
         AppState::Stopping => AppStateView::Stopping,
     };
     let spec = handle.spec.read().await;
@@ -1176,7 +1368,7 @@ async fn view_of(handle: &Arc<AppHandle>) -> AppView {
 
 #[async_trait]
 impl<R: RuntimeOps, E: EgressOps> UpstreamResolver for AppController<R, E> {
-    async fn resolve(&self, host: &str) -> Option<SocketAddr> {
+    async fn resolve(&self, host: &str) -> Option<Upstream> {
         let subdomain = subdomain_of(host)?;
         let handle = {
             let maps = self.apps.read().await;
@@ -1185,7 +1377,10 @@ impl<R: RuntimeOps, E: EgressOps> UpstreamResolver for AppController<R, E> {
         };
         let port = handle.spec.read().await.port;
         match self.ensure_running(&handle).await {
-            Ok(ip) => Some(SocketAddr::from((ip, port))),
+            Ok(ip) => Some(Upstream::with_active_upgrades(
+                SocketAddr::from((ip, port)),
+                handle.active_upgrades.clone(),
+            )),
             Err(e) => {
                 error!(host, error = ?e, "ensure_running failed");
                 None
@@ -1227,6 +1422,31 @@ async fn emit_resource_metrics(handle: &Arc<AppHandle>, usage: ResourceUsage) {
     }
 }
 
+/// Parse `MemAvailable` (in bytes) from `/proc/meminfo`. Returns
+/// `None` if the file can't be read or the field is missing — callers
+/// should skip the tick rather than treat an absent reading as
+/// "no pressure". Linux-only path; on a non-Linux dev host this
+/// returns `None` and the memory pressure loop is a no-op.
+fn read_mem_available() -> Option<u64> {
+    let raw = std::fs::read_to_string("/proc/meminfo").ok()?;
+    parse_mem_available(&raw)
+}
+
+fn parse_mem_available(meminfo: &str) -> Option<u64> {
+    for line in meminfo.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            // `MemAvailable:   123456 kB` — split on whitespace, take
+            // the number, multiply by 1024.
+            let kb: u64 = rest
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse().ok())?;
+            return Some(kb * 1024);
+        }
+    }
+    None
+}
+
 async fn wait_for_port(addr: SocketAddr, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     let mut last_err: Option<std::io::Error> = None;
@@ -1260,6 +1480,7 @@ mod tests {
         pull_results: StdMutex<VecDeque<std::result::Result<ImageId, RuntimeError>>>,
         start_results: StdMutex<VecDeque<std::result::Result<RunningApp, RuntimeError>>>,
         running: StdMutex<HashMap<String, bool>>,
+        paused: StdMutex<HashMap<String, bool>>,
         calls: StdMutex<Vec<String>>,
     }
 
@@ -1269,6 +1490,9 @@ mod tests {
         }
         fn set_running(&self, app: &str, value: bool) {
             self.running.lock().unwrap().insert(app.to_owned(), value);
+        }
+        fn set_paused(&self, app: &str, value: bool) {
+            self.paused.lock().unwrap().insert(app.to_owned(), value);
         }
         fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
@@ -1312,11 +1536,28 @@ mod tests {
         async fn stop_app(&self, name: &str) -> std::result::Result<(), RuntimeError> {
             self.record(format!("stop_app({name})"));
             self.running.lock().unwrap().remove(name);
+            self.paused.lock().unwrap().remove(name);
+            Ok(())
+        }
+
+        async fn freeze_app(&self, name: &str) -> std::result::Result<(), RuntimeError> {
+            self.record(format!("freeze_app({name})"));
+            self.paused.lock().unwrap().insert(name.to_owned(), true);
+            Ok(())
+        }
+
+        async fn unfreeze_app(&self, name: &str) -> std::result::Result<(), RuntimeError> {
+            self.record(format!("unfreeze_app({name})"));
+            self.paused.lock().unwrap().remove(name);
             Ok(())
         }
 
         fn is_container_running(&self, name: &str) -> bool {
             *self.running.lock().unwrap().get(name).unwrap_or(&false)
+        }
+
+        fn is_container_paused(&self, name: &str) -> bool {
+            *self.paused.lock().unwrap().get(name).unwrap_or(&false)
         }
 
         fn resource_usage(&self, _name: &str) -> Option<ResourceUsage> {
@@ -1443,6 +1684,24 @@ mod tests {
             digest_pinned_ref("gcr.io/x/y", Some(&digest)),
             "gcr.io/x/y@sha256:abc123"
         );
+    }
+
+    #[test]
+    fn parse_mem_available_finds_value_and_converts_kb_to_bytes() {
+        let sample = "MemTotal:        1014820 kB\nMemFree:          123456 kB\nMemAvailable:     200000 kB\nBuffers:           12345 kB\n";
+        assert_eq!(parse_mem_available(sample), Some(200_000 * 1024));
+    }
+
+    #[test]
+    fn parse_mem_available_returns_none_when_field_missing() {
+        let sample = "MemTotal: 1024 kB\nMemFree: 512 kB\n";
+        assert!(parse_mem_available(sample).is_none());
+    }
+
+    #[test]
+    fn parse_mem_available_tolerates_extra_whitespace() {
+        let sample = "MemAvailable:\t  500 kB\n";
+        assert_eq!(parse_mem_available(sample), Some(500 * 1024));
     }
 
     #[test]
@@ -1941,6 +2200,184 @@ mod tests {
         assert!(
             eg_calls.contains(&"release_endpoint(alpha)".to_owned()),
             "expected release_endpoint; got {eg_calls:?}"
+        );
+    }
+
+    async fn force_running(handle: &AppHandle) {
+        let mut inner = handle.inner.lock().await;
+        inner.state = AppState::Running {
+            container_ip: Ipv4Addr::LOCALHOST,
+        };
+    }
+
+    /// Idle reaper freezes (not stops) by default. Container survives;
+    /// only its cgroup gets the freezer write.
+    #[tokio::test]
+    async fn idle_timeout_freezes_running_app() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut spec = spec_with_name("alpha");
+        // Short idle so the test doesn't need fake clocks.
+        spec.scaling = bugpot_config::Scaling {
+            idle_timeout: Some("10ms".into()),
+        };
+        let stored = StoredApp {
+            spec,
+            rollout: Some(Rollout {
+                tag: "v1".into(),
+                created_at: "1970-01-01T00:00:00Z".into(),
+            }),
+        };
+        let controller = make_controller(vec![stored], tmp.path().to_owned());
+        let handle = {
+            let maps = controller.apps.read().await;
+            maps.by_name.get("alpha").cloned().unwrap()
+        };
+        force_running(&handle).await;
+        controller.runtime.set_running("alpha", true);
+
+        // Push last_access into the past so the reaper triggers.
+        {
+            let mut inner = handle.inner.lock().await;
+            inner.last_access = Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("test machine clock should not be at unix epoch");
+        }
+        controller.sweep().await;
+
+        let state = handle.inner.lock().await.state.clone();
+        assert!(
+            matches!(state, AppState::Frozen { .. }),
+            "expected Frozen after idle timeout, got {state:?}"
+        );
+        let rt_calls = controller.runtime.calls();
+        assert!(
+            rt_calls.contains(&"freeze_app(alpha)".to_owned()),
+            "expected freeze_app; got {rt_calls:?}"
+        );
+        // Must NOT have stopped — freeze leaves the container resident.
+        assert!(
+            !rt_calls.iter().any(|c| c == "stop_app(alpha)"),
+            "stop_app must not be called on freeze path; got {rt_calls:?}"
+        );
+    }
+
+    /// `active_upgrades > 0` means the router is mid-splice for a
+    /// WebSocket / SSE connection. Freezing would silently strand the
+    /// connection; the reaper must skip and try later.
+    #[tokio::test]
+    async fn freeze_skipped_when_upgrades_active() {
+        let tmp = tempfile::tempdir().unwrap();
+        let controller =
+            make_controller(vec![stored_with_name("alpha", "v1")], tmp.path().to_owned());
+        let handle = {
+            let maps = controller.apps.read().await;
+            maps.by_name.get("alpha").cloned().unwrap()
+        };
+        force_running(&handle).await;
+        handle.active_upgrades.fetch_add(1, Ordering::Relaxed);
+
+        controller.freeze(&handle).await.unwrap();
+
+        let state = handle.inner.lock().await.state.clone();
+        assert!(
+            matches!(state, AppState::Running { .. }),
+            "expected freeze to be skipped (still Running), got {state:?}"
+        );
+        let rt_calls = controller.runtime.calls();
+        assert!(
+            !rt_calls.iter().any(|c| c == "freeze_app(alpha)"),
+            "freeze_app must not be called when upgrades active; got {rt_calls:?}"
+        );
+    }
+
+    /// `ensure_running` from `Frozen` calls `unfreeze_app` and reuses
+    /// the same `container_ip` — no endpoint reallocation, no image
+    /// pull. This is the "snappy resume" path that makes scale-to-zero
+    /// invisible.
+    #[tokio::test]
+    async fn ensure_running_unfreezes_from_frozen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let controller =
+            make_controller(vec![stored_with_name("alpha", "v1")], tmp.path().to_owned());
+        let handle = {
+            let maps = controller.apps.read().await;
+            maps.by_name.get("alpha").cloned().unwrap()
+        };
+        let frozen_ip = Ipv4Addr::new(10, 0, 0, 7);
+        {
+            let mut inner = handle.inner.lock().await;
+            inner.state = AppState::Frozen {
+                container_ip: frozen_ip,
+            };
+        }
+        controller.runtime.set_paused("alpha", true);
+
+        let ip = controller.ensure_running(&handle).await.unwrap();
+        assert_eq!(ip, frozen_ip, "unfreeze must preserve container_ip");
+        let rt_calls = controller.runtime.calls();
+        assert!(
+            rt_calls.contains(&"unfreeze_app(alpha)".to_owned()),
+            "expected unfreeze_app; got {rt_calls:?}"
+        );
+        assert!(
+            !rt_calls.iter().any(|c| c.starts_with("start_app")),
+            "start_app must not be called on resume; got {rt_calls:?}"
+        );
+        assert!(
+            !rt_calls.iter().any(|c| c.starts_with("pull_image")),
+            "pull_image must not be called on resume; got {rt_calls:?}"
+        );
+    }
+
+    /// Eviction picks the oldest `last_access` among Frozen handles.
+    /// Newer-touched frozen apps stay frozen, older ones drop to
+    /// Stopped to free RAM.
+    #[tokio::test]
+    async fn evict_lru_frozen_picks_oldest_last_access() {
+        let tmp = tempfile::tempdir().unwrap();
+        let controller = make_controller(
+            vec![
+                stored_with_name("alpha", "v1"),
+                stored_with_name("beta", "v1"),
+            ],
+            tmp.path().to_owned(),
+        );
+        let (alpha, beta) = {
+            let maps = controller.apps.read().await;
+            (
+                maps.by_name.get("alpha").cloned().unwrap(),
+                maps.by_name.get("beta").cloned().unwrap(),
+            )
+        };
+        let now = Instant::now();
+        {
+            let mut inner = alpha.inner.lock().await;
+            inner.state = AppState::Frozen {
+                container_ip: Ipv4Addr::new(10, 0, 0, 1),
+            };
+            inner.last_access = now
+                .checked_sub(Duration::from_mins(1))
+                .expect("test machine clock should not be at unix epoch");
+        }
+        {
+            let mut inner = beta.inner.lock().await;
+            inner.state = AppState::Frozen {
+                container_ip: Ipv4Addr::new(10, 0, 0, 2),
+            };
+            inner.last_access = now;
+        }
+
+        assert!(controller.evict_lru_frozen().await, "expected an eviction");
+
+        let alpha_state = alpha.inner.lock().await.state.clone();
+        let beta_state = beta.inner.lock().await.state.clone();
+        assert!(
+            matches!(alpha_state, AppState::Stopped),
+            "older alpha should be evicted, got {alpha_state:?}"
+        );
+        assert!(
+            matches!(beta_state, AppState::Frozen { .. }),
+            "newer beta should stay frozen, got {beta_state:?}"
         );
     }
 }
