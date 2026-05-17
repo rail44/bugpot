@@ -664,19 +664,29 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         }
 
         if was_running {
-            if let Err(e) = self.stop(&handle).await {
-                return Err(UpdateError::RestartFailed(anyhow!(
-                    "stop before reconfigure: {e:#}"
-                )));
-            }
-            if let Err(e) = self.ensure_running(&handle).await {
-                return Err(UpdateError::RestartFailed(anyhow!(
-                    "restart after reconfigure: {e:#}"
-                )));
-            }
+            self.restart_after_spec_change(&handle).await?;
         }
 
         Ok(view_of(&handle).await)
+    }
+
+    /// Stop + start cycle for an app whose spec was just rewritten.
+    /// Errors map to [`UpdateError::RestartFailed`] with a phase
+    /// label so operators can tell whether the failure was on the
+    /// way down or on the way back up.
+    async fn restart_after_spec_change(
+        &self,
+        handle: &Arc<AppHandle>,
+    ) -> std::result::Result<(), UpdateError> {
+        if let Err(e) = self.stop(handle).await {
+            return Err(UpdateError::RestartFailed(anyhow!(
+                "stop before reconfigure: {e:#}"
+            )));
+        }
+        self.ensure_running(handle)
+            .await
+            .map(|_| ())
+            .map_err(|e| UpdateError::RestartFailed(anyhow!("restart after reconfigure: {e:#}")))
     }
 
     /// Append a new rollout to `name` and bring the app to that tag.
@@ -720,29 +730,16 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         }
 
         // 1. Pull.
-        let repo = handle.spec.read().await.repo.clone();
-        let image_ref = format!("{repo}:{tag}");
-        let resolved_digest = self
-            .runtime
-            .pull_image(&image_ref, self.resolve_auth(&repo))
-            .await
-            .map_err(|e| classify_pull_error_for_rollout(e, name, &image_ref))?;
+        let resolved_digest = self.pull_for_rollout(&handle, &tag).await?;
 
-        // 2. Append to history. Reset the digest cache so the next
-        // `do_start` uses *this* rollout's digest (not the previous
-        // rollout's, which may have been a different tag).
+        // 2. Append to history and update the digest cache so the
+        // next `do_start` uses *this* rollout's digest, not the
+        // previous rollout's (which may have been a different tag).
         let rollout = Rollout {
             tag,
             created_at: humantime::format_rfc3339_seconds(SystemTime::now()).to_string(),
         };
-        {
-            let mut inner = handle.inner.lock().await;
-            while inner.rollouts.len() >= MAX_ROLLOUT_HISTORY {
-                inner.rollouts.pop_front();
-            }
-            inner.rollouts.push_back(rollout.clone());
-        }
-        handle.inner.lock().await.image_digest = Some(resolved_digest);
+        record_rollout(&handle, rollout.clone(), resolved_digest).await;
 
         // 3. Persist the rollout to its own state file. Spec doesn't
         // change here, so no spec rewrite needed.
@@ -761,6 +758,24 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         }
 
         Ok(rollout)
+    }
+
+    /// Pull `{repo}:{tag}` for an in-flight `set_rollout`. Classifies
+    /// auth-side failures into the dedicated [`RolloutError::ImageAuth`]
+    /// variant so adapter crates can distinguish them from generic
+    /// `ImagePull` errors.
+    async fn pull_for_rollout(
+        &self,
+        handle: &AppHandle,
+        tag: &str,
+    ) -> std::result::Result<bugpot_runtime::ImageId, RolloutError> {
+        let name = &handle.identity.name;
+        let repo = handle.spec.read().await.repo.clone();
+        let image_ref = format!("{repo}:{tag}");
+        self.runtime
+            .pull_image(&image_ref, self.resolve_auth(&repo))
+            .await
+            .map_err(|e| classify_pull_error_for_rollout(e, name, &image_ref))
     }
 
     /// Return a snapshot of the rollout history (front = oldest,
@@ -956,15 +971,66 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         }
     }
 
+    /// Cold-start orchestration: allocate endpoint → pull image →
+    /// start container → wait for readiness. Each phase contributes
+    /// a single `bugpot_cold_start_seconds{phase=...}` sample on
+    /// success; failure paths leave the histogram untouched so the
+    /// distribution reflects completed starts.
+    ///
+    /// Error cleanup is the orchestrator's job: a failure mid-flight
+    /// releases the endpoint (and stops the container, if the
+    /// failure is post-start), but the per-phase helpers themselves
+    /// stay cleanup-free — they return `Result` and let `do_start`
+    /// decide how to unwind.
     async fn do_start(&self, handle: &AppHandle) -> Result<Ipv4Addr> {
         let name = &handle.identity.name;
-        // Snapshot the spec once: a cold start interleaves several
-        // awaits with reads of repo / port / egress.allow / readiness,
-        // so cloning the small `AppSpec` is cheaper than holding the
-        // RwLock guard across them (or re-locking each time).
         let spec = handle.spec.read().await.clone();
-        // Resolve current rollout. An app without a rollout cannot
-        // start — fail fast before allocating any resources.
+        let plain_image_ref = self.resolve_image_ref(handle, &spec).await?;
+        info!(app = %name, image = %plain_image_ref, "starting");
+
+        let endpoint = self.allocate_endpoint_phase(name, &spec).await?;
+
+        let image_id = match self.pull_image_phase(handle, &spec, &plain_image_ref).await {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = self.egress.release_endpoint(name).await;
+                return Err(e);
+            }
+        };
+
+        let running = match self
+            .start_container_phase(&spec, &image_id, &endpoint)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = self.egress.release_endpoint(name).await;
+                return Err(e);
+            }
+        };
+        info!(
+            app = %name,
+            pid = running.pid,
+            container_ip = %endpoint.container_ip,
+            "container running"
+        );
+
+        if let Err(e) = self
+            .readiness_phase(name, endpoint.container_ip, &spec)
+            .await
+        {
+            warn!(app = %name, error = %e, "readiness probe failed");
+            let _ = self.runtime.stop_app(name).await;
+            let _ = self.egress.release_endpoint(name).await;
+            return Err(e);
+        }
+        Ok(endpoint.container_ip)
+    }
+
+    /// Form `repo:tag` for the cold start. Errors when the app has
+    /// no rollout — there is no tag to pull.
+    async fn resolve_image_ref(&self, handle: &AppHandle, spec: &AppSpec) -> Result<String> {
+        let name = &handle.identity.name;
         let tag = handle
             .inner
             .lock()
@@ -973,14 +1039,16 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
             .back()
             .map(|r| r.tag.clone())
             .ok_or_else(|| anyhow!("app '{name}' has no rollout; POST a rollout first"))?;
-        let plain_image_ref = format!("{repo}:{tag}", repo = spec.repo);
-        info!(app = %name, image = %plain_image_ref, "starting");
+        Ok(format!("{repo}:{tag}", repo = spec.repo))
+    }
 
-        // Each cold-start phase records into bugpot_cold_start_seconds
-        // *only on success*; failure paths intentionally don't record so
-        // the histogram reflects the latency distribution of complete
-        // cold starts. Total cold-start time = sum across phases (queryable
-        // in Prom).
+    /// Phase 1 of `do_start`: claim a netns + container IP + DNS
+    /// allowlist slot from `bugpot-egress`.
+    async fn allocate_endpoint_phase(
+        &self,
+        name: &str,
+        spec: &AppSpec,
+    ) -> Result<bugpot_egress::Endpoint> {
         let phase_start = Instant::now();
         let endpoint = self
             .egress
@@ -989,7 +1057,19 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
             .with_context(|| format!("allocate endpoint for {name}"))?;
         histogram!("bugpot_cold_start_seconds", "phase" => "endpoint")
             .record(phase_start.elapsed().as_secs_f64());
+        Ok(endpoint)
+    }
 
+    /// Phase 2: pull, pinning to the cached digest if one was
+    /// resolved on a previous start of this handle, then write the
+    /// resolved digest back to the cache the first time.
+    async fn pull_image_phase(
+        &self,
+        handle: &AppHandle,
+        spec: &AppSpec,
+        plain_image_ref: &str,
+    ) -> Result<bugpot_runtime::ImageId> {
+        let name = &handle.identity.name;
         let phase_start = Instant::now();
         // If a prior pull on this handle resolved the tag to a
         // digest, pin to it for this pull so the registry-side
@@ -997,22 +1077,16 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         // digest references). The cache invalidates only when the
         // handle is destroyed (operator redeploy or bugpot restart).
         let image_ref = digest_pinned_ref(
-            &plain_image_ref,
+            plain_image_ref,
             handle.inner.lock().await.image_digest.as_ref(),
         );
-        let image_id = match self
+        let image_id = self
             .runtime
             .pull_image(&image_ref, self.resolve_auth(&spec.repo))
             .await
-        {
-            Ok(id) => id,
-            Err(e) => {
-                let _ = self.egress.release_endpoint(name).await;
-                return Err(e).with_context(|| format!("pull image for {name}"));
-            }
-        };
+            .with_context(|| format!("pull image for {name}"))?;
         // Persist the resolved digest the first time we see it.
-        // Subsequent cold-starts (within this process) will skip the
+        // Subsequent cold-starts (within this process) skip the
         // probe via the branch above.
         {
             let mut inner = handle.inner.lock().await;
@@ -1022,49 +1096,47 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         }
         histogram!("bugpot_cold_start_seconds", "phase" => "pull")
             .record(phase_start.elapsed().as_secs_f64());
+        Ok(image_id)
+    }
 
+    /// Phase 3: hand off to libcontainer.
+    async fn start_container_phase(
+        &self,
+        spec: &AppSpec,
+        image_id: &bugpot_runtime::ImageId,
+        endpoint: &bugpot_egress::Endpoint,
+    ) -> Result<bugpot_runtime::RunningApp> {
         let phase_start = Instant::now();
-        let running = match self
+        let running = self
             .runtime
-            .start_app(&spec, &image_id, Some(&endpoint.netns_path))
+            .start_app(spec, image_id, Some(&endpoint.netns_path))
             .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = self.egress.release_endpoint(name).await;
-                return Err(e).with_context(|| format!("start container for {name}"));
-            }
-        };
+            .with_context(|| format!("start container for {}", spec.name()))?;
         histogram!("bugpot_cold_start_seconds", "phase" => "start")
             .record(phase_start.elapsed().as_secs_f64());
+        Ok(running)
+    }
 
-        info!(
-            app = %name,
-            pid = running.pid,
-            container_ip = %endpoint.container_ip,
-            "container running"
-        );
-
-        // Wait for the app to bind on its declared port before returning,
-        // otherwise the first proxied request would race ahead of the
-        // process's listener. Timeout is per-app (TOML
-        // `readiness.timeout`), falling back to the workspace default.
+    /// Phase 4: TCP-bind or HTTP probe, until the app accepts traffic
+    /// or the per-app `readiness.timeout` fires. Without this, the
+    /// first proxied request would race ahead of the process's
+    /// listener.
+    async fn readiness_phase(
+        &self,
+        name: &str,
+        container_ip: Ipv4Addr,
+        spec: &AppSpec,
+    ) -> Result<()> {
         let timeout = spec
             .readiness
             .resolve_timeout(READINESS_TIMEOUT_DEFAULT)
             .map_err(|e| anyhow!("{name}: {e}"))?;
-        let upstream = SocketAddr::from((endpoint.container_ip, spec.port));
+        let upstream = SocketAddr::from((container_ip, spec.port));
         let phase_start = Instant::now();
-        let probe_path = spec.readiness.path.as_deref();
-        if let Err(e) = wait_for_ready(upstream, probe_path, timeout).await {
-            warn!(app = %name, error = %e, "readiness probe failed");
-            let _ = self.runtime.stop_app(name).await;
-            let _ = self.egress.release_endpoint(name).await;
-            return Err(e);
-        }
+        wait_for_ready(upstream, spec.readiness.path.as_deref(), timeout).await?;
         histogram!("bugpot_cold_start_seconds", "phase" => "readiness")
             .record(phase_start.elapsed().as_secs_f64());
-        Ok(endpoint.container_ip)
+        Ok(())
     }
 
     /// Unfreeze a paused container. The endpoint and listen socket
@@ -1147,6 +1219,24 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         }
         Ok(())
     }
+}
+
+/// Append a freshly-minted rollout to the handle's history (popping
+/// the oldest entry when the deque is full) and overwrite the
+/// per-handle image-digest cache. Held under `inner` for a single
+/// critical section so the rollouts + digest move atomically — a
+/// concurrent `view_of` either sees both updates or neither.
+async fn record_rollout(
+    handle: &Arc<AppHandle>,
+    rollout: Rollout,
+    digest: bugpot_runtime::ImageId,
+) {
+    let mut inner = handle.inner.lock().await;
+    while inner.rollouts.len() >= MAX_ROLLOUT_HISTORY {
+        inner.rollouts.pop_front();
+    }
+    inner.rollouts.push_back(rollout);
+    inner.image_digest = Some(digest);
 }
 
 /// Best-effort cleanup of a TOML written by `deploy_app` that the
