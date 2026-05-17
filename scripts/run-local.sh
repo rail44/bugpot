@@ -15,11 +15,6 @@
 #   http://beta.localhost:8080/
 # (the `*.localhost` wildcard resolves to 127.0.0.1 on modern OSes; no
 # /etc/hosts edits required)
-#
-# Each cold start runs `oci-client` pull + libcontainer start (~3-5s the
-# first time, ~0.5-1s after the image is cached). After ~30s of no traffic
-# for a given app, the idle sweeper stops its container; the next request
-# restarts it.
 
 set -eu
 
@@ -27,6 +22,8 @@ cd "$(dirname "$0")/.."
 WORKDIR=$(pwd)
 
 LISTEN=127.0.0.1:8080
+ADMIN_LISTEN=127.0.0.1:8081
+ADMIN_TOKEN="dev-only-do-not-deploy"
 IMAGE_REPO="gcr.io/google-samples/hello-app"
 IMAGE_TAG="1.0"
 IDLE="30s"
@@ -42,27 +39,41 @@ if [ ! -x "$BIN" ]; then
     exit 1
 fi
 
-APPS_DIR=$(mktemp -d)
 STATE_DIR=$(mktemp -d)
+LOG=$(mktemp)
+PID=""
 
 cleanup() {
-    rm -rf "$APPS_DIR" "$STATE_DIR"
+    if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+        kill -INT "$PID" 2>/dev/null || true
+        wait "$PID" 2>/dev/null || true
+    fi
+    rm -rf "$STATE_DIR" "$LOG"
 }
 trap cleanup EXIT INT TERM
 
-for name in alpha beta; do
-    cat >"$APPS_DIR/$name.toml" <<EOF
-repo = "$IMAGE_REPO"
-port = 8080
+register_app() {
+    body=$1
+    curl -fsS -X POST \
+        -H "Authorization: Bearer $ADMIN_TOKEN" \
+        -H "Content-Type: application/toml" \
+        --data-binary "$body" \
+        "http://$ADMIN_LISTEN/apps" >/dev/null
+}
 
-[scaling]
-idle_timeout = "$IDLE"
-
-[rollout]
-tag = "$IMAGE_TAG"
-created_at = "1970-01-01T00:00:00Z"
-EOF
-done
+push_rollout() {
+    name=$1
+    tag=$2
+    deploy_token=$(curl -fsS -X POST \
+        -H "Authorization: Bearer $ADMIN_TOKEN" \
+        "http://$ADMIN_LISTEN/apps/$name/deploy-keys" \
+        | sed 's/.*"token":[ ]*"\([^"]*\)".*/\1/')
+    curl -fsS -X POST \
+        -H "Authorization: Bearer $deploy_token" \
+        -H "Content-Type: application/json" \
+        -d "{\"tag\":\"$tag\"}" \
+        "http://$ADMIN_LISTEN/apps/$name/rollouts" >/dev/null
+}
 
 cat <<EOF
 
@@ -73,22 +84,46 @@ In your browser:
    http://beta.localhost:8080/
 
    First load ≈ 5s (image pull + container start).
-   After ${IDLE} idle, the container auto-stops; next request restarts it.
+   After ${IDLE} idle, the controller freezes the container; next
+   request resumes it in sub-ms.
 
-   Watch the terminal: you'll see 'starting' / 'stopping' lines from the
-   controller as each app spins up and down.
+   Watch the terminal: you'll see freeze / resume lines from the
+   controller as each app idles and wakes back up.
 
 Press Ctrl+C to shut down.
 
 EOF
 
-# `exec` replaces this shell with bugpot so Ctrl+C delivers SIGINT
-# directly to bugpot. `env` cleanly sets the override variables.
-exec env \
-    BUGPOT_APPS_DIR="$APPS_DIR" \
-    BUGPOT_STATE_DIR="$STATE_DIR" \
-    BUGPOT_LISTEN="$LISTEN" \
-    BUGPOT_ADMIN_TOKEN="dev-only-do-not-deploy" \
-    BUGPOT_DEPLOY_SECRET="dev-only-deploy-secret" \
-    RUST_LOG="bugpot=info,bugpot_router=info,bugpot_runtime=info,bugpot_egress=info" \
-    "$BIN"
+BUGPOT_STATE_DIR="$STATE_DIR" \
+BUGPOT_LISTEN="$LISTEN" \
+BUGPOT_ADMIN_LISTEN="$ADMIN_LISTEN" \
+BUGPOT_ADMIN_TOKEN="$ADMIN_TOKEN" \
+BUGPOT_DEPLOY_SECRET="dev-only-deploy-secret" \
+RUST_LOG="bugpot=info,bugpot_router=info,bugpot_runtime=info,bugpot_egress=info" \
+    "$BIN" 2>&1 | tee "$LOG" &
+PID=$!
+
+# Wait for the daemon to surface its admin listener before the curls
+# below try to land on it.
+for _ in $(seq 1 120); do
+    if grep -q "bugpot up" "$LOG" 2>/dev/null; then
+        break
+    fi
+    sleep 0.5
+done
+
+for name in alpha beta; do
+    register_app "$(cat <<EOF
+name = "$name"
+repo = "$IMAGE_REPO"
+port = 8080
+[scaling]
+idle_timeout = "$IDLE"
+EOF
+)"
+    push_rollout "$name" "$IMAGE_TAG"
+    echo "registered $name"
+done
+
+# Block on the daemon. cleanup() handles SIGINT.
+wait "$PID"

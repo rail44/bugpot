@@ -44,7 +44,6 @@ if [ ! -x "$BIN" ]; then
     exit 1
 fi
 
-APPS_DIR=$(mktemp -d)
 STATE_DIR=$(mktemp -d)
 LOG=$(mktemp)
 RESP=$(mktemp)
@@ -70,33 +69,15 @@ cleanup() {
     done
     nft delete table inet bugpot 2>/dev/null
     ip link delete bugpot0 2>/dev/null
-    rm -rf "$APPS_DIR" "$STATE_DIR"
+    rm -rf "$STATE_DIR"
     echo
     echo "(script exit=$rc; bugpotd log=$LOG resp=$RESP kept for inspection)"
     return $rc
 }
 trap cleanup EXIT INT TERM
 
-# UID 0 keeps the host dir owned by root, matching hello-app's container
-# user (also root). For real apps (Linkding uid=33, Vaultwarden uid=1000)
-# operators set `user = N` explicitly.
-cat >"$APPS_DIR/$APP_NAME.toml" <<EOF
-repo = "$IMAGE_REPO"
-port = 8080
-subdomain = "$SUBDOMAIN"
-[scaling]
-idle_timeout = "$IDLE_TIMEOUT"
-[[volumes]]
-name = "$VOLUME_NAME"
-path = "$VOLUME_PATH"
-[rollout]
-tag = "$IMAGE_TAG"
-created_at = "1970-01-01T00:00:00Z"
-EOF
-
 launch_bugpot() {
     LOG_OFFSET=$(wc -l <"$LOG" 2>/dev/null | awk '{print $1}')
-    BUGPOT_APPS_DIR="$APPS_DIR" \
     BUGPOT_STATE_DIR="$STATE_DIR" \
     BUGPOT_LISTEN="$LISTEN" \
     BUGPOT_ADMIN_LISTEN="$ADMIN_LISTEN" \
@@ -105,6 +86,29 @@ launch_bugpot() {
     RUST_LOG="bugpot=info,bugpot_controller=debug,bugpot_router=info,bugpot_runtime=info,bugpot_egress=info" \
         "$BIN" >>"$LOG" 2>&1 &
     PID=$!
+}
+
+register_app() {
+    body=$1
+    curl -fsS -X POST \
+        -H "Authorization: Bearer $ADMIN_TOKEN" \
+        -H "Content-Type: application/toml" \
+        --data-binary "$body" \
+        "http://$ADMIN_LISTEN/apps" >/dev/null
+}
+
+push_rollout() {
+    name=$1
+    tag=$2
+    deploy_token=$(curl -fsS -X POST \
+        -H "Authorization: Bearer $ADMIN_TOKEN" \
+        "http://$ADMIN_LISTEN/apps/$name/deploy-keys" \
+        | sed 's/.*"token":[ ]*"\([^"]*\)".*/\1/')
+    curl -fsS -X POST \
+        -H "Authorization: Bearer $deploy_token" \
+        -H "Content-Type: application/json" \
+        -d "{\"tag\":\"$tag\"}" \
+        "http://$ADMIN_LISTEN/apps/$name/rollouts" >/dev/null
 }
 
 wait_for_up() {
@@ -131,7 +135,9 @@ state_of() {
 }
 
 hit_app() {
-    curl -sS -o "$RESP" -w "%{http_code}\n" -m 10 \
+    # 60s timeout absorbs the first-time image pull on the cold-start
+    # request — subsequent resumes are sub-second.
+    curl -sS -o "$RESP" -w "%{http_code}\n" -m 60 \
         -H "Host: $SUBDOMAIN.bugpot.example" "http://$LISTEN/"
 }
 
@@ -190,15 +196,31 @@ assert_state() {
 
 echo "=== preflight ==="
 echo "bin       : $BIN"
-echo "apps_dir  : $APPS_DIR"
 echo "state_dir : $STATE_DIR"
 echo "log       : $LOG"
 echo
 
-echo "=== launching bugpotd ==="
+echo "=== launching bugpotd + registering app ==="
 launch_bugpot
 wait_for_up || exit 1
 echo "pid=$PID"
+
+# UID 0 keeps the host dir owned by root, matching hello-app's
+# container user (also root). For real apps (Linkding uid=33,
+# Vaultwarden uid=1000) operators set `user = N` explicitly.
+register_app "$(cat <<EOF
+name = "$APP_NAME"
+repo = "$IMAGE_REPO"
+port = 8080
+subdomain = "$SUBDOMAIN"
+[scaling]
+idle_timeout = "$IDLE_TIMEOUT"
+[[volumes]]
+name = "$VOLUME_NAME"
+path = "$VOLUME_PATH"
+EOF
+)"
+push_rollout "$APP_NAME" "$IMAGE_TAG"
 
 echo
 echo "=== 1. cold start ==="

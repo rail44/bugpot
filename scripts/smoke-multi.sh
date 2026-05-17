@@ -12,6 +12,8 @@ cd "$(dirname "$0")/.."
 WORKDIR=$(pwd)
 
 LISTEN=127.0.0.1:8080
+ADMIN_LISTEN=127.0.0.1:8081
+ADMIN_TOKEN="smoke-only-do-not-deploy"
 IMAGE_REPO="gcr.io/google-samples/hello-app"
 IMAGE_TAG="1.0"
 
@@ -26,7 +28,6 @@ if [ ! -x "$BIN" ]; then
     exit 1
 fi
 
-APPS_DIR=$(mktemp -d)
 STATE_DIR=$(mktemp -d)
 LOG=$(mktemp)
 RESP=$(mktemp)
@@ -51,33 +52,45 @@ cleanup() {
     done
     nft delete table inet bugpot 2>/dev/null
     ip link delete bugpot0 2>/dev/null
-    rm -rf "$APPS_DIR" "$STATE_DIR"
+    rm -rf "$STATE_DIR"
     echo
     echo "(script exit=$rc; bugpot log=$LOG resp=$RESP kept for inspection)"
     return $rc
 }
 trap cleanup EXIT INT TERM
 
-for name in alpha beta; do
-    cat >"$APPS_DIR/$name.toml" <<EOF
-repo = "$IMAGE_REPO"
-port = 8080
-[rollout]
-tag = "$IMAGE_TAG"
-created_at = "1970-01-01T00:00:00Z"
-EOF
-done
+register_app() {
+    body=$1
+    curl -fsS -X POST \
+        -H "Authorization: Bearer $ADMIN_TOKEN" \
+        -H "Content-Type: application/toml" \
+        --data-binary "$body" \
+        "http://$ADMIN_LISTEN/apps" >/dev/null
+}
+
+push_rollout() {
+    name=$1
+    tag=$2
+    deploy_token=$(curl -fsS -X POST \
+        -H "Authorization: Bearer $ADMIN_TOKEN" \
+        "http://$ADMIN_LISTEN/apps/$name/deploy-keys" \
+        | sed 's/.*"token":[ ]*"\([^"]*\)".*/\1/')
+    curl -fsS -X POST \
+        -H "Authorization: Bearer $deploy_token" \
+        -H "Content-Type: application/json" \
+        -d "{\"tag\":\"$tag\"}" \
+        "http://$ADMIN_LISTEN/apps/$name/rollouts" >/dev/null
+}
 
 echo "=== preflight ==="
-echo "apps_dir  : $APPS_DIR"
-ls -1 "$APPS_DIR"
+echo "state_dir : $STATE_DIR"
 echo
 
 echo "=== launching bugpot ==="
-BUGPOT_APPS_DIR="$APPS_DIR" \
 BUGPOT_STATE_DIR="$STATE_DIR" \
 BUGPOT_LISTEN="$LISTEN" \
-BUGPOT_ADMIN_TOKEN="smoke-only-do-not-deploy" \
+BUGPOT_ADMIN_LISTEN="$ADMIN_LISTEN" \
+BUGPOT_ADMIN_TOKEN="$ADMIN_TOKEN" \
 BUGPOT_DEPLOY_SECRET="smoke-only-deploy-secret" \
 RUST_LOG="bugpot=info,bugpot_router=info,bugpot_runtime=info,bugpot_egress=info" \
     "$BIN" >"$LOG" 2>&1 &
@@ -103,6 +116,19 @@ if [ "$ok" -ne 1 ]; then
 fi
 
 echo
+echo "=== registering apps ==="
+for name in alpha beta; do
+    register_app "$(cat <<EOF
+name = "$name"
+repo = "$IMAGE_REPO"
+port = 8080
+EOF
+)"
+    push_rollout "$name" "$IMAGE_TAG"
+    echo "registered $name"
+done
+
+echo
 echo "=== environment after bring-up ==="
 ip -brief addr show bugpot0
 ip -all netns list | head -10
@@ -114,7 +140,7 @@ fetch_and_assert() {
     expected_hostname=$2
     echo
     echo "=== fetch http://$LISTEN/ Host=$domain ==="
-    status=$(curl -sS -o "$RESP" -w "%{http_code}" -m 10 -H "Host: $domain" "http://$LISTEN/" || echo "curl-failed")
+    status=$(curl -sS -o "$RESP" -w "%{http_code}" -m 60 -H "Host: $domain" "http://$LISTEN/" || echo "curl-failed")
     echo "HTTP $status"
     cat "$RESP"
     if [ "$status" != "200" ]; then

@@ -29,7 +29,7 @@ if [ ! -x "$BIN" ]; then
     exit 1
 fi
 
-EMPTY_APPS=$(mktemp -d)
+STATE_DIR=$(mktemp -d)
 LOGFILE=$(mktemp)
 cleanup() {
     rc=$?
@@ -41,7 +41,7 @@ cleanup() {
     # Tear down the infrastructure so the host returns to its previous state.
     nft delete table inet bugpot 2>/dev/null || true
     ip link delete bugpot0 2>/dev/null || true
-    rm -rf "$EMPTY_APPS"
+    rm -rf "$STATE_DIR"
     echo
     echo "(script exit=$rc; log=$LOGFILE)"
 }
@@ -49,12 +49,14 @@ trap cleanup EXIT INT TERM
 
 echo "=== preflight ==="
 echo "bugpot binary : $BIN"
-echo "empty apps    : $EMPTY_APPS"
+echo "state_dir     : $STATE_DIR"
 echo "log           : $LOGFILE"
 echo
 
 echo "=== launching bugpot ==="
-BUGPOT_APPS_DIR="$EMPTY_APPS" \
+BUGPOT_STATE_DIR="$STATE_DIR" \
+BUGPOT_ADMIN_TOKEN="smoke-only-do-not-deploy" \
+BUGPOT_DEPLOY_SECRET="smoke-only-deploy-secret" \
 RUST_LOG="bugpot=info,bugpot_router=info,bugpot_runtime=info,bugpot_egress=info" \
     "$BIN" >"$LOGFILE" 2>&1 &
 PID=$!

@@ -22,9 +22,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use bugpot_config::{
-    AppIdentity, AppSpec, AuthConfig, RegistryCredential, Rollout, StoredApp, registry_host,
-};
+use bugpot_config::{AppIdentity, AppSpec, AuthConfig, RegistryCredential, Rollout, registry_host};
 use bugpot_egress::EgressOps;
 use bugpot_router::{Upstream, UpstreamResolver, subdomain_of};
 use bugpot_runtime::{Auth, ResourceUsage, RuntimeError, RuntimeOps};
@@ -271,7 +269,12 @@ struct AppMaps {
 pub struct AppController<R: RuntimeOps, E: EgressOps> {
     runtime: Arc<R>,
     egress: Arc<E>,
-    apps_dir: PathBuf,
+    /// Directory where bugpotd persists its own view of the world:
+    /// `<state>/apps/<name>.toml` for `AppSpec`,
+    /// `<state>/rollouts/<name>.toml` for rollout history. Operators
+    /// do not edit anything under here — every spec change goes
+    /// through the admin API.
+    state_dir: PathBuf,
     auth: AuthConfig,
     apps: RwLock<AppMaps>,
     /// One-shot guard for `reattach_running`. The controller is only
@@ -283,21 +286,34 @@ pub struct AppController<R: RuntimeOps, E: EgressOps> {
 }
 
 impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
-    #[must_use]
+    /// Create a controller, materialising the daemon-owned state
+    /// directories and rehydrating any apps + rollouts persisted by
+    /// a previous run.
+    ///
+    /// Errors when an on-disk spec fails validation or rollouts file
+    /// can't be parsed — both indicate state corruption that the
+    /// operator should investigate before bugpotd serves traffic.
     pub fn new(
         runtime: Arc<R>,
         egress: Arc<E>,
-        apps_dir: PathBuf,
+        state_dir: PathBuf,
         auth: AuthConfig,
-        stored: Vec<StoredApp>,
-    ) -> Self {
+    ) -> Result<Self> {
+        let specs_dir = state_dir.join("apps");
+        let rollouts_dir = state_dir.join("rollouts");
+        std::fs::create_dir_all(&specs_dir)
+            .with_context(|| format!("create {}", specs_dir.display()))?;
+        std::fs::create_dir_all(&rollouts_dir)
+            .with_context(|| format!("create {}", rollouts_dir.display()))?;
+
         let mut maps = AppMaps::default();
-        for s in stored {
-            // `load_apps` already validated each spec; an `InvalidSpec`
-            // here would indicate a caller bypassed that, which is a
-            // bug — `expect` is the right reaction.
-            let handle = make_handle(s.spec, s.rollout)
-                .expect("controller::new received unvalidated AppSpec");
+        for (spec, rollouts) in load_persisted_state(&specs_dir, &rollouts_dir)? {
+            // Specs persisted by bugpot have already passed validation
+            // before being written; corrupted state here is operator-
+            // investigation territory, but we fail loudly rather than
+            // silently dropping the app.
+            let handle = make_handle_with_rollouts(spec, rollouts)
+                .map_err(|e| anyhow!("rehydrate handle: {e}"))?;
             maps.by_subdomain.insert(
                 handle.identity.subdomain.clone(),
                 handle.identity.name.clone(),
@@ -306,14 +322,14 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         }
         #[allow(clippy::cast_precision_loss)]
         gauge!("bugpot_apps_active").set(maps.by_name.len() as f64);
-        Self {
+        Ok(Self {
             runtime,
             egress,
-            apps_dir,
+            state_dir,
             auth,
             apps: RwLock::new(maps),
             reattach_done: AtomicBool::new(false),
-        }
+        })
     }
 
     /// Resolve pull credentials for an image reference by looking the
@@ -705,7 +721,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
     pub async fn deploy_app(&self, mut spec: AppSpec) -> std::result::Result<AppView, DeployError> {
         let name = spec.name.clone().ok_or(DeployError::MissingName)?;
         // Strict validation BEFORE we touch the filesystem — `name`
-        // lands in `<apps_dir>/<name>.toml` and `bugpot-<name>` netns
+        // lands in `<state>/apps/<name>.toml` and `bugpot-<name>` netns
         // names, and the admin API accepts arbitrary JSON.
         spec.validate()?;
         let subdomain = spec.subdomain().to_owned();
@@ -721,13 +737,9 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
             }
         }
 
-        let toml_path = self.apps_dir.join(format!("{name}.toml"));
-        let stored = StoredApp {
-            spec: spec.clone(),
-            rollout: None,
-        };
+        let toml_path = self.spec_path(&name);
         let toml_body =
-            toml::to_string_pretty(&stored).with_context(|| format!("serialize app for {name}"))?;
+            toml::to_string_pretty(&spec).with_context(|| format!("serialize app for {name}"))?;
         tokio::fs::write(&toml_path, toml_body)
             .await
             .with_context(|| format!("write {}", toml_path.display()))?;
@@ -834,7 +846,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
             *handle.image_digest.lock().await = None;
         }
 
-        if let Err(e) = self.persist_stored(&handle).await {
+        if let Err(e) = self.persist_spec(&handle).await {
             return Err(UpdateError::Internal(e));
         }
 
@@ -919,9 +931,10 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         }
         *handle.image_digest.lock().await = Some(resolved_digest);
 
-        // 3. Persist.
-        if let Err(e) = self.persist_stored(&handle).await {
-            warn!(app = %name, error = ?e, "failed to persist updated stored toml");
+        // 3. Persist the rollout to its own state file. Spec doesn't
+        // change here, so no spec rewrite needed.
+        if let Err(e) = self.persist_rollouts(&handle).await {
+            warn!(app = %name, error = ?e, "failed to persist rollouts");
         }
 
         // 4 + 5: bring the container to the new image. If it was
@@ -945,17 +958,40 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         Some(handle.rollouts.lock().await.iter().cloned().collect())
     }
 
-    /// Persist the handle's spec + current rollout to
-    /// `<apps_dir>/<name>.toml`. Best-effort; the caller logs on
+    fn spec_path(&self, name: &str) -> PathBuf {
+        self.state_dir.join("apps").join(format!("{name}.toml"))
+    }
+
+    fn rollouts_path(&self, name: &str) -> PathBuf {
+        self.state_dir.join("rollouts").join(format!("{name}.toml"))
+    }
+
+    /// Persist the handle's spec (post-update) to
+    /// `<state>/apps/<name>.toml`. Best-effort; the caller logs on
     /// error.
-    async fn persist_stored(&self, handle: &Arc<AppHandle>) -> Result<()> {
+    async fn persist_spec(&self, handle: &Arc<AppHandle>) -> Result<()> {
         let name = &handle.identity.name;
         let spec = handle.spec.read().await.clone();
-        let rollout = handle.rollouts.lock().await.back().cloned();
-        let stored = StoredApp { spec, rollout };
-        let body = toml::to_string_pretty(&stored)
-            .with_context(|| format!("serialize stored app for {name}"))?;
-        let path = self.apps_dir.join(format!("{name}.toml"));
+        let body =
+            toml::to_string_pretty(&spec).with_context(|| format!("serialize spec for {name}"))?;
+        let path = self.spec_path(name);
+        tokio::fs::write(&path, body)
+            .await
+            .with_context(|| format!("write {}", path.display()))?;
+        Ok(())
+    }
+
+    /// Persist the handle's full rollout history to
+    /// `<state>/rollouts/<name>.toml`. The file is daemon-owned; no
+    /// operator should ever edit it, so the on-disk shape is purely
+    /// `[[rollout]]` entries (oldest first, back = current).
+    async fn persist_rollouts(&self, handle: &Arc<AppHandle>) -> Result<()> {
+        let name = &handle.identity.name;
+        let rollouts: Vec<Rollout> = handle.rollouts.lock().await.iter().cloned().collect();
+        let file = RolloutsFile { rollouts };
+        let body = toml::to_string_pretty(&file)
+            .with_context(|| format!("serialize rollouts for {name}"))?;
+        let path = self.rollouts_path(name);
         tokio::fs::write(&path, body)
             .await
             .with_context(|| format!("write {}", path.display()))?;
@@ -1005,11 +1041,17 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
                 "cleanup_orphan_container failed during remove; bundle / volume dir may leak",
             );
         }
-        let toml_path = self.apps_dir.join(format!("{}.toml", handle.identity.name));
-        if toml_path.exists()
-            && let Err(e) = tokio::fs::remove_file(&toml_path).await
+        let spec_path = self.spec_path(&handle.identity.name);
+        if spec_path.exists()
+            && let Err(e) = tokio::fs::remove_file(&spec_path).await
         {
-            warn!(path = %toml_path.display(), error = %e, "remove toml failed");
+            warn!(path = %spec_path.display(), error = %e, "remove spec toml failed");
+        }
+        let rollouts_path = self.rollouts_path(&handle.identity.name);
+        if rollouts_path.exists()
+            && let Err(e) = tokio::fs::remove_file(&rollouts_path).await
+        {
+            warn!(path = %rollouts_path.display(), error = %e, "remove rollouts toml failed");
         }
         Ok(())
     }
@@ -1317,11 +1359,22 @@ fn make_handle(
     spec: AppSpec,
     initial_rollout: Option<Rollout>,
 ) -> Result<Arc<AppHandle>, bugpot_config::InvalidSpec> {
-    let identity = spec.identity()?;
     let mut rollouts = VecDeque::with_capacity(MAX_ROLLOUT_HISTORY);
     if let Some(r) = initial_rollout {
         rollouts.push_back(r);
     }
+    make_handle_with_rollouts(spec, rollouts)
+}
+
+/// Build a handle from a spec + a pre-populated rollout history.
+/// Used by the rehydrate-from-disk path; preserves the order callers
+/// (and the on-disk file) maintain — back of the queue = current
+/// rollout.
+fn make_handle_with_rollouts(
+    spec: AppSpec,
+    rollouts: VecDeque<Rollout>,
+) -> Result<Arc<AppHandle>, bugpot_config::InvalidSpec> {
+    let identity = spec.identity()?;
     Ok(Arc::new(AppHandle {
         identity,
         spec: RwLock::new(spec),
@@ -1334,6 +1387,58 @@ fn make_handle(
             cpu_baseline: 0,
         }),
     }))
+}
+
+/// On-disk shape of the rollouts file. Wrapped in a top-level table
+/// so it can grow extra fields later without breaking the format.
+#[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
+struct RolloutsFile {
+    #[serde(default, rename = "rollout", skip_serializing_if = "Vec::is_empty")]
+    rollouts: Vec<Rollout>,
+}
+
+/// Walk the spec and rollouts state directories, returning one
+/// `(spec, rollouts)` pair per registered app. Specs that fail
+/// validation surface as an error — corrupted bugpot state should
+/// stop the daemon coming up, not silently drop an app.
+fn load_persisted_state(
+    specs_dir: &Path,
+    rollouts_dir: &Path,
+) -> Result<Vec<(AppSpec, VecDeque<Rollout>)>> {
+    let mut out = Vec::new();
+    let entries =
+        std::fs::read_dir(specs_dir).with_context(|| format!("read {}", specs_dir.display()))?;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("read {}", specs_dir.display()))?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("toml") {
+            continue;
+        }
+        let body =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let mut spec: AppSpec =
+            toml::from_str(&body).with_context(|| format!("parse {}", path.display()))?;
+        spec.source_path.clone_from(&path);
+        spec.validate()
+            .with_context(|| format!("validate {}", path.display()))?;
+        let name = spec.name().to_owned();
+        let rollouts = read_rollouts_file(rollouts_dir, &name)?;
+        out.push((spec, rollouts));
+    }
+    out.sort_by(|a, b| a.0.name().cmp(b.0.name()));
+    Ok(out)
+}
+
+fn read_rollouts_file(rollouts_dir: &Path, name: &str) -> Result<VecDeque<Rollout>> {
+    let path = rollouts_dir.join(format!("{name}.toml"));
+    if !path.exists() {
+        return Ok(VecDeque::new());
+    }
+    let body =
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let parsed: RolloutsFile =
+        toml::from_str(&body).with_context(|| format!("parse {}", path.display()))?;
+    Ok(parsed.rollouts.into_iter().collect())
 }
 
 /// If `digest` is `Some`, return an OCI reference pinned to that
@@ -1830,27 +1935,56 @@ mod tests {
     /// Pre-registered app with an initial rollout for tests that
     /// want to drive `ensure_running` directly (skipping the
     /// register-then-rollout choreography of the real admin API).
-    fn stored_with_name(name: &str, tag: &str) -> StoredApp {
-        StoredApp {
-            spec: spec_with_name(name),
-            rollout: Some(Rollout {
+    /// `stored` is just a (spec, optional initial rollout) tuple now
+    /// that on-disk persistence is keyed by state dir, not a single
+    /// combined file.
+    fn stored_with_name(name: &str, tag: &str) -> (AppSpec, Option<Rollout>) {
+        (
+            spec_with_name(name),
+            Some(Rollout {
                 tag: tag.to_owned(),
                 created_at: "1970-01-01T00:00:00Z".to_owned(),
             }),
-        }
+        )
     }
 
     fn make_controller(
-        stored: Vec<StoredApp>,
-        apps_dir: PathBuf,
+        stored: Vec<(AppSpec, Option<Rollout>)>,
+        state_dir: PathBuf,
     ) -> Arc<AppController<MockRuntime, MockEgress>> {
-        Arc::new(AppController::new(
-            Arc::new(MockRuntime::default()),
-            Arc::new(MockEgress::default()),
-            apps_dir,
-            AuthConfig::default(),
-            stored,
-        ))
+        // Seed the state dir so AppController::new's load path picks
+        // these specs + rollouts back up on construction — keeps the
+        // test entry symmetric with production (everything goes
+        // through the disk-rehydrate code path).
+        std::fs::create_dir_all(state_dir.join("apps")).unwrap();
+        std::fs::create_dir_all(state_dir.join("rollouts")).unwrap();
+        for (spec, rollout) in stored {
+            let name = spec.name().to_owned();
+            let spec_body = toml::to_string_pretty(&spec).unwrap();
+            std::fs::write(
+                state_dir.join("apps").join(format!("{name}.toml")),
+                spec_body,
+            )
+            .unwrap();
+            if let Some(r) = rollout {
+                let file = RolloutsFile { rollouts: vec![r] };
+                let body = toml::to_string_pretty(&file).unwrap();
+                std::fs::write(
+                    state_dir.join("rollouts").join(format!("{name}.toml")),
+                    body,
+                )
+                .unwrap();
+            }
+        }
+        Arc::new(
+            AppController::new(
+                Arc::new(MockRuntime::default()),
+                Arc::new(MockEgress::default()),
+                state_dir,
+                AuthConfig::default(),
+            )
+            .expect("controller::new"),
+        )
     }
 
     /// `deploy_app` only registers; it does not pull. So even a
@@ -1875,7 +2009,7 @@ mod tests {
             view.current_rollout.is_none(),
             "newly registered app has no rollout yet"
         );
-        let toml = tmp.path().join("alpha.toml");
+        let toml = tmp.path().join("apps").join("alpha.toml");
         assert!(toml.exists(), "register must persist the toml");
         let calls = controller.runtime.calls();
         assert!(
@@ -1937,7 +2071,8 @@ mod tests {
         assert_eq!(view.port, 9999);
 
         // TOML on disk reflects the new state.
-        let toml_body = std::fs::read_to_string(tmp.path().join("alpha.toml")).unwrap();
+        let toml_body =
+            std::fs::read_to_string(tmp.path().join("apps").join("alpha.toml")).unwrap();
         assert!(
             toml_body.contains("port = 9999"),
             "toml missing new port: {toml_body}"
@@ -2316,13 +2451,13 @@ mod tests {
         spec.scaling = bugpot_config::Scaling {
             idle_timeout: Some("10ms".into()),
         };
-        let stored = StoredApp {
+        let stored = (
             spec,
-            rollout: Some(Rollout {
+            Some(Rollout {
                 tag: "v1".into(),
                 created_at: "1970-01-01T00:00:00Z".into(),
             }),
-        };
+        );
         let controller = make_controller(vec![stored], tmp.path().to_owned());
         let handle = {
             let maps = controller.apps.read().await;
