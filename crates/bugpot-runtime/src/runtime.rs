@@ -4,39 +4,26 @@
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::future::Future;
-use std::io::SeekFrom;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use bugpot_config::AppSpec;
-use futures::StreamExt;
-use inotify::{Inotify, WatchMask};
 use libcontainer::container::builder::ContainerBuilder;
 use libcontainer::container::{Container, ContainerStatus};
 use libcontainer::signal::Signal;
 use libcontainer::syscall::syscall::SyscallType;
 use metrics::histogram;
 use nix::sys::signal::Signal as NixSignal;
-use tokio::io::{AsyncBufReadExt, AsyncSeekExt, BufReader};
 use tracing::{debug, info, warn};
 
-/// Per-stream cap on the on-disk log file. When the file grows past this
-/// threshold the tail task truncates it in place. Bytes between the size
-/// check and the truncate may be lost; the tracing pipeline already
-/// emitted everything before the truncate point, so the loss only
-/// matters for operators reading the file directly.
-// Per-stream cap on the container log file before it gets truncated
-// in place. Sized for "small disk on cheap VM": with N apps × 2
-// streams, total log floor is N × 2 MiB even when truncation kicks
-// in continuously, which fits comfortably on a 10 GiB host. Bump if
-// running a chatty app needs more pre-truncation history.
-const MAX_LOG_BYTES: u64 = 1024 * 1024; // 1 MiB
-
 use crate::auth::Auth;
+use crate::cgroup_stats::{cgroup_path_for_pid, read_cpu_usec, read_memory_bytes};
 use crate::error::{Result, RuntimeError};
 use crate::image::{ImageId, Puller, gc_unused_images, load_cached_image};
+use crate::logs::spawn_log_tails;
 use crate::spec::{SpecInputs, build_spec};
+use crate::volumes::{ensure_volume_host_dirs, remove_volume_dirs};
 
 /// A bugpot-managed container that has been started.
 #[derive(Debug, Clone)]
@@ -244,7 +231,7 @@ impl RuntimeOps for Runtime {
         // ownership (so a TOML `user` change does the right thing on
         // next start). Data survives across container restarts and
         // rollouts; only `cleanup_orphan_container` removes the dir.
-        let volume_host_paths = self.ensure_volume_host_dirs(&name, &spec.volumes)?;
+        let volume_host_paths = ensure_volume_host_dirs(&self.volumes_dir, &name, &spec.volumes)?;
 
         // 4. Spec.
         //
@@ -342,8 +329,7 @@ impl RuntimeOps for Runtime {
         // new line via tracing so `just logs` still works. Seek to EOF
         // so a fresh start doesn't replay historical lines; on reattach,
         // the controller calls `ensure_log_tails` for the same effect.
-        tokio::spawn(forward_log_file(stdout_path, name.clone(), "stdout"));
-        tokio::spawn(forward_log_file(stderr_path, name.clone(), "stderr"));
+        spawn_log_tails(&log_dir, &name);
 
         let raw_pid = container
             .pid()
@@ -484,26 +470,18 @@ impl RuntimeOps for Runtime {
         // operator-initiated remove (or an orphan whose TOML has
         // disappeared) should wipe them. The log dir is intentionally
         // left alone — operators may want post-mortem access.
-        self.remove_volume_dirs(name)?;
+        remove_volume_dirs(&self.volumes_dir, name)?;
         Ok(())
     }
 
     fn ensure_log_tails(&self, name: &str) {
-        let log_dir = self.log_dir_for(name);
-        let stdout_path = log_dir.join("stdout.log");
-        let stderr_path = log_dir.join("stderr.log");
-        tokio::spawn(forward_log_file(stdout_path, name.to_owned(), "stdout"));
-        tokio::spawn(forward_log_file(stderr_path, name.to_owned(), "stderr"));
+        spawn_log_tails(&self.log_dir_for(name), name);
     }
 }
 
 impl Runtime {
     fn log_dir_for(&self, app: &str) -> PathBuf {
         self.logs_dir.join(app)
-    }
-
-    fn volume_dir_for(&self, app: &str) -> PathBuf {
-        self.volumes_dir.join(app)
     }
 
     /// Materialise the host-side directories for an app's
@@ -518,50 +496,6 @@ impl Runtime {
     /// every call. That's deliberate — if an operator updates `user`
     /// in the TOML and redeploys, the next start picks up the new
     /// ownership without any manual `chown` on the host.
-    fn ensure_volume_host_dirs(
-        &self,
-        app: &str,
-        volumes: &[bugpot_config::VolumeSpec],
-    ) -> Result<Vec<PathBuf>> {
-        if volumes.is_empty() {
-            return Ok(Vec::new());
-        }
-        let app_dir = self.volume_dir_for(app);
-        fs::create_dir_all(&app_dir).map_err(|e| RuntimeError::io(&app_dir, e))?;
-        let mut out = Vec::with_capacity(volumes.len());
-        for v in volumes {
-            let host_path = app_dir.join(&v.name);
-            fs::create_dir_all(&host_path).map_err(|e| RuntimeError::io(&host_path, e))?;
-            if let Some(uid) = v.user {
-                // Same UID for group; matches the typical container
-                // image convention `appuser:appuser`. nix's wrapper
-                // keeps us inside the workspace's `unsafe_code = deny`.
-                nix::unistd::chown(
-                    &host_path,
-                    Some(nix::unistd::Uid::from_raw(uid)),
-                    Some(nix::unistd::Gid::from_raw(uid)),
-                )
-                .map_err(|e| RuntimeError::io(&host_path, std::io::Error::from(e)))?;
-            }
-            out.push(host_path);
-        }
-        Ok(out)
-    }
-
-    /// Remove all volume directories belonging to `app`. Called by
-    /// `cleanup_orphan_container` on the explicit-remove path.
-    ///
-    /// Best-effort: an IO failure is surfaced, but a missing dir is
-    /// fine (the app may never have started, or its TOML may never
-    /// have declared any volumes).
-    fn remove_volume_dirs(&self, app: &str) -> Result<()> {
-        let app_dir = self.volume_dir_for(app);
-        if !app_dir.exists() {
-            return Ok(());
-        }
-        fs::remove_dir_all(&app_dir).map_err(|e| RuntimeError::io(&app_dir, e))
-    }
-
     /// Reference set for image-cache GC: every digest currently bound
     /// to a bundle's `rootfs` symlink. Apps that have at least started
     /// once have their image protected; apps registered but never
@@ -614,123 +548,6 @@ impl Runtime {
     }
 }
 
-async fn truncate_in_place(path: &Path) -> std::io::Result<()> {
-    let file = tokio::fs::OpenOptions::new().write(true).open(path).await?;
-    file.set_len(0).await
-}
-
-/// Follow a per-app log file and forward each new line through tracing.
-///
-/// Opens at the start of the file so bugpot restarts replay everything
-/// the file still holds — that's how the interregnum (bugpot down, app
-/// kept writing) gets into the new bugpot's tracing pipeline. Replay
-/// is bounded by `MAX_LOG_BYTES` (truncation cap), so the cost is
-/// at most one cap-worth of duplicate emissions per restart event.
-///
-/// Waits for `IN_MODIFY` from inotify between read passes instead of
-/// polling — idle apps cost zero CPU on bugpot's side. After each
-/// read pass, checks size: when the file has grown past
-/// `MAX_LOG_BYTES`, truncates it in place and seeks the reader back
-/// to 0. Container `fd 1/2` were opened `O_APPEND`, so writes after
-/// truncation resume at offset 0.
-///
-/// Detached on purpose; cancellation happens when bugpot exits (we
-/// hold no `JoinHandle`s).
-async fn forward_log_file(path: PathBuf, app: String, stream: &'static str) {
-    let inotify = match Inotify::init() {
-        Ok(i) => i,
-        Err(e) => {
-            warn!(app = %app, stream, error = %e, "inotify init failed; log tail disabled");
-            return;
-        }
-    };
-    if let Err(e) = inotify.watches().add(&path, WatchMask::MODIFY) {
-        warn!(app = %app, stream, path = %path.display(), error = %e, "inotify watch failed");
-        return;
-    }
-    let buffer = vec![0u8; 1024];
-    let mut events = match inotify.into_event_stream(buffer) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!(app = %app, stream, error = %e, "inotify into_event_stream failed");
-            return;
-        }
-    };
-
-    let file = match tokio::fs::OpenOptions::new().read(true).open(&path).await {
-        Ok(f) => f,
-        Err(e) => {
-            warn!(app = %app, stream, path = %path.display(), error = %e, "open log file for tail failed");
-            return;
-        }
-    };
-    let mut reader = BufReader::new(file);
-    // `line` accumulates bytes across iterations. `read_line` appends
-    // to it, and we only emit + clear once we've actually seen a
-    // newline — so a container that writes "Hello, w" before flushing
-    // doesn't get split into two log entries on the bugpot side.
-    let mut line = String::new();
-
-    loop {
-        // Drain everything currently in the file.
-        loop {
-            match reader.read_line(&mut line).await {
-                Ok(0) => break,
-                Ok(_) => {
-                    if line.ends_with('\n') {
-                        let trimmed = line.trim_end();
-                        if !trimmed.is_empty() {
-                            info!(target: "bugpot::app", app = %app, stream, "{trimmed}");
-                        }
-                        line.clear();
-                    }
-                    // Otherwise: EOF hit mid-line. Keep what we have
-                    // in `line` and loop — the next iteration will
-                    // either pick up more bytes (if the container
-                    // wrote while we were reading) or fall through to
-                    // the inotify wait below.
-                }
-                Err(e) => {
-                    warn!(app = %app, stream, error = %e, "log file tail read failed");
-                    return;
-                }
-            }
-        }
-
-        // Bound on-disk size. In-place truncate keeps the inode (so
-        // container fd 1/2 keep working); container `O_APPEND` causes
-        // subsequent writes to start at offset 0.
-        match tokio::fs::metadata(&path).await {
-            Ok(meta) if meta.len() > MAX_LOG_BYTES => {
-                if let Err(e) = truncate_in_place(&path).await {
-                    warn!(app = %app, stream, error = %e, "truncate log file failed");
-                } else {
-                    info!(target: "bugpot::app", app = %app, stream, "log file truncated at {MAX_LOG_BYTES} bytes");
-                    if let Err(e) = reader.seek(SeekFrom::Start(0)).await {
-                        warn!(app = %app, stream, error = %e, "seek after truncate failed");
-                        return;
-                    }
-                    // The bytes we accumulated belong to the pre-
-                    // truncate file; concatenating them onto the
-                    // first post-truncate line would corrupt it.
-                    line.clear();
-                }
-            }
-            Ok(_) => {}
-            Err(e) => {
-                warn!(app = %app, stream, error = %e, "metadata failed");
-            }
-        }
-
-        // Block until the container writes again, or the watch goes
-        // away. We don't care about the event details; one wake-up
-        // per batch of writes is enough.
-        if events.next().await.is_none() {
-            return;
-        }
-    }
-}
-
 /// Prepare `<bundle_dir>/rootfs` so libcontainer can use it.
 ///
 /// Strategy: create `bundle_dir/rootfs` as an empty directory and
@@ -739,54 +556,6 @@ async fn forward_log_file(path: PathBuf, app: String, stream: &'static str) {
 /// simply create a symlink to the image rootfs, which works for read-only
 /// scenarios; once we want a writable upper layer (overlayfs), this is the
 /// hook to replace.
-/// Resolve the cgroup v2 path of `pid` by reading `/proc/<pid>/cgroup`.
-/// Returns `None` when the file is missing (process gone) or the
-/// expected `0::/...` line is absent (cgroup v1 host).
-fn cgroup_path_for_pid(pid: u32) -> Option<PathBuf> {
-    let body = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
-    parse_cgroup_v2_path(&body).map(|rel| {
-        let mut p = PathBuf::from("/sys/fs/cgroup");
-        let trimmed = rel.trim_start_matches('/');
-        if !trimmed.is_empty() {
-            p.push(trimmed);
-        }
-        p
-    })
-}
-
-/// Parse the cgroup v2 line (`"0::/foo/bar"`) out of the content of
-/// `/proc/<pid>/cgroup`. Cgroup v1 lines (`"4:cpu:/..."`) are ignored.
-fn parse_cgroup_v2_path(s: &str) -> Option<String> {
-    for line in s.lines() {
-        if let Some(rest) = line.strip_prefix("0::") {
-            return Some(rest.to_owned());
-        }
-    }
-    None
-}
-
-fn read_memory_bytes(cgroup: &Path) -> Option<u64> {
-    let text = fs::read_to_string(cgroup.join("memory.current")).ok()?;
-    text.trim().parse().ok()
-}
-
-fn read_cpu_usec(cgroup: &Path) -> Option<u64> {
-    let text = fs::read_to_string(cgroup.join("cpu.stat")).ok()?;
-    parse_cpu_usec(&text)
-}
-
-/// Parse the `usage_usec <n>` field out of the cgroup v2 `cpu.stat`
-/// file body. Other fields (`user_usec`, `system_usec`, throttling
-/// stats) are ignored.
-fn parse_cpu_usec(stat_content: &str) -> Option<u64> {
-    for line in stat_content.lines() {
-        if let Some(rest) = line.strip_prefix("usage_usec ") {
-            return rest.trim().parse().ok();
-        }
-    }
-    None
-}
-
 fn prepare_bundle_dir(bundle_dir: &Path, image_rootfs: &Path) -> Result<()> {
     if bundle_dir.exists() {
         fs::remove_dir_all(bundle_dir).map_err(|e| RuntimeError::io(bundle_dir, e))?;
@@ -815,53 +584,6 @@ mod tests {
         assert!(rt.bundles_dir.is_dir());
         assert!(rt.containers_dir.is_dir());
         assert_eq!(rt.state_dir(), tmp.path());
-    }
-
-    #[test]
-    fn parse_cgroup_v2_picks_unified_line() {
-        // Real-world `/proc/<pid>/cgroup` on a cgroup-v2-unified host.
-        let body = "0::/system.slice/bugpot-x.service\n";
-        assert_eq!(
-            parse_cgroup_v2_path(body),
-            Some("/system.slice/bugpot-x.service".to_string()),
-        );
-    }
-
-    #[test]
-    fn parse_cgroup_v2_ignores_v1_lines() {
-        // Hybrid mode: v1 controllers come first, v2 is the line with "0::".
-        let body = "\
-13:misc:/\n\
-12:cpuset:/\n\
-11:cpu,cpuacct:/foo\n\
-0::/unified/path\n";
-        assert_eq!(
-            parse_cgroup_v2_path(body),
-            Some("/unified/path".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_cgroup_v2_absent_returns_none() {
-        // v1-only host has no `0::` line.
-        let body = "1:cpu:/foo\n2:memory:/foo\n";
-        assert!(parse_cgroup_v2_path(body).is_none());
-    }
-
-    #[test]
-    fn parse_cpu_usec_finds_usage_field() {
-        let body = "\
-usage_usec 123456789\n\
-user_usec 100000000\n\
-system_usec 23456789\n\
-nr_periods 0\n";
-        assert_eq!(parse_cpu_usec(body), Some(123_456_789));
-    }
-
-    #[test]
-    fn parse_cpu_usec_missing_field_returns_none() {
-        let body = "user_usec 1\nsystem_usec 1\n";
-        assert!(parse_cpu_usec(body).is_none());
     }
 
     #[test]
