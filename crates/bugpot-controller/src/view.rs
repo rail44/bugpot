@@ -42,15 +42,18 @@ pub enum AppStateView {
 }
 
 pub(crate) async fn view_of(handle: &Arc<AppHandle>) -> AppView {
-    let state = match &handle.inner.lock().await.state {
-        AppState::Stopped => AppStateView::Stopped,
-        AppState::Starting { .. } => AppStateView::Starting,
-        AppState::Running { .. } => AppStateView::Running,
-        AppState::Frozen { .. } => AppStateView::Frozen,
-        AppState::Stopping => AppStateView::Stopping,
+    let (state, current_rollout) = {
+        let inner = handle.inner.lock().await;
+        let state = match &inner.state {
+            AppState::Stopped => AppStateView::Stopped,
+            AppState::Starting { .. } => AppStateView::Starting,
+            AppState::Running { .. } => AppStateView::Running,
+            AppState::Frozen { .. } => AppStateView::Frozen,
+            AppState::Stopping => AppStateView::Stopping,
+        };
+        (state, inner.rollouts.back().cloned())
     };
     let spec = handle.spec.read().await;
-    let current_rollout = handle.rollouts.lock().await.back().cloned();
     AppView {
         name: handle.identity.name.clone(),
         subdomain: handle.identity.subdomain.clone(),

@@ -56,11 +56,6 @@ pub(crate) struct AppHandle {
     /// operator-side redeploy is required to pick up an upstream
     /// retag. No TTL.
     pub(crate) image_digest: Mutex<Option<bugpot_runtime::ImageId>>,
-    /// Bounded rollout history. The back of the deque is the current
-    /// rollout (the tag bugpot pulls and runs). Empty = the app is
-    /// registered but not yet deployed, in which case
-    /// `ensure_running` will fail and the router returns 404.
-    pub(crate) rollouts: Mutex<VecDeque<Rollout>>,
     /// Per-app counter of HTTP/1.1 upgrades (WebSocket / SSE) currently
     /// spliced through the router. Incremented by the router on splice
     /// spawn, decremented when the splice task exits. The idle reaper
@@ -76,6 +71,14 @@ pub(crate) struct AppHandle {
 pub(crate) struct HandleInner {
     pub(crate) state: AppState,
     pub(crate) last_access: Instant,
+    /// Bounded rollout history, co-located with `state` because the
+    /// two move together: a rollout push advances both the rollout
+    /// list and the state (Stopped → Running, or Running → Stopping →
+    /// Running with the new image). The back of the deque is the
+    /// current rollout (the tag bugpot pulls and runs). Empty = the
+    /// app is registered but not yet deployed, in which case
+    /// `ensure_running` will fail.
+    pub(crate) rollouts: VecDeque<Rollout>,
     /// Last-seen cgroup `cpu_usec` for the running container, used to
     /// compute deltas for the `bugpot_app_cpu_microseconds_total`
     /// counter across sweeps. Lifetime matches the handle's running
@@ -180,11 +183,11 @@ pub(crate) fn make_handle_with_rollouts(
         identity,
         spec: RwLock::new(spec),
         image_digest: Mutex::new(None),
-        rollouts: Mutex::new(rollouts),
         active_upgrades: Arc::new(AtomicUsize::new(0)),
         inner: Mutex::new(HandleInner {
             state: AppState::Stopped,
             last_access: Instant::now(),
+            rollouts,
             cpu_baseline: 0,
         }),
     }))
