@@ -37,7 +37,7 @@ use bugpot_router::{ResolveError, Upstream, UpstreamResolver, subdomain_of};
 use bugpot_runtime::RuntimeError;
 use bugpot_runtime::{Auth, RuntimeOps};
 use metrics::{counter, gauge, histogram};
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 mod error;
@@ -52,7 +52,8 @@ use mempressure::read_mem_available;
 
 mod handle;
 use handle::{
-    AppHandle, AppMaps, AppState, MAX_ROLLOUT_HISTORY, make_handle, make_handle_with_rollouts,
+    AppHandle, AppMaps, AppState, MAX_ROLLOUT_HISTORY, StartClaim, make_handle,
+    make_handle_with_rollouts,
 };
 
 mod view;
@@ -905,69 +906,33 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
     /// the container IP.
     async fn ensure_running(&self, handle: &Arc<AppHandle>) -> Result<Ipv4Addr> {
         loop {
-            // Phase 1: inspect / transition state under the lock.
-            //
-            // The `Notify` lives inside the `Starting` variant so the
-            // "starting state without a notify" footgun is gone at the
-            // type level — no more `expect` here.
-            let (own_notify, resume_from) = {
-                let mut inner = handle.inner.lock().await;
-                inner.last_access = Instant::now();
-                match &inner.state {
-                    AppState::Running { container_ip } => return Ok(*container_ip),
-                    AppState::Starting { notify } => {
-                        let n = notify.clone();
-                        drop(inner);
-                        debug!(app = %handle.identity.name, "awaiting concurrent start");
-                        n.notified().await;
-                        continue;
-                    }
-                    AppState::Stopping => {
-                        drop(inner);
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                        continue;
-                    }
-                    AppState::Stopped => {
-                        let n = Arc::new(Notify::new());
-                        inner.state = AppState::Starting { notify: n.clone() };
-                        drop(inner);
-                        (n, None)
-                    }
-                    AppState::Frozen { container_ip } => {
-                        // Resume from cgroup freezer. We still re-use
-                        // `Starting` here so concurrent callers coalesce
-                        // through the same `Notify` regardless of which
-                        // dormant state we were in.
-                        let n = Arc::new(Notify::new());
-                        let ip = *container_ip;
-                        inner.state = AppState::Starting { notify: n.clone() };
-                        drop(inner);
-                        (n, Some(ip))
-                    }
+            let claim = handle.inner.lock().await.claim_start_slot();
+            match claim {
+                StartClaim::Ready(ip) => return Ok(ip),
+                StartClaim::Coalesce(notify) => {
+                    debug!(app = %handle.identity.name, "awaiting concurrent start");
+                    notify.notified().await;
                 }
-            };
-
-            // Phase 2: do the work outside the lock.
-            let result = if let Some(ip) = resume_from {
-                self.do_resume(handle, ip).await
-            } else {
-                self.do_start(handle).await
-            };
-
-            // Phase 3: commit state + wake waiters (after dropping the
-            // lock so concurrent readers don't contend on `Notify`).
-            // Transitioning out of `Starting` drops the in-state `Arc`;
-            // `own_notify` keeps it alive for the wake below.
-            {
-                let mut inner = handle.inner.lock().await;
-                inner.state = result
-                    .as_ref()
-                    .map_or(AppState::Stopped, |ip| AppState::Running {
-                        container_ip: *ip,
-                    });
+                StartClaim::WaitForStopping => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                StartClaim::Claimed {
+                    notify: own_notify,
+                    resume_from,
+                } => {
+                    let result = match resume_from {
+                        Some(ip) => self.do_resume(handle, ip).await,
+                        None => self.do_start(handle).await,
+                    };
+                    // Commit the result *before* waking waiters so the
+                    // wake races against an observable state. `own_notify`
+                    // keeps the channel alive across the transition that
+                    // drops the in-state `Arc`.
+                    handle.inner.lock().await.finish_start(&result);
+                    own_notify.notify_waiters();
+                    return result;
+                }
             }
-            own_notify.notify_waiters();
-            return result;
         }
     }
 
