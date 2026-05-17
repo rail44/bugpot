@@ -305,7 +305,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
             // started yet. Skip with a warning rather than failing the
             // entire bring-up — the operator will see the warning and
             // POST a rollout when ready.
-            if handle.rollouts.lock().await.is_empty() {
+            if handle.inner.lock().await.rollouts.is_empty() {
                 warn!(
                     app = %handle.identity.name,
                     "eager start skipped: app has no rollout yet"
@@ -736,11 +736,11 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
             created_at: humantime::format_rfc3339_seconds(SystemTime::now()).to_string(),
         };
         {
-            let mut rollouts = handle.rollouts.lock().await;
-            while rollouts.len() >= MAX_ROLLOUT_HISTORY {
-                rollouts.pop_front();
+            let mut inner = handle.inner.lock().await;
+            while inner.rollouts.len() >= MAX_ROLLOUT_HISTORY {
+                inner.rollouts.pop_front();
             }
-            rollouts.push_back(rollout.clone());
+            inner.rollouts.push_back(rollout.clone());
         }
         *handle.image_digest.lock().await = Some(resolved_digest);
 
@@ -768,7 +768,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
     /// exist.
     pub async fn list_rollouts(&self, name: &str) -> Option<Vec<Rollout>> {
         let handle = self.apps.read().await.by_name.get(name).cloned()?;
-        Some(handle.rollouts.lock().await.iter().cloned().collect())
+        Some(handle.inner.lock().await.rollouts.iter().cloned().collect())
     }
 
     fn spec_path(&self, name: &str) -> PathBuf {
@@ -800,7 +800,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
     /// `[[rollout]]` entries (oldest first, back = current).
     async fn persist_rollouts(&self, handle: &Arc<AppHandle>) -> Result<()> {
         let name = &handle.identity.name;
-        let rollouts: Vec<Rollout> = handle.rollouts.lock().await.iter().cloned().collect();
+        let rollouts: Vec<Rollout> = handle.inner.lock().await.rollouts.iter().cloned().collect();
         let file = RolloutsFile { rollouts };
         let body = toml::to_string_pretty(&file)
             .with_context(|| format!("serialize rollouts for {name}"))?;
@@ -966,9 +966,10 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         // Resolve current rollout. An app without a rollout cannot
         // start — fail fast before allocating any resources.
         let tag = handle
-            .rollouts
+            .inner
             .lock()
             .await
+            .rollouts
             .back()
             .map(|r| r.tag.clone())
             .ok_or_else(|| anyhow!("app '{name}' has no rollout; POST a rollout first"))?;
