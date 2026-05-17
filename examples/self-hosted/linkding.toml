@@ -1,0 +1,65 @@
+# Linkding — self-hosted bookmark manager (Django + sqlite).
+#
+# Usage: copy into your ops repo's `apps/` directory, configure the
+# superuser env vars below, push. The image is published by the
+# upstream project as sissbruecker/linkding.
+
+name = "linkding"
+
+repo = "docker.io/sissbruecker/linkding"
+
+# Linkding's default port (uwsgi worker).
+port = 9090
+
+[scaling]
+# Django + sqlite + a uwsgi pool: cold start is several seconds,
+# which is exactly the pain freezer is meant to mask. Keep the
+# idle window modest so RAM doesn't pile up.
+idle_timeout = "15m"
+
+[egress]
+# Linkding fetches metadata (title, description, snapshot) for the
+# URLs you save. That's effectively "the whole web" — bugpot's
+# egress allowlist isn't a great fit for that, so options are:
+#
+#   1. Disable background tasks (LD_DISABLE_BACKGROUND_TASKS = "True")
+#      to skip metadata fetching entirely. Then leave `allow` empty.
+#   2. Allow each specific destination you bookmark from (impractical).
+#   3. Wide-open egress per app is on bugpot's roadmap; for now,
+#      option 1 is the operationally sound choice.
+#
+# Either way, no third-party SaaS calls are required.
+allow = []
+
+[env]
+# REQUIRED on first boot. Linkding creates the superuser from these
+# values; rotate the password from `/settings` after login.
+# LD_SUPERUSER_NAME = "admin"
+# LD_SUPERUSER_PASSWORD = "REPLACE_ME"
+
+# See egress note above. Set to "True" if you can't make the
+# allowlist match every bookmark URL.
+LD_DISABLE_BACKGROUND_TASKS = "True"
+
+[readiness]
+# Linkding's `/health` is the canonical endpoint and waits until
+# the DB pool is ready, not just until uwsgi has bound.
+path = "/health"
+# Django + sqlite migrations can stretch on a cold start the first
+# time the data volume is empty. Generous timeout up front.
+timeout = "60s"
+
+[resources]
+# Django keeps a couple of worker processes warm; 256 MiB covers
+# a typical install with a few thousand bookmarks.
+memory = "256MiB"
+cpu = "0.5"
+
+[[volumes]]
+# Sqlite DB + uploaded snapshots + the search index. Back this up.
+name = "data"
+# Linkding's image expects its data under /etc/linkding/data.
+path = "/etc/linkding/data"
+# Linkding runs as user 33 (www-data) inside the container —
+# without this `user =`, the very first write fails with EACCES.
+user = 33

@@ -1,0 +1,77 @@
+# Vaultwarden — Rust-based Bitwarden-compatible server.
+#
+# Usage: copy this file into your ops repo's `apps/` directory (or
+# adapt verbatim for `BUGPOT_APPS_DIR`), set ADMIN_TOKEN below, push.
+# The matching app repo's CI handles image rollouts; the image
+# vaultwarden/server is published by the upstream project on
+# Docker Hub.
+
+name = "vaultwarden"
+
+# Use the official image. If you don't want anonymous Docker Hub
+# pulls (rate-limited), mirror it to ghcr.io/<your-org>/vaultwarden
+# and point `repo` at the mirror instead.
+repo = "docker.io/vaultwarden/server"
+
+# Vaultwarden's default web port. (The legacy WebSocket port 3012
+# was retired in v1.29 — notifications now run on the same port.)
+port = 80
+
+[scaling]
+# Freezer is a great fit: full RSS is ~30-50 MiB, and the next
+# request (or push) wakes it sub-ms. Choose `idle_timeout` based on
+# how long you tolerate idle RAM occupancy; the memory-pressure
+# handler will evict to Stopped under load anyway.
+idle_timeout = "10m"
+
+[egress]
+# Default-deny. Vaultwarden is fully functional offline. The only
+# external calls it makes are optional:
+#   * gravatar.com  — fetching user avatar images
+#   * icons.bitwarden.net (or favicon hosts) — site favicons
+#   * push.bitwarden.com — mobile push relay (requires upstream
+#     credentials; off by default)
+# Uncomment what you want. Empty list is fine for "pure private use".
+allow = [
+    # "www.gravatar.com",
+    # "icons.bitwarden.net",
+]
+
+[env]
+# REQUIRED before first login: the admin token gates `/admin`.
+# Generate one with: openssl rand -base64 48
+# Keep it out of git — set via your CI's secret store, not inline.
+# ADMIN_TOKEN = "REPLACE_ME"
+
+# Public URL the server is reachable on (used in invite emails, push
+# notifications, etc.). Should match what your reverse proxy /
+# Tailscale serves.
+# DOMAIN = "https://vault.example.com"
+
+# After the first user is created, you'll almost certainly want
+# SIGNUPS_ALLOWED = "false" to lock the instance to existing accounts.
+# SIGNUPS_ALLOWED = "true"
+
+[readiness]
+# `/alive` returns 200 once Vaultwarden's HTTP handlers are wired up.
+# Without this, the TCP-only probe might let through the first
+# request before the database (sqlite) is migrated.
+path = "/alive"
+timeout = "30s"
+
+[resources]
+# Vaultwarden is light; 128 MiB is a comfortable ceiling for a few
+# dozen accounts. Bump to 256 MiB if you import a large vault or
+# enable Send (file uploads).
+memory = "128MiB"
+cpu = "0.5"
+
+[[volumes]]
+# Sqlite DB (`db.sqlite3`), attachments, icon cache, RSA keys, sends.
+# Everything important lives here — back it up out-of-band.
+name = "data"
+path = "/data"
+# The official image runs as the `vaultwarden` user (uid 1000) by
+# default. If you pull a fork that runs as root, set user = 0 (or
+# omit this line).
+user = 1000

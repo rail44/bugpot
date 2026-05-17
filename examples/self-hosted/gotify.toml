@@ -1,0 +1,62 @@
+# Gotify — self-hosted push notification server (Go + sqlite).
+#
+# Worth a deeper look as a bugpot demo because Gotify's clients
+# maintain a *long-lived WebSocket* for push delivery. That
+# exercises bugpot's active_upgrades guard: the idle reaper must
+# refuse to freeze the app while any client is still connected, or
+# every push subscriber would silently disconnect every idle_timeout.
+
+name = "gotify"
+
+repo = "docker.io/gotify/server"
+
+# Gotify's web + WebSocket port.
+port = 80
+
+[scaling]
+# Default-on apps (idle_timeout = "0") never freeze, period. That's
+# the safest choice when you actually want push to keep flowing.
+#
+# Most operators end up here for Gotify — a push server that
+# sometimes blinks out during the night defeats the purpose.
+idle_timeout = "0"
+
+# (If you do want freeze, the active_upgrades counter will defer it
+# while any subscriber is connected; flip to e.g. idle_timeout = "1h"
+# and verify with `bugpot apps get gotify` after disconnecting every
+# client.)
+
+[egress]
+# Gotify itself doesn't call out — it only accepts inbound
+# notifications from your apps + serves them via WebSocket. Empty
+# allowlist is correct.
+allow = []
+
+[env]
+# Override the default `admin / admin` on first boot. Rotate via
+# the web UI after login.
+# GOTIFY_DEFAULTUSER_NAME = "admin"
+# GOTIFY_DEFAULTUSER_PASS = "REPLACE_ME"
+
+# Match your public URL; affects links in notifications.
+# GOTIFY_SERVER_PUBLICURL = "https://push.example.com"
+
+[readiness]
+# Gotify's `/health` returns `{"health": "green"}` once handlers
+# are bound and the DB is open.
+path = "/health"
+timeout = "20s"
+
+[resources]
+# Go server, tiny. 64 MiB is plenty for a personal install with a
+# few hundred messages of history.
+memory = "64MiB"
+cpu = "0.25"
+
+[[volumes]]
+# Sqlite DB (users, applications, messages), config, uploaded
+# images for notifications. Back this up.
+name = "data"
+path = "/app/data"
+# Official image runs as root, so `user` is intentionally omitted.
+# If you switch to a non-root fork, set user = N here.
