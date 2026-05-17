@@ -117,6 +117,12 @@ smoke-multi:
 smoke-freeze:
     limactl shell bugpot -- sudo bash scripts/smoke-freeze.sh
 
+# Persistent volume end-to-end (~1 min wall-clock; one freeze cycle).
+# Verifies host dir creation, mount visibility in container,
+# sentinel persistence across freeze→resume, DELETE cleanup.
+smoke-volume:
+    limactl shell bugpot -- sudo bash scripts/smoke-volume.sh
+
 # Long-running interactive demo (foreground; Ctrl+C to stop).
 run:
     limactl shell bugpot -- sudo bash scripts/run-local.sh
