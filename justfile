@@ -112,6 +112,11 @@ smoke-app:
 smoke-multi:
     limactl shell bugpot -- sudo bash scripts/smoke-multi.sh
 
+# Freezer scale-to-zero end-to-end (~2 min wall-clock; sweep tick is
+# 30 s). Verifies idle → frozen → resume + reattach across restart.
+smoke-freeze:
+    limactl shell bugpot -- sudo bash scripts/smoke-freeze.sh
+
 # Long-running interactive demo (foreground; Ctrl+C to stop).
 run:
     limactl shell bugpot -- sudo bash scripts/run-local.sh
