@@ -334,6 +334,7 @@ dependencies = [
  "hyper-util",
  "ipnet",
  "metrics",
+ "thiserror 2.0.18",
  "tokio",
  "tower",
  "tower-http",
