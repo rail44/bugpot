@@ -136,9 +136,23 @@ impl Scaling {
     }
 }
 
-/// Per-app readiness probe tuning. Currently exposes the timeout for
-/// the post-start TCP probe; the poll interval stays a workspace
-/// constant.
+/// Per-app readiness probe tuning.
+///
+/// **`timeout`** caps how long the controller waits for the app to
+/// signal ready after a cold start; falls back to the workspace
+/// default when missing.
+///
+/// **`path`** opts the app into an HTTP-level probe instead of the
+/// default TCP-bind check. When set, `bugpot-controller` issues
+/// `GET <ip>:<port><path>` until it gets a 2xx response (or the
+/// timeout fires). When unset, the controller only waits for the
+/// container to accept TCP connections on `port`.
+///
+/// HTTP is opt-in rather than the default because the canonical
+/// `/healthz` is a Kubernetes idiom, not a self-hosted-tool one:
+/// Vaultwarden serves `/alive`, Linkding `/health`, Miniflux
+/// `/healthcheck`, Grafana `/api/health`, etc. Forcing a fixed path
+/// would break every pre-built image that picked a different name.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Readiness {
     /// How long to wait for the container to bind on its declared port
@@ -147,12 +161,17 @@ pub struct Readiness {
     /// etc.). Missing or empty → use the workspace default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<String>,
+    /// Absolute HTTP path the controller should GET to declare the app
+    /// ready. Must start with `/` and not contain `..`. When `None`
+    /// (the default) the controller falls back to TCP-only probing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 impl Readiness {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.timeout.is_none()
+        self.timeout.is_none() && self.path.is_none()
     }
 
     /// Resolve `timeout`, falling back to `default` when unset or empty.
@@ -288,8 +307,34 @@ impl AppSpec {
         validate_dns_label("subdomain", self.subdomain())?;
         validate_repo(&self.repo)?;
         validate_volumes(&self.volumes)?;
+        validate_readiness_path(self.readiness.path.as_deref())?;
         Ok(())
     }
+}
+
+/// `readiness.path` (when set) must be an absolute HTTP path with no
+/// traversal segments. Query strings or fragments are rejected: the
+/// probe path should be canonical and stable, not carry per-request
+/// state.
+fn validate_readiness_path(path: Option<&str>) -> Result<(), InvalidSpec> {
+    let Some(raw) = path else {
+        return Ok(());
+    };
+    let invalid = |reason: &'static str| InvalidSpec {
+        field: "readiness.path",
+        value: raw.to_owned(),
+        reason,
+    };
+    if !raw.starts_with('/') {
+        return Err(invalid("must start with '/'"));
+    }
+    if raw.split('/').any(|seg| seg == "..") {
+        return Err(invalid("must not contain '..' segments"));
+    }
+    if raw.contains('?') || raw.contains('#') {
+        return Err(invalid("must not contain query string or fragment"));
+    }
+    Ok(())
 }
 
 /// Reserved mount points: bugpot or libcontainer already binds something
@@ -861,6 +906,7 @@ mod tests {
     fn readiness_explicit_value_overrides_default() {
         let r = Readiness {
             timeout: Some("30s".into()),
+            path: None,
         };
         let got = r
             .resolve_timeout(std::time::Duration::from_secs(7))
@@ -872,6 +918,7 @@ mod tests {
     fn readiness_empty_string_uses_default() {
         let r = Readiness {
             timeout: Some(String::new()),
+            path: None,
         };
         let got = r
             .resolve_timeout(std::time::Duration::from_secs(7))
@@ -883,6 +930,7 @@ mod tests {
     fn readiness_rejects_garbage() {
         let r = Readiness {
             timeout: Some("not-a-duration".into()),
+            path: None,
         };
         assert!(
             r.resolve_timeout(std::time::Duration::from_secs(7))
@@ -1139,5 +1187,68 @@ port = 80
         ];
         let err = spec.validate().expect_err("dup path must fail");
         assert_eq!(err.field, "volumes.path");
+    }
+
+    #[test]
+    fn readiness_path_parses() {
+        let spec: AppSpec = toml::from_str(
+            r#"
+            repo = "x"
+            port = 80
+            name = "alpha"
+
+            [readiness]
+            path = "/health"
+            timeout = "30s"
+            "#,
+        )
+        .expect("parse");
+        spec.validate().expect("validate");
+        assert_eq!(spec.readiness.path.as_deref(), Some("/health"));
+    }
+
+    #[test]
+    fn readiness_path_rejects_relative() {
+        let mut spec: AppSpec = toml::from_str(
+            r#"
+            repo = "x"
+            port = 80
+            name = "alpha"
+            "#,
+        )
+        .unwrap();
+        spec.readiness.path = Some("health".into());
+        let err = spec.validate().expect_err("relative must fail");
+        assert_eq!(err.field, "readiness.path");
+    }
+
+    #[test]
+    fn readiness_path_rejects_traversal() {
+        let mut spec: AppSpec = toml::from_str(
+            r#"
+            repo = "x"
+            port = 80
+            name = "alpha"
+            "#,
+        )
+        .unwrap();
+        spec.readiness.path = Some("/foo/../etc/passwd".into());
+        let err = spec.validate().expect_err("traversal must fail");
+        assert_eq!(err.field, "readiness.path");
+    }
+
+    #[test]
+    fn readiness_path_rejects_query_string() {
+        let mut spec: AppSpec = toml::from_str(
+            r#"
+            repo = "x"
+            port = 80
+            name = "alpha"
+            "#,
+        )
+        .unwrap();
+        spec.readiness.path = Some("/health?token=x".into());
+        let err = spec.validate().expect_err("query string must fail");
+        assert_eq!(err.field, "readiness.path");
     }
 }
