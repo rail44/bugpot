@@ -22,8 +22,13 @@ WORKDIR=$(pwd)
 
 LISTEN=127.0.0.1:8080
 ADMIN_LISTEN=127.0.0.1:8081
-IMAGE_REPO="gcr.io/google-samples/hello-app"
-IMAGE_TAG="1.0"
+# nginx (not the gcr.io hello-app) is the right test fixture here:
+# hello-app responds 200 to *every* path, so a bogus `/no-such-path`
+# probe path would silently pass and the failure-mode half of this
+# test would be unable to fire. nginx returns 404 for unknown paths
+# out of the box, which lets us prove the non-2xx → unready path.
+IMAGE_REPO="docker.io/library/nginx"
+IMAGE_TAG="alpine"
 ADMIN_TOKEN="smoke-only-do-not-deploy"
 READINESS_TIMEOUT="5s"
 
@@ -73,7 +78,7 @@ trap cleanup EXIT INT TERM
 
 cat >"$APPS_DIR/good.toml" <<EOF
 repo = "$IMAGE_REPO"
-port = 8080
+port = 80
 subdomain = "good"
 [readiness]
 path = "/"
@@ -85,7 +90,7 @@ EOF
 
 cat >"$APPS_DIR/bad.toml" <<EOF
 repo = "$IMAGE_REPO"
-port = 8080
+port = 80
 subdomain = "bad"
 [readiness]
 path = "/no-such-path"
