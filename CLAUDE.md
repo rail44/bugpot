@@ -254,7 +254,7 @@ cmd/bugpot (CLI; pure-Rust, also builds on macOS — talks to bugpotd's admin AP
 1. Router receives HTTP, extracts first DNS label of `Host` (see `subdomain_of` in `bugpot-router`).
 2. Calls `UpstreamResolver::resolve` — the controller's impl, which **may take seconds** (cold start).
 3. Controller's `AppHandle` state machine (`Stopped → Starting → Running → Stopping`) gates work: concurrent starts on the same app coalesce on a per-handle `Notify`.
-4. On cold start: `Egress::allocate_endpoint` (netns + veth + IP + DNS registry) → `Runtime::pull_image` → `Runtime::start_app` (passes the netns path to libcontainer) → TCP readiness probe on the app's declared port.
+4. On cold start: `Egress::allocate_endpoint` (netns + veth + IP + DNS registry) → `Runtime::pull_image` → `Runtime::start_app` (passes the netns path to libcontainer) → readiness probe on the app's declared port (TCP-bind by default; HTTP GET when `[readiness] path` is set — see below).
 5. Router proxies via `hyper_util` legacy client; HTTP/1.1 Upgrade (e.g. WebSocket) is spliced bidirectionally.
 
 ### Router defences
@@ -290,6 +290,23 @@ A user namespace was investigated and **deferred**: libcontainer creates the use
 `scaling.idle_timeout` in app TOML: `"0"` / `""` / missing → always-on (eagerly started at bring-up, never frozen); `"30s"` / `"5m"` / `"2h"` → freezer kicks in once `last_access` is older than the timeout. Default 5m. The state-transition logic lives in `crates/bugpot-controller`.
 
 **Freeze vs stop.** The default scale-to-zero path is **freeze, not stop** (cgroup v2 freezer). Frozen apps keep their full RSS resident but consume zero CPU; the next request resumes in sub-ms (no image pull, no libcontainer fork, no TCP readiness probe). The trade-off — RAM stays allocated — is bounded by a memory-pressure handler that polls `MemAvailable` and evicts oldest-frozen apps to `Stopped` when memory drops below `BUGPOT_FREEZE_MEM_LO`. This shifts the bottleneck from "cold-start CPU spike on every long-idle hit" to "RAM in steady state", which is what's wanted for the "many small self-hosted apps on a cheap VM" use case (Vaultwarden / Grafana / Linkding-class). Set `BUGPOT_FREEZE_ENABLED=false` to restore the pre-freeze idle = stop behavior. The router's `forward_upgrade` increments `AppHandle::active_upgrades` for the lifetime of every WebSocket / SSE splice, and the idle reaper refuses to freeze while that counter is non-zero — so long-lived upgraded connections survive idle gaps without being silently stranded.
+
+### Readiness probe
+
+`bugpot-controller` waits for the app to signal ready after starting the container; the cold-start path doesn't return success (and the router doesn't forward the first request) until the probe passes. Two modes, selected per-app in TOML:
+
+```toml
+[readiness]
+timeout = "30s"      # optional; how long to wait before giving up (workspace default if missing)
+path = "/health"     # optional; opt into HTTP probing
+```
+
+- **TCP-bind (default, `path` unset):** the probe is a `TcpStream::connect` against `(container_ip, port)`. Sufficient for plain-TCP apps and for HTTP apps whose handlers come up the moment they bind.
+- **HTTP (`path` set):** the controller sends `GET <path>` and waits for a 2xx status. This catches the common Rails / Django startup pattern where the listener binds early but the app responds 500 until its DB pool is connected, which the TCP-only probe lets slip through.
+
+`path` is opt-in rather than a fixed default like `/healthz` because the self-hosted-tool ecosystem hasn't standardised: Vaultwarden serves `/alive`, Linkding `/health`, Miniflux `/healthcheck`, Grafana `/api/health`, Mastodon `/health`, Nextcloud `/status.php`. Forcing a single name would break most pre-built images. Operators pick the right path per app.
+
+The HTTP probe is implemented inline (raw `TcpStream` + a 200-byte read of the response head) rather than via a hyper or reqwest client to keep `bugpot-controller`'s dep graph stable — a single `GET` with `Connection: close` is the smallest possible HTTP/1.1 exchange and the parser only needs the status code.
 
 ### Persistent volumes
 
