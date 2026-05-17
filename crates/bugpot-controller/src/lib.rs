@@ -12,251 +12,61 @@
 //! crates (HTTP admin, future webhook / poller / CLI frontends) can mutate
 //! it at runtime via [`AppController::deploy_app`] / [`AppController::remove_app`].
 //! Per-app `Mutex`-protected state machines coalesce concurrent starts.
+//!
+//! Note: `pub(crate)` is used for cross-module items inside this crate;
+//! the `clippy::redundant_pub_crate` warning conflicts with the workspace's
+//! `unreachable_pub` rule, so the former is allowed crate-wide (same
+//! convention as `bugpot-runtime`).
 
-use std::collections::{HashMap, VecDeque};
+#![allow(clippy::redundant_pub_crate)]
+
+#[cfg(test)]
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use bugpot_config::{AppIdentity, AppSpec, AuthConfig, RegistryCredential, Rollout, registry_host};
+use bugpot_config::{AppSpec, AuthConfig, RegistryCredential, Rollout, registry_host};
 use bugpot_egress::EgressOps;
 use bugpot_router::{ResolveError, Upstream, UpstreamResolver, subdomain_of};
-use bugpot_runtime::{Auth, ResourceUsage, RuntimeError, RuntimeOps};
+#[cfg(test)]
+use bugpot_runtime::RuntimeError;
+use bugpot_runtime::{Auth, RuntimeOps};
 use metrics::{counter, gauge, histogram};
-use serde::Serialize;
-use thiserror::Error;
-use tokio::net::TcpStream;
-use tokio::sync::{Mutex, Notify, RwLock};
+use tokio::sync::{Notify, RwLock};
 use tracing::{debug, error, info, warn};
 
-/// Errors surfaced by the public mutation API. Adapter crates map these
-/// to their transport-specific failure shapes (HTTP status codes, etc).
-#[derive(Debug, Error)]
-pub enum DeployError {
-    #[error("spec.name is required for deploy")]
-    MissingName,
-    #[error("invalid spec: {0}")]
-    InvalidSpec(#[from] bugpot_config::InvalidSpec),
-    #[error("app '{0}' already exists")]
-    AlreadyExists(String),
-    #[error("subdomain '{0}' already in use")]
-    SubdomainTaken(String),
-    /// The registry rejected bugpot's credentials (or the image
-    /// requires credentials and none were configured). Distinct from
-    /// the general `ImagePull` so operators can grep audit logs for
-    /// auth-side failures specifically — the message conveys
-    /// "fix bugpot's auth.toml" rather than "retry later".
-    #[error("registry authentication failed: {0:#}")]
-    ImageAuth(#[source] anyhow::Error),
-    #[error("image pull failed: {0:#}")]
-    ImagePull(#[source] anyhow::Error),
-    #[error("eager start failed: {0:#}")]
-    StartFailed(#[source] anyhow::Error),
-    #[error(transparent)]
-    Internal(#[from] anyhow::Error),
-}
+mod error;
+use error::classify_pull_error_for_rollout;
+pub use error::{DeployError, RemoveError, RolloutError, UpdateError};
 
-#[derive(Debug, Error)]
-pub enum RemoveError {
-    #[error("app '{0}' not found")]
-    NotFound(String),
-    #[error(transparent)]
-    Internal(#[from] anyhow::Error),
-}
+mod probe;
+use probe::wait_for_ready;
 
-/// Errors specific to the rollout plane (image-tag updates that do not
-/// touch app config). Adapter crates map these to HTTP status codes.
-#[derive(Debug, Error)]
-pub enum RolloutError {
-    #[error("app '{0}' not found")]
-    NotFound(String),
-    #[error("rollout tag must not be empty")]
-    EmptyTag,
-    #[error("registry authentication failed: {0:#}")]
-    ImageAuth(#[source] anyhow::Error),
-    #[error("image pull failed: {0:#}")]
-    ImagePull(#[source] anyhow::Error),
-    /// App is mid-transition (Starting / Stopping); the caller should
-    /// retry once the state settles.
-    #[error("app '{0}' is currently transitioning state; retry")]
-    Conflict(String),
-    /// Pull + persist succeeded but the cold start (or re-start)
-    /// driven by the rollout failed. The rollout history still
-    /// contains the new entry; operators can roll back to a previous
-    /// tag.
-    #[error("rollout started but app failed to come up: {0:#}")]
-    StartFailed(#[source] anyhow::Error),
-    #[error(transparent)]
-    Internal(#[from] anyhow::Error),
-}
+mod mempressure;
+use mempressure::read_mem_available;
 
-/// Errors specific to the config plane's `PATCH /apps/<name>` path.
-/// Adapter crates map these to HTTP status codes.
-#[derive(Debug, Error)]
-pub enum UpdateError {
-    #[error("app '{0}' not found")]
-    NotFound(String),
-    #[error("invalid spec: {0}")]
-    InvalidSpec(#[from] bugpot_config::InvalidSpec),
-    /// The caller attempted to change `name` (identity). Rename =
-    /// delete + recreate; PATCH does not perform it.
-    #[error("name is immutable; delete + recreate to rename")]
-    NameImmutable,
-    /// Same constraint as `name`. Routing identity is fixed for the
-    /// life of an app.
-    #[error("subdomain is immutable; delete + recreate to change")]
-    SubdomainImmutable,
-    /// App is mid-transition (Starting / Stopping); the caller should
-    /// retry once the state settles.
-    #[error("app '{0}' is currently transitioning state; retry")]
-    Conflict(String),
-    /// PATCH succeeded at the config-store level but the post-update
-    /// restart (stop + start) of a running container failed. The new
-    /// config has already been persisted.
-    #[error("config updated but app failed to restart: {0:#}")]
-    RestartFailed(#[source] anyhow::Error),
-    #[error(transparent)]
-    Internal(#[from] anyhow::Error),
-}
+mod handle;
+use handle::{
+    AppHandle, AppMaps, AppState, MAX_ROLLOUT_HISTORY, make_handle, make_handle_with_rollouts,
+};
+
+mod view;
+pub use view::{AppStateView, AppView};
+use view::{emit_resource_metrics, view_of};
+
+mod persist;
+use persist::{RolloutsFile, load_persisted_state};
 
 /// How long to wait for an app to start accepting TCP connections on its
 /// declared port after libcontainer reports the container is running.
 /// Default readiness timeout when an app does not override
 /// `readiness.timeout` in its TOML.
 const READINESS_TIMEOUT_DEFAULT: Duration = Duration::from_secs(10);
-const READINESS_POLL: Duration = Duration::from_millis(100);
-
-/// Cap on the per-app rollout history retained in memory + on disk.
-/// Older rollouts are dropped (popped from the front of the deque) as
-/// new ones land. Two = live rollout + one immediate-rollback target,
-/// which matches the realistic recovery window for an internal-tool
-/// deployment cadence and keeps stale image references from defeating
-/// the image GC on cheap-VM hosts.
-const MAX_ROLLOUT_HISTORY: usize = 2;
-
-#[derive(Debug)]
-struct AppHandle {
-    /// Immutable identity (name + subdomain). Set once at construction
-    /// from the validating `AppSpec::identity`, never updated — a
-    /// future PUT-style update path will compare against this and
-    /// reject mismatches rather than mutating it. `name` is the primary
-    /// key in `AppMaps.by_name`; `subdomain` is the reverse-lookup key
-    /// used by `UpstreamResolver::resolve`.
-    identity: AppIdentity,
-    /// Mutable spec fields (image, port, env, etc.). Wrapped in
-    /// `RwLock` so future PUT-style updates can mutate in place
-    /// without rebuilding the handle. The spec's own `name` /
-    /// `subdomain` fields exist for TOML / JSON serialisation shape
-    /// only — `identity` is the authoritative pair.
-    spec: RwLock<AppSpec>,
-    /// Resolved image digest from the first successful pull. Pinning
-    /// at the handle level means subsequent cold-starts for this app
-    /// skip the `manifest_probe` round-trip (~1s on a remote registry)
-    /// and go straight to the cache-hit path inside `Puller::pull`.
-    ///
-    /// Invalidation is **deterministic** by construction:
-    ///
-    /// - `DELETE /apps/<name>` followed by `POST /apps` drops the
-    ///   handle entirely; the replacement starts at `None`.
-    /// - A bugpot process restart drops the in-memory map; the next
-    ///   start of each app re-probes once.
-    ///
-    /// Mutable tags (`:latest` etc.) therefore behave the same way
-    /// Kubernetes' `imagePullPolicy: IfNotPresent` does — an
-    /// operator-side redeploy is required to pick up an upstream
-    /// retag. No TTL.
-    image_digest: Mutex<Option<bugpot_runtime::ImageId>>,
-    /// Bounded rollout history. The back of the deque is the current
-    /// rollout (the tag bugpot pulls and runs). Empty = the app is
-    /// registered but not yet deployed, in which case
-    /// `ensure_running` will fail and the router returns 404.
-    rollouts: Mutex<VecDeque<Rollout>>,
-    /// Per-app counter of HTTP/1.1 upgrades (WebSocket / SSE) currently
-    /// spliced through the router. Incremented by the router on splice
-    /// spawn, decremented when the splice task exits. The idle reaper
-    /// reads this **without taking `inner`'s lock** to decide whether
-    /// to freeze: freezing an app mid-WebSocket would silently strand
-    /// the connection, since the kernel keeps the listen socket up but
-    /// the user-space process can't process frames.
-    active_upgrades: Arc<AtomicUsize>,
-    inner: Mutex<HandleInner>,
-}
-
-#[derive(Debug)]
-struct HandleInner {
-    state: AppState,
-    last_access: Instant,
-    /// Last-seen cgroup `cpu_usec` for the running container, used to
-    /// compute deltas for the `bugpot_app_cpu_microseconds_total`
-    /// counter across sweeps. Lifetime matches the handle's running
-    /// lifetime (only valid while `state` is `Running`); resetting it
-    /// on stop keeps the next run starting from zero, which Prometheus
-    /// `rate()` tolerates as a reset.
-    cpu_baseline: u64,
-}
-
-#[derive(Debug, Clone)]
-enum AppState {
-    Stopped,
-    /// A concurrent start is in flight. Waiters subscribe on the inner
-    /// `Notify`. The `Arc` lives only while the state machine is in
-    /// this variant; transitioning away drops it (held clones held by
-    /// waiters keep the channel alive long enough to receive the wake).
-    Starting {
-        notify: Arc<Notify>,
-    },
-    Running {
-        container_ip: Ipv4Addr,
-    },
-    /// Container is suspended via cgroup freezer; netns + listen
-    /// socket are still alive. The `container_ip` is reused on resume —
-    /// no endpoint re-allocation needed. `ensure_running` transitions
-    /// Frozen → Starting → Running by unfreezing.
-    Frozen {
-        container_ip: Ipv4Addr,
-    },
-    Stopping,
-}
-
-/// Public, serialisable snapshot of an app's registration.
-#[derive(Debug, Clone, Serialize)]
-pub struct AppView {
-    pub name: String,
-    pub subdomain: String,
-    pub repo: String,
-    pub port: u16,
-    pub state: AppStateView,
-    /// `None` when the app has never been rolled out (registered only).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub current_rollout: Option<Rollout>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AppStateView {
-    Stopped,
-    Starting,
-    Running,
-    /// Container is paused (cgroup freezer). RAM resident, CPU 0.
-    /// Next request resumes it in sub-ms (no cold start).
-    Frozen,
-    Stopping,
-}
-
-/// Both registration maps under a single lock so insert / remove are
-/// atomic across the (name, subdomain) pair. Name is the primary key
-/// (used by `get_app` / `remove_app` / `cleanup`); subdomain is a
-/// reverse index used by `UpstreamResolver::resolve` to route HTTP
-/// requests in O(1).
-#[derive(Debug, Default)]
-struct AppMaps {
-    by_name: HashMap<String, Arc<AppHandle>>,
-    by_subdomain: HashMap<String, String>,
-}
 
 /// Per-app lifecycle controller.
 ///
@@ -1351,96 +1161,6 @@ async fn discard_failed_toml(path: &Path) {
     }
 }
 
-/// Construct a handle from a validated spec. Returns `Err` if
-/// `spec.identity()` fails (the spec's name / subdomain weren't valid
-/// DNS labels). Callers in the deploy path are expected to have run
-/// `spec.validate()` earlier; this is the belt-and-braces version.
-fn make_handle(
-    spec: AppSpec,
-    initial_rollout: Option<Rollout>,
-) -> Result<Arc<AppHandle>, bugpot_config::InvalidSpec> {
-    let mut rollouts = VecDeque::with_capacity(MAX_ROLLOUT_HISTORY);
-    if let Some(r) = initial_rollout {
-        rollouts.push_back(r);
-    }
-    make_handle_with_rollouts(spec, rollouts)
-}
-
-/// Build a handle from a spec + a pre-populated rollout history.
-/// Used by the rehydrate-from-disk path; preserves the order callers
-/// (and the on-disk file) maintain — back of the queue = current
-/// rollout.
-fn make_handle_with_rollouts(
-    spec: AppSpec,
-    rollouts: VecDeque<Rollout>,
-) -> Result<Arc<AppHandle>, bugpot_config::InvalidSpec> {
-    let identity = spec.identity()?;
-    Ok(Arc::new(AppHandle {
-        identity,
-        spec: RwLock::new(spec),
-        image_digest: Mutex::new(None),
-        rollouts: Mutex::new(rollouts),
-        active_upgrades: Arc::new(AtomicUsize::new(0)),
-        inner: Mutex::new(HandleInner {
-            state: AppState::Stopped,
-            last_access: Instant::now(),
-            cpu_baseline: 0,
-        }),
-    }))
-}
-
-/// On-disk shape of the rollouts file. Wrapped in a top-level table
-/// so it can grow extra fields later without breaking the format.
-#[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
-struct RolloutsFile {
-    #[serde(default, rename = "rollout", skip_serializing_if = "Vec::is_empty")]
-    rollouts: Vec<Rollout>,
-}
-
-/// Walk the spec and rollouts state directories, returning one
-/// `(spec, rollouts)` pair per registered app. Specs that fail
-/// validation surface as an error — corrupted bugpot state should
-/// stop the daemon coming up, not silently drop an app.
-fn load_persisted_state(
-    specs_dir: &Path,
-    rollouts_dir: &Path,
-) -> Result<Vec<(AppSpec, VecDeque<Rollout>)>> {
-    let mut out = Vec::new();
-    let entries =
-        std::fs::read_dir(specs_dir).with_context(|| format!("read {}", specs_dir.display()))?;
-    for entry in entries {
-        let entry = entry.with_context(|| format!("read {}", specs_dir.display()))?;
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("toml") {
-            continue;
-        }
-        let body =
-            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        let mut spec: AppSpec =
-            toml::from_str(&body).with_context(|| format!("parse {}", path.display()))?;
-        spec.source_path.clone_from(&path);
-        spec.validate()
-            .with_context(|| format!("validate {}", path.display()))?;
-        let name = spec.name().to_owned();
-        let rollouts = read_rollouts_file(rollouts_dir, &name)?;
-        out.push((spec, rollouts));
-    }
-    out.sort_by(|a, b| a.0.name().cmp(b.0.name()));
-    Ok(out)
-}
-
-fn read_rollouts_file(rollouts_dir: &Path, name: &str) -> Result<VecDeque<Rollout>> {
-    let path = rollouts_dir.join(format!("{name}.toml"));
-    if !path.exists() {
-        return Ok(VecDeque::new());
-    }
-    let body =
-        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    let parsed: RolloutsFile =
-        toml::from_str(&body).with_context(|| format!("parse {}", path.display()))?;
-    Ok(parsed.rollouts.into_iter().collect())
-}
-
 /// If `digest` is `Some`, return an OCI reference pinned to that
 /// digest so a subsequent pull skips the registry-side
 /// `manifest_probe`. Returns the original reference unchanged when
@@ -1451,42 +1171,6 @@ fn digest_pinned_ref(image: &str, digest: Option<&bugpot_runtime::ImageId>) -> S
     match digest {
         Some(d) if !image.contains('@') => format!("{image}@{d}", d = d.as_str()),
         _ => image.to_owned(),
-    }
-}
-
-/// Classify a `pull_image` failure into the rollout-level error
-/// variant. Auth-side failures (registry rejected bugpot's
-/// credentials, or none were configured for a private image) become
-/// [`RolloutError::ImageAuth`]; everything else (network, manifest
-/// parsing, missing image) stays in the generic
-/// [`RolloutError::ImagePull`].
-fn classify_pull_error_for_rollout(err: RuntimeError, name: &str, image_ref: &str) -> RolloutError {
-    let is_auth = err.is_registry_auth_error();
-    let context = anyhow::Error::from(err).context(format!("pull {image_ref} for {name}"));
-    if is_auth {
-        RolloutError::ImageAuth(context)
-    } else {
-        RolloutError::ImagePull(context)
-    }
-}
-
-async fn view_of(handle: &Arc<AppHandle>) -> AppView {
-    let state = match &handle.inner.lock().await.state {
-        AppState::Stopped => AppStateView::Stopped,
-        AppState::Starting { .. } => AppStateView::Starting,
-        AppState::Running { .. } => AppStateView::Running,
-        AppState::Frozen { .. } => AppStateView::Frozen,
-        AppState::Stopping => AppStateView::Stopping,
-    };
-    let spec = handle.spec.read().await;
-    let current_rollout = handle.rollouts.lock().await.back().cloned();
-    AppView {
-        name: handle.identity.name.clone(),
-        subdomain: handle.identity.subdomain.clone(),
-        repo: spec.repo.clone(),
-        port: spec.port,
-        state,
-        current_rollout,
     }
 }
 
@@ -1520,157 +1204,6 @@ impl<R: RuntimeOps, E: EgressOps> UpstreamResolver for AppController<R, E> {
             }
         }
     }
-}
-
-/// Emit `bugpot_app_memory_bytes` (gauge) and
-/// `bugpot_app_cpu_microseconds_total` (counter) from a fresh cgroup
-/// sample. The CPU delta is computed against the per-handle baseline
-/// stored in `HandleInner.cpu_baseline`, which is updated in place.
-///
-/// CPU is exposed in microseconds (cgroup-v2's native unit) so the
-/// counter keeps full precision. Operators querying via Prometheus
-/// divide by 1e6: `rate(bugpot_app_cpu_microseconds_total[5m]) / 1000000`.
-async fn emit_resource_metrics(handle: &Arc<AppHandle>, usage: ResourceUsage) {
-    #[allow(clippy::cast_precision_loss)]
-    gauge!("bugpot_app_memory_bytes", "app" => handle.identity.name.clone())
-        .set(usage.memory_bytes as f64);
-
-    let mut inner = handle.inner.lock().await;
-    let last = inner.cpu_baseline;
-    inner.cpu_baseline = usage.cpu_usec;
-    drop(inner);
-
-    // A container restart resets the cgroup counter under us; treat
-    // any backwards step as a 0-baseline and increment by the new
-    // absolute value. Prometheus `rate()` tolerates the apparent
-    // reset.
-    let delta_usec = if usage.cpu_usec >= last {
-        usage.cpu_usec - last
-    } else {
-        usage.cpu_usec
-    };
-    if delta_usec > 0 {
-        counter!("bugpot_app_cpu_microseconds_total", "app" => handle.identity.name.clone())
-            .increment(delta_usec);
-    }
-}
-
-/// Parse `MemAvailable` (in bytes) from `/proc/meminfo`. Returns
-/// `None` if the file can't be read or the field is missing — callers
-/// should skip the tick rather than treat an absent reading as
-/// "no pressure". Linux-only path; on a non-Linux dev host this
-/// returns `None` and the memory pressure loop is a no-op.
-fn read_mem_available() -> Option<u64> {
-    let raw = std::fs::read_to_string("/proc/meminfo").ok()?;
-    parse_mem_available(&raw)
-}
-
-fn parse_mem_available(meminfo: &str) -> Option<u64> {
-    for line in meminfo.lines() {
-        if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            // `MemAvailable:   123456 kB` — split on whitespace, take
-            // the number, multiply by 1024.
-            let kb: u64 = rest
-                .split_whitespace()
-                .next()
-                .and_then(|s| s.parse().ok())?;
-            return Some(kb * 1024);
-        }
-    }
-    None
-}
-
-/// Poll the container's port until it's ready, on the cadence of
-/// `READINESS_POLL` and up to `timeout`.
-///
-/// When `path` is `None`, "ready" = a successful `TcpStream::connect`
-/// — sufficient for plain-TCP apps and the cheap path for HTTP apps
-/// whose handlers come up the moment they bind. When `path` is
-/// `Some(p)`, "ready" = the upstream replies to `GET p` with a 2xx
-/// status; this catches the common Rails / Django startup pattern
-/// where the listener binds early but the app responds 500 until
-/// its DB pool is connected.
-async fn wait_for_ready(addr: SocketAddr, path: Option<&str>, timeout: Duration) -> Result<()> {
-    let deadline = Instant::now() + timeout;
-    let mut last_err: Option<anyhow::Error> = None;
-    while Instant::now() < deadline {
-        let attempt = match path {
-            None => tcp_probe(addr).await,
-            Some(p) => http_probe(addr, p).await,
-        };
-        match attempt {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                last_err = Some(e);
-                tokio::time::sleep(READINESS_POLL).await;
-            }
-        }
-    }
-    let kind = path.map_or("TCP", |_| "HTTP");
-    Err(anyhow!(
-        "{kind} readiness probe of {addr} timed out after {timeout:?}: {last_err:?}"
-    ))
-}
-
-async fn tcp_probe(addr: SocketAddr) -> Result<()> {
-    TcpStream::connect(addr)
-        .await
-        .map(|_| ())
-        .map_err(anyhow::Error::from)
-}
-
-/// One-shot HTTP/1.1 GET probe. Returns `Ok(())` on 2xx, `Err` on
-/// connect failure / write failure / non-2xx status. Written by hand
-/// rather than pulled in via hyper to keep `bugpot-controller`'s
-/// dependency graph stable — a single GET with `Connection: close`
-/// is the minimal HTTP exchange that any compliant server will
-/// answer, so the parser stays tiny.
-async fn http_probe(addr: SocketAddr, path: &str) -> Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let mut stream = TcpStream::connect(addr).await?;
-    // `Host` carries the literal upstream address — bugpot's apps
-    // bind a single virtual host inside their netns, so the value
-    // doesn't matter for routing, only for HTTP/1.1 compliance.
-    let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nUser-Agent: bugpot-readiness\r\nConnection: close\r\nAccept: */*\r\n\r\n",
-    );
-    stream.write_all(request.as_bytes()).await?;
-    stream.flush().await?;
-
-    // We only need the status line. 256 bytes is enough for any
-    // reasonable HTTP/1.1 status line + the start of the headers,
-    // and capping the read keeps a wedged upstream from streaming
-    // megabytes into our probe.
-    let mut buf = [0u8; 256];
-    let n = stream.read(&mut buf).await?;
-    if n == 0 {
-        return Err(anyhow!("upstream closed before sending any bytes"));
-    }
-    let head = std::str::from_utf8(&buf[..n])
-        .map_err(|e| anyhow!("non-UTF-8 in HTTP status line: {e}"))?;
-    let status = parse_http_status_code(head)
-        .ok_or_else(|| anyhow!("could not parse HTTP status from {head:?}"))?;
-    if (200..300).contains(&status) {
-        Ok(())
-    } else {
-        Err(anyhow!("upstream returned HTTP {status} on {path}"))
-    }
-}
-
-/// Extract the integer status code from an HTTP/1.x response head.
-/// Returns `None` if the first line doesn't look like
-/// `HTTP/<version> <code> <reason>`.
-fn parse_http_status_code(head: &str) -> Option<u16> {
-    let first_line = head.split("\r\n").next()?;
-    let mut parts = first_line.split(' ');
-    // Skip "HTTP/1.1" or similar.
-    let version = parts.next()?;
-    if !version.starts_with("HTTP/") {
-        return None;
-    }
-    let code = parts.next()?;
-    code.parse().ok()
 }
 
 #[cfg(test)]
@@ -1893,24 +1426,6 @@ mod tests {
             digest_pinned_ref("gcr.io/x/y", Some(&digest)),
             "gcr.io/x/y@sha256:abc123"
         );
-    }
-
-    #[test]
-    fn parse_mem_available_finds_value_and_converts_kb_to_bytes() {
-        let sample = "MemTotal:        1014820 kB\nMemFree:          123456 kB\nMemAvailable:     200000 kB\nBuffers:           12345 kB\n";
-        assert_eq!(parse_mem_available(sample), Some(200_000 * 1024));
-    }
-
-    #[test]
-    fn parse_mem_available_returns_none_when_field_missing() {
-        let sample = "MemTotal: 1024 kB\nMemFree: 512 kB\n";
-        assert!(parse_mem_available(sample).is_none());
-    }
-
-    #[test]
-    fn parse_mem_available_tolerates_extra_whitespace() {
-        let sample = "MemAvailable:\t  500 kB\n";
-        assert_eq!(parse_mem_available(sample), Some(500 * 1024));
     }
 
     #[test]
@@ -2619,64 +2134,6 @@ mod tests {
             matches!(beta_state, AppState::Frozen { .. }),
             "newer beta should stay frozen, got {beta_state:?}"
         );
-    }
-
-    #[test]
-    fn parse_http_status_code_handles_typical_responses() {
-        assert_eq!(parse_http_status_code("HTTP/1.1 200 OK\r\n"), Some(200));
-        assert_eq!(
-            parse_http_status_code("HTTP/1.0 503 Service Unavailable\r\nServer: x\r\n"),
-            Some(503),
-        );
-        // Tolerant of HTTP/2 framing should it ever land here (would
-        // require a downstream that speaks h2 on the same socket — not
-        // bugpot's case today, but cheap to handle).
-        assert_eq!(
-            parse_http_status_code("HTTP/2 204 No Content\r\n"),
-            Some(204)
-        );
-    }
-
-    #[test]
-    fn parse_http_status_code_rejects_garbage() {
-        assert!(parse_http_status_code("").is_none());
-        assert!(parse_http_status_code("hello world").is_none());
-        assert!(parse_http_status_code("HTTP/1.1\r\n").is_none());
-        assert!(parse_http_status_code("HTTP/1.1 oops OK\r\n").is_none());
-    }
-
-    /// End-to-end smoke for `http_probe`: spin up a tiny in-process
-    /// listener that hand-rolls one response per connection, then
-    /// confirm `http_probe` distinguishes 2xx from non-2xx.
-    #[tokio::test]
-    async fn http_probe_accepts_2xx_rejects_5xx() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpListener;
-
-        async fn run_once(response: &'static str) -> std::result::Result<(), anyhow::Error> {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            let server = tokio::spawn(async move {
-                let (mut sock, _) = listener.accept().await.unwrap();
-                // Drain the request enough that the client's `write_all`
-                // completes; don't bother parsing.
-                let mut buf = [0u8; 512];
-                let _ = sock.read(&mut buf).await;
-                sock.write_all(response.as_bytes()).await.unwrap();
-                sock.shutdown().await.ok();
-            });
-            let res = http_probe(addr, "/health").await;
-            server.await.unwrap();
-            res
-        }
-
-        run_once("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-            .await
-            .expect("2xx must be ready");
-        let err = run_once("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
-            .await
-            .expect_err("5xx must not be ready");
-        assert!(err.to_string().contains("503"), "got {err}");
     }
 
     /// `DELETE /apps/<name>` (which lands in `remove_app`) must also
