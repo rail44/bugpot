@@ -24,7 +24,7 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use bugpot_config::{AppIdentity, AppSpec, AuthConfig, RegistryCredential, Rollout, registry_host};
 use bugpot_egress::EgressOps;
-use bugpot_router::{Upstream, UpstreamResolver, subdomain_of};
+use bugpot_router::{ResolveError, Upstream, UpstreamResolver, subdomain_of};
 use bugpot_runtime::{Auth, ResourceUsage, RuntimeError, RuntimeOps};
 use metrics::{counter, gauge, histogram};
 use serde::Serialize;
@@ -1492,22 +1492,31 @@ async fn view_of(handle: &Arc<AppHandle>) -> AppView {
 
 #[async_trait]
 impl<R: RuntimeOps, E: EgressOps> UpstreamResolver for AppController<R, E> {
-    async fn resolve(&self, host: &str) -> Option<Upstream> {
-        let subdomain = subdomain_of(host)?;
+    async fn resolve(&self, host: &str) -> Result<Upstream, ResolveError> {
+        let subdomain = subdomain_of(host).ok_or(ResolveError::NoSuchApp)?;
         let handle = {
             let maps = self.apps.read().await;
-            let name = maps.by_subdomain.get(subdomain)?;
-            maps.by_name.get(name)?.clone()
+            let name = maps
+                .by_subdomain
+                .get(subdomain)
+                .ok_or(ResolveError::NoSuchApp)?;
+            let handle = maps
+                .by_name
+                .get(name)
+                .ok_or(ResolveError::NoSuchApp)?
+                .clone();
+            drop(maps);
+            handle
         };
         let port = handle.spec.read().await.port;
         match self.ensure_running(&handle).await {
-            Ok(ip) => Some(Upstream::with_active_upgrades(
+            Ok(ip) => Ok(Upstream::with_active_upgrades(
                 SocketAddr::from((ip, port)),
                 handle.active_upgrades.clone(),
             )),
             Err(e) => {
                 error!(host, error = ?e, "ensure_running failed");
-                None
+                Err(ResolveError::Unhealthy(e))
             }
         }
     }

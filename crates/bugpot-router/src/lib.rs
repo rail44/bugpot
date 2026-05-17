@@ -210,6 +210,29 @@ impl Upstream {
     }
 }
 
+/// Why a host couldn't be resolved to a live upstream. Distinguishes
+/// the two operator-visible failure modes so the router can return
+/// different HTTP status codes:
+///
+/// - [`ResolveError::NoSuchApp`] → `404 Not Found`. The subdomain
+///   never matched a registered app; the request is for something
+///   that doesn't exist.
+/// - [`ResolveError::Unhealthy`] → `502 Bad Gateway`. The app **is**
+///   registered, but bringing it up to serve this request failed
+///   (image pull, readiness probe, etc.). The error chain is logged
+///   server-side; clients see only the status code.
+///
+/// Without this split a deployed-but-failing app and an unregistered
+/// subdomain look identical to operators, which is exactly the
+/// "Linkding is broken vs I never deployed it" gotcha.
+#[derive(Debug, thiserror::Error)]
+pub enum ResolveError {
+    #[error("no app registered for this host")]
+    NoSuchApp,
+    #[error("upstream is registered but failed to come up: {0}")]
+    Unhealthy(#[source] anyhow::Error),
+}
+
 /// Pluggable upstream resolver.
 ///
 /// The router calls this on every request to find out where to forward.
@@ -218,7 +241,7 @@ impl Upstream {
 /// drops the future.
 #[async_trait]
 pub trait UpstreamResolver: Send + Sync + std::fmt::Debug {
-    async fn resolve(&self, host: &str) -> Option<Upstream>;
+    async fn resolve(&self, host: &str) -> Result<Upstream, ResolveError>;
 }
 
 /// Convenience extractor used by both [`AppRouter`] and any custom
@@ -262,8 +285,10 @@ impl AppRouter {
 
 #[async_trait]
 impl UpstreamResolver for AppRouter {
-    async fn resolve(&self, host: &str) -> Option<Upstream> {
-        self.resolve(host).map(|d| Upstream::new(d.upstream))
+    async fn resolve(&self, host: &str) -> Result<Upstream, ResolveError> {
+        self.resolve(host)
+            .map(|d| Upstream::new(d.upstream))
+            .ok_or(ResolveError::NoSuchApp)
     }
 }
 
@@ -390,14 +415,27 @@ async fn handler(State(state): State<ProxyState>, req: Request) -> Response {
     let app_label = subdomain_of(&host).unwrap_or("unknown").to_owned();
 
     let response = match state.resolver.resolve(&host).await {
-        None => {
+        Err(ResolveError::NoSuchApp) => {
             warn!(host = %host, "no app matched");
             error_response(
                 StatusCode::NOT_FOUND,
                 format!("no app matched host '{host}'\n"),
             )
         }
-        Some(upstream) => {
+        Err(ResolveError::Unhealthy(err)) => {
+            // The app is registered but couldn't be made ready —
+            // cold start failure, readiness probe fail, etc. 502 so
+            // operators can tell this case apart from "you never
+            // deployed me" (404). The detail is in the daemon log;
+            // we don't echo it to the client because it can leak
+            // internal hostnames / pull errors.
+            warn!(host = %host, error = ?err, "upstream unhealthy");
+            error_response(
+                StatusCode::BAD_GATEWAY,
+                format!("upstream for '{host}' failed to come up\n"),
+            )
+        }
+        Ok(upstream) => {
             // Per-request route confirmation. At info-level this
             // showed up as ~33μs/req (≈ 2.7× total router throughput
             // hit at the default level). Route hits are not

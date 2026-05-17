@@ -20,6 +20,7 @@ hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "
 ipnet = "2"
 metrics.workspace = true
 tokio.workspace = true
+thiserror.workspace = true
 tower = { version = "0.5", features = ["limit"] }
 tower-http = { version = "0.6", features = ["limit", "timeout"] }
 tracing.workspace = true
