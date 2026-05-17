@@ -74,6 +74,7 @@ fn fake_app(name: &str, port: u16) -> AppSpec {
         scaling: Scaling::default(),
         readiness: Readiness::default(),
         resources: Resources::default(),
+        volumes: Vec::new(),
         source_path: PathBuf::from(format!("/apps/{name}.toml")),
     }
 }

@@ -28,6 +28,11 @@ pub(crate) struct SpecInputs<'a> {
     /// Optional network namespace path to join. If `None`, a fresh netns
     /// is created at container start.
     pub netns_path: Option<&'a Path>,
+    /// Resolved host-side paths for each `spec.volumes` entry, in the
+    /// same order. The runtime creates / chowns these before building
+    /// the spec; `build_spec` only consumes the paths and emits bind
+    /// mounts. Length must match `spec.volumes.len()`.
+    pub volume_host_paths: &'a [PathBuf],
 }
 
 /// Build an OCI runtime [`Spec`] from the given inputs.
@@ -40,6 +45,7 @@ pub(crate) fn build_spec(inputs: &SpecInputs<'_>) -> Result<Spec> {
         image_config,
         rootfs,
         netns_path,
+        volume_host_paths,
     } = *inputs;
 
     // ---- Process (Args / Env / Cwd / User) ----
@@ -94,7 +100,7 @@ pub(crate) fn build_spec(inputs: &SpecInputs<'_>) -> Result<Spec> {
         .build()?;
 
     // ---- Mounts ----
-    let mounts = build_mounts();
+    let mounts = build_mounts(spec, volume_host_paths)?;
 
     // ---- Root ----
     // `Spec::canonicalize_rootfs` (called by libcontainer) will resolve the
@@ -313,7 +319,7 @@ fn build_resources(spec: &AppSpec) -> Result<oci_spec::runtime::LinuxResources> 
         .build()?)
 }
 
-fn build_mounts() -> Vec<Mount> {
+fn build_mounts(spec: &AppSpec, volume_host_paths: &[PathBuf]) -> Result<Vec<Mount>> {
     // Start from the spec defaults (proc, sys, /dev/pts, ...).
     let mut mounts = get_default_mounts();
 
@@ -337,7 +343,33 @@ fn build_mounts() -> Vec<Mount> {
         mounts.push(m);
     }
 
-    mounts
+    // Per-app persistent volumes. The runtime has already created /
+    // chowned the host directories in `ensure_volume_host_dirs`. We
+    // mount them rw with the same hardening options every other bind
+    // gets (nosuid + nodev keep a hostile image from elevating
+    // privileges via setuid binaries dropped inside the volume).
+    assert_eq!(
+        volume_host_paths.len(),
+        spec.volumes.len(),
+        "volume_host_paths length must mirror spec.volumes",
+    );
+    for (v, host_path) in spec.volumes.iter().zip(volume_host_paths) {
+        let m = MountBuilder::default()
+            .destination(v.path.clone())
+            .source(host_path.clone())
+            .typ("bind")
+            .options(vec![
+                "rbind".to_owned(),
+                "rw".to_owned(),
+                "nosuid".to_owned(),
+                "nodev".to_owned(),
+            ])
+            .build()
+            .map_err(RuntimeError::from)?;
+        mounts.push(m);
+    }
+
+    Ok(mounts)
 }
 
 /// A modest, container-typical capability set. Mirrors the runc default
@@ -413,6 +445,7 @@ cpu = "0.5"
             image_config: &image,
             rootfs: &rootfs,
             netns_path: None,
+            volume_host_paths: &[],
         })
         .expect("build_spec");
 
@@ -474,6 +507,7 @@ cpu = "0.5"
             image_config: &image,
             rootfs: &rootfs,
             netns_path: Some(&netns),
+            volume_host_paths: &[],
         })
         .unwrap();
 
@@ -497,6 +531,7 @@ cpu = "0.5"
             image_config: &image,
             rootfs: Path::new("/tmp/rootfs"),
             netns_path: None,
+            volume_host_paths: &[],
         })
         .unwrap();
 
@@ -530,6 +565,7 @@ PORT = "9999"
             image_config: &image,
             rootfs: Path::new("/tmp/rootfs"),
             netns_path: None,
+            volume_host_paths: &[],
         })
         .unwrap();
 
@@ -537,6 +573,64 @@ PORT = "9999"
         let port_entries: Vec<_> = env.iter().filter(|e| e.starts_with("PORT=")).collect();
         assert_eq!(port_entries.len(), 1);
         assert_eq!(port_entries[0], "PORT=9999");
+    }
+
+    #[test]
+    fn spec_emits_bind_mount_per_volume() {
+        let toml_src = r#"
+            repo = "ghcr.io/x/y"
+            port = 80
+            name = "myapp"
+
+            [[volumes]]
+            name = "data"
+            path = "/data"
+
+            [[volumes]]
+            name = "cache"
+            path = "/var/cache/app"
+            "#;
+        let app: AppSpec = toml::from_str(toml_src).expect("parse");
+        let image = make_image_config(vec!["/bin/run"], vec![]);
+        let host_paths = [
+            PathBuf::from("/var/lib/bugpot/volumes/myapp/data"),
+            PathBuf::from("/var/lib/bugpot/volumes/myapp/cache"),
+        ];
+        let spec = build_spec(&SpecInputs {
+            spec: &app,
+            image_config: &image,
+            rootfs: Path::new("/tmp/rootfs"),
+            netns_path: None,
+            volume_host_paths: &host_paths,
+        })
+        .expect("build_spec");
+
+        let mounts = spec.mounts().as_ref().expect("mounts present");
+        let data_mount = mounts
+            .iter()
+            .find(|m| m.destination() == Path::new("/data"))
+            .expect("data mount");
+        assert_eq!(
+            data_mount.source().as_deref(),
+            Some(Path::new("/var/lib/bugpot/volumes/myapp/data")),
+        );
+        assert_eq!(data_mount.typ().as_deref(), Some("bind"));
+        let opts = data_mount.options().as_ref().expect("options present");
+        // rw + nosuid + nodev are the hardening floor every user
+        // volume gets; rbind keeps libcontainer happy with nested
+        // mounts inside the volume.
+        for required in ["rbind", "rw", "nosuid", "nodev"] {
+            assert!(
+                opts.iter().any(|o| o == required),
+                "missing option {required:?}; got {opts:?}",
+            );
+        }
+        // Second volume is also wired.
+        assert!(
+            mounts
+                .iter()
+                .any(|m| m.destination() == Path::new("/var/cache/app")),
+        );
     }
 
     #[test]
@@ -552,6 +646,7 @@ PORT = "9999"
             image_config: &image,
             rootfs: Path::new("/tmp/rootfs"),
             netns_path: None,
+            volume_host_paths: &[],
         })
         .unwrap_err();
         match err {

@@ -291,9 +291,26 @@ A user namespace was investigated and **deferred**: libcontainer creates the use
 
 **Freeze vs stop.** The default scale-to-zero path is **freeze, not stop** (cgroup v2 freezer). Frozen apps keep their full RSS resident but consume zero CPU; the next request resumes in sub-ms (no image pull, no libcontainer fork, no TCP readiness probe). The trade-off — RAM stays allocated — is bounded by a memory-pressure handler that polls `MemAvailable` and evicts oldest-frozen apps to `Stopped` when memory drops below `BUGPOT_FREEZE_MEM_LO`. This shifts the bottleneck from "cold-start CPU spike on every long-idle hit" to "RAM in steady state", which is what's wanted for the "many small self-hosted apps on a cheap VM" use case (Vaultwarden / Grafana / Linkding-class). Set `BUGPOT_FREEZE_ENABLED=false` to restore the pre-freeze idle = stop behavior. The router's `forward_upgrade` increments `AppHandle::active_upgrades` for the lifetime of every WebSocket / SSE splice, and the idle reaper refuses to freeze while that counter is non-zero — so long-lived upgraded connections survive idle gaps without being silently stranded.
 
+### Persistent volumes
+
+Stateful self-hosted apps (Vaultwarden's sqlite DB, Linkding's bookmarks DB, etc.) survive freeze (the container's fs is untouched while paused) but **would lose data on a stop** — including memory-pressure eviction, manual restart, or any bugpot-side teardown. The `[[volumes]]` section of an app TOML declares one or more bind mounts from `<state>/volumes/<app>/<name>/` into the container:
+
+```toml
+[[volumes]]
+name = "data"       # → /var/lib/bugpot/volumes/<app>/data/
+path = "/data"      # mount point inside container
+user = 33           # optional: chown the host dir to this UID at start
+```
+
+**Permissions trap.** Containers typically run as a non-root user (Linkding uid=33, Vaultwarden uid=1000, …). The host-side directory inherits root ownership at creation; without setting `user` the app will get `EACCES` on first write. bugpot chowns to `user:user` on every start (idempotent for unchanged values; correctly re-chowns if the operator updates the TOML).
+
+**Lifecycle.** Volumes are created lazily on first start (`Runtime::ensure_volume_host_dirs`), preserved across freeze / rollouts / memory-pressure eviction, and removed only when the app itself is removed (`DELETE /apps/<name>` flows through `cleanup_orphan_container`, which now also drops the volume dir). Removing the `[[volumes]]` entry from a TOML without deleting the app leaves the host directory on disk — operators can re-add the same `name` and the data is still there.
+
+**Reserved paths.** Volumes cannot target `/`, `/proc`, `/sys`, `/dev`, `/dev/pts`, `/dev/shm`, `/dev/mqueue`, or `/etc/resolv.conf` — these are owned by the OCI default mounts or bugpot's DNS bind. `validate_volumes` rejects collisions at deploy time so a bad TOML never reaches `start_app`.
+
 ### State directory
 
-`/var/lib/bugpot/{images,bundles,containers,logs}`. Images are content-addressed by digest; bundles are per-app (`rootfs` is a symlink into the image cache — read-only, no overlayfs yet). `Runtime::start_app` removes stale `containers/<name>` from a prior crash before letting libcontainer recreate it. Note that libcontainer's `with_root_path` takes the **parent** of the per-container state dir, not the dir itself.
+`/var/lib/bugpot/{images,bundles,containers,logs,volumes}`. Images are content-addressed by digest; bundles are per-app (`rootfs` is a symlink into the image cache — read-only, no overlayfs yet); volumes are `volumes/<app>/<name>/` and survive across freeze / rollout / eviction. `Runtime::start_app` removes stale `containers/<name>` from a prior crash before letting libcontainer recreate it. Note that libcontainer's `with_root_path` takes the **parent** of the per-container state dir, not the dir itself.
 
 **Image cache GC (#19):** `Runtime::gc_unused_images` runs once at startup before any pull. It treats the union of every `bundles/<app>/rootfs` symlink's target as the live set of image digests, and removes any `images/<digest>/` not in that set, plus any dir missing `.done` (orphaned `.tmp.*` leftovers from a crashed pull). Tradeoff: an app that's been **registered but never started** has no bundle, so its already-pulled image may get reclaimed and re-pulled on first start. The `live_image_digests` + `gc_unused_images` split keeps the call-site interface stable for the future overlayfs / layer-keyed storage migration — only the internal expansion to live layers changes there.
 

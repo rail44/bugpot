@@ -1727,6 +1727,7 @@ mod tests {
             scaling: Scaling::default(),
             readiness: Readiness::default(),
             resources: Resources::default(),
+            volumes: Vec::new(),
             source_path: PathBuf::new(),
         }
     }

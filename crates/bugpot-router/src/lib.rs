@@ -800,6 +800,7 @@ mod tests {
             scaling: bugpot_config::Scaling::default(),
             readiness: bugpot_config::Readiness::default(),
             resources: bugpot_config::Resources::default(),
+            volumes: Vec::new(),
             source_path: PathBuf::from(format!("/apps/{name}.toml")),
         }
     }

@@ -124,6 +124,7 @@ pub struct Runtime {
     bundles_dir: PathBuf,
     containers_dir: PathBuf,
     logs_dir: PathBuf,
+    volumes_dir: PathBuf,
     /// One puller shared across every `pull_image` call: its
     /// per-digest inflight map is what makes concurrent pulls of the
     /// same image coalesce on a single registry round-trip + extract.
@@ -138,12 +139,14 @@ impl Runtime {
         let bundles_dir = state_dir.join("bundles");
         let containers_dir = state_dir.join("containers");
         let logs_dir = state_dir.join("logs");
+        let volumes_dir = state_dir.join("volumes");
         for p in [
             &state_dir,
             &images_dir,
             &bundles_dir,
             &containers_dir,
             &logs_dir,
+            &volumes_dir,
         ] {
             fs::create_dir_all(p).map_err(|e| RuntimeError::io(p, e))?;
         }
@@ -155,6 +158,7 @@ impl Runtime {
             bundles_dir,
             containers_dir,
             logs_dir,
+            volumes_dir,
             puller,
         })
     }
@@ -232,7 +236,17 @@ impl RuntimeOps for Runtime {
         histogram!("bugpot_container_start_seconds", "step" => "bundle")
             .record(step.elapsed().as_secs_f64());
 
-        // 3. Spec.
+        // 3. Volumes.
+        //
+        // Materialise the per-app, per-volume host dirs *before* the
+        // spec build needs their paths. Idempotent — re-running this
+        // for an existing volume is a no-op aside from re-asserting
+        // ownership (so a TOML `user` change does the right thing on
+        // next start). Data survives across container restarts and
+        // rollouts; only `cleanup_orphan_container` removes the dir.
+        let volume_host_paths = self.ensure_volume_host_dirs(&name, &spec.volumes)?;
+
+        // 4. Spec.
         //
         // Pass the absolute path `<bundle_dir>/rootfs` (a symlink set up by
         // `prepare_bundle_dir` that points at the image cache). libcontainer
@@ -246,6 +260,7 @@ impl RuntimeOps for Runtime {
             image_config: &image.config,
             rootfs: &bundle_rootfs,
             netns_path,
+            volume_host_paths: &volume_host_paths,
         })?;
         let config_path = bundle_dir.join("config.json");
         runtime_spec
@@ -464,6 +479,12 @@ impl RuntimeOps for Runtime {
         if bundle_dir.exists() {
             fs::remove_dir_all(&bundle_dir).map_err(|e| RuntimeError::io(&bundle_dir, e))?;
         }
+        // Volume dirs are part of the "explicit remove" path: their
+        // whole purpose is surviving freezes / rollouts, so only an
+        // operator-initiated remove (or an orphan whose TOML has
+        // disappeared) should wipe them. The log dir is intentionally
+        // left alone — operators may want post-mortem access.
+        self.remove_volume_dirs(name)?;
         Ok(())
     }
 
@@ -479,6 +500,66 @@ impl RuntimeOps for Runtime {
 impl Runtime {
     fn log_dir_for(&self, app: &str) -> PathBuf {
         self.logs_dir.join(app)
+    }
+
+    fn volume_dir_for(&self, app: &str) -> PathBuf {
+        self.volumes_dir.join(app)
+    }
+
+    /// Materialise the host-side directories for an app's
+    /// [`VolumeSpec`]s and (when a UID is declared) chown them so the
+    /// container user can read & write them.
+    ///
+    /// Returns the resolved host paths in the same order as `volumes`
+    /// — `build_spec` consumes them to emit bind mounts.
+    ///
+    /// Idempotent: re-running for an existing app is a no-op for the
+    /// directories that already exist, but **re-asserts ownership**
+    /// every call. That's deliberate — if an operator updates `user`
+    /// in the TOML and redeploys, the next start picks up the new
+    /// ownership without any manual `chown` on the host.
+    fn ensure_volume_host_dirs(
+        &self,
+        app: &str,
+        volumes: &[bugpot_config::VolumeSpec],
+    ) -> Result<Vec<PathBuf>> {
+        if volumes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let app_dir = self.volume_dir_for(app);
+        fs::create_dir_all(&app_dir).map_err(|e| RuntimeError::io(&app_dir, e))?;
+        let mut out = Vec::with_capacity(volumes.len());
+        for v in volumes {
+            let host_path = app_dir.join(&v.name);
+            fs::create_dir_all(&host_path).map_err(|e| RuntimeError::io(&host_path, e))?;
+            if let Some(uid) = v.user {
+                // Same UID for group; matches the typical container
+                // image convention `appuser:appuser`. nix's wrapper
+                // keeps us inside the workspace's `unsafe_code = deny`.
+                nix::unistd::chown(
+                    &host_path,
+                    Some(nix::unistd::Uid::from_raw(uid)),
+                    Some(nix::unistd::Gid::from_raw(uid)),
+                )
+                .map_err(|e| RuntimeError::io(&host_path, std::io::Error::from(e)))?;
+            }
+            out.push(host_path);
+        }
+        Ok(out)
+    }
+
+    /// Remove all volume directories belonging to `app`. Called by
+    /// `cleanup_orphan_container` on the explicit-remove path.
+    ///
+    /// Best-effort: an IO failure is surfaced, but a missing dir is
+    /// fine (the app may never have started, or its TOML may never
+    /// have declared any volumes).
+    fn remove_volume_dirs(&self, app: &str) -> Result<()> {
+        let app_dir = self.volume_dir_for(app);
+        if !app_dir.exists() {
+            return Ok(());
+        }
+        fs::remove_dir_all(&app_dir).map_err(|e| RuntimeError::io(&app_dir, e))
     }
 
     /// Reference set for image-cache GC: every digest currently bound
