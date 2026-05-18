@@ -18,6 +18,16 @@ Re-run any of the commands below to get fresh data.
 4. **Responsibility audit** — "1-sentence summary test": for each module
    / crate, state what it does in one sentence. Modules that resist
    this are the candidates.
+5. **AST similarity (post-refactor dedup pass)** — `just similar`
+   (default 0.85 threshold) / `just similar-strict` (0.92 + body
+   prints). Catches Type-2 / Type-3 clones whose AST shapes match
+   after identifier normalisation. Run after a refactor that
+   splits functions to catch helpers whose pieces ended up similar
+   enough to share. PR #138 / #139 used this to surface the
+   `http_*` and `persist_*` / `parse_env_*` clusters; the residual
+   high-similarity pairs left after those are intentional
+   (symmetric trait methods, state-machine queries, mock helpers).
+   See `cargo install similarity-rs`.
 
 ## Axis 1 — top 10 hotspots
 

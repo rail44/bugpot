@@ -201,3 +201,19 @@ modules pkg:
 # `dot -Tsvg -o crates.svg` if graphviz is installed.
 depgraph:
     cargo depgraph --workspace-only
+
+# AST-based code similarity scan. Flags Type-2 / Type-3 clones across
+# the workspace (functions whose AST shapes match after identifier
+# normalisation, default threshold 0.85). Use after a refactor pass
+# to catch helpers whose split has left twin patterns that could
+# share a helper.
+#
+# Tooling: `cargo install similarity-rs`.
+similar:
+    similarity-rs --skip-test --exclude target --exclude experiments --exclude '**/benches/**' crates/ cmd/
+
+# Same scan, with a tighter threshold and the matched code printed
+# inline. Useful when the default list is too noisy and you want to
+# eyeball the actual bodies.
+similar-strict:
+    similarity-rs --skip-test --exclude target --exclude experiments --exclude '**/benches/**' --threshold 0.92 --print crates/ cmd/
