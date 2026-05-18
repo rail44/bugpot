@@ -180,6 +180,23 @@ impl Runtime {
     pub fn state_dir(&self) -> &Path {
         &self.state_dir
     }
+
+    /// Load libcontainer's state for `name`. Returns
+    /// [`RuntimeError::AppNotFound`] when the per-container state
+    /// directory doesn't exist; otherwise propagates any
+    /// libcontainer load error.
+    ///
+    /// Centralises the `containers_dir.join(name)` + `exists()` +
+    /// `Container::load` triple that every lifecycle method (start /
+    /// stop / freeze / unfreeze / status / cgroup-stats / orphan
+    /// reclaim) used to write inline.
+    fn try_load_container(&self, name: &str) -> Result<Container> {
+        let root = self.containers_dir.join(name);
+        if !root.exists() {
+            return Err(RuntimeError::AppNotFound(name.to_owned()));
+        }
+        Container::load(root).map_err(Into::into)
+    }
 }
 
 impl RuntimeOps for Runtime {
@@ -375,11 +392,8 @@ impl RuntimeOps for Runtime {
     /// `Stopped` here, not (stale) `Running`. PID reuse is theoretically
     /// possible but rare on a single-host setup; we accept the limit.
     fn is_container_running(&self, name: &str) -> bool {
-        let container_root = self.containers_dir.join(name);
-        if !container_root.exists() {
-            return false;
-        }
-        Container::load(container_root).is_ok_and(|c| c.status() == ContainerStatus::Running)
+        self.try_load_container(name)
+            .is_ok_and(|c| c.status() == ContainerStatus::Running)
     }
 
     /// Read the live cgroup v2 memory + CPU stats for the container
@@ -387,8 +401,7 @@ impl RuntimeOps for Runtime {
     /// or when its cgroup path / files cannot be resolved (e.g. cgroup
     /// v1 host, transient `/proc` races).
     fn resource_usage(&self, name: &str) -> Option<ResourceUsage> {
-        let container_root = self.containers_dir.join(name);
-        let container = Container::load(container_root).ok()?;
+        let container = self.try_load_container(name).ok()?;
         if container.status() != ContainerStatus::Running {
             return None;
         }
@@ -406,32 +419,21 @@ impl RuntimeOps for Runtime {
     /// recover the state.
     #[allow(clippy::unused_async)]
     async fn freeze_app(&self, name: &str) -> Result<()> {
-        let container_root = self.containers_dir.join(name);
-        if !container_root.exists() {
-            return Err(RuntimeError::AppNotFound(name.to_owned()));
-        }
-        let mut container = Container::load(container_root)?;
+        let mut container = self.try_load_container(name)?;
         container.pause()?;
         Ok(())
     }
 
     #[allow(clippy::unused_async)]
     async fn unfreeze_app(&self, name: &str) -> Result<()> {
-        let container_root = self.containers_dir.join(name);
-        if !container_root.exists() {
-            return Err(RuntimeError::AppNotFound(name.to_owned()));
-        }
-        let mut container = Container::load(container_root)?;
+        let mut container = self.try_load_container(name)?;
         container.resume()?;
         Ok(())
     }
 
     fn is_container_paused(&self, name: &str) -> bool {
-        let container_root = self.containers_dir.join(name);
-        if !container_root.exists() {
-            return false;
-        }
-        Container::load(container_root).is_ok_and(|c| c.status() == ContainerStatus::Paused)
+        self.try_load_container(name)
+            .is_ok_and(|c| c.status() == ContainerStatus::Paused)
     }
 
     /// Stop and clean up a running container.
@@ -441,12 +443,7 @@ impl RuntimeOps for Runtime {
     /// a child process abstraction).
     #[allow(clippy::unused_async)]
     async fn stop_app(&self, name: &str) -> Result<()> {
-        let container_root = self.containers_dir.join(name);
-        if !container_root.exists() {
-            return Err(RuntimeError::AppNotFound(name.to_owned()));
-        }
-
-        let mut container = Container::load(container_root)?;
+        let mut container = self.try_load_container(name)?;
         if container.status() == ContainerStatus::Running {
             // Best-effort graceful SIGTERM. We always force-delete after,
             // which matches `runc rm -f` semantics.

@@ -152,22 +152,11 @@ impl Bootstrap {
 }
 
 /// Returns `true` iff the current process has `CAP_NET_ADMIN` in its
-/// effective set. Reads `/proc/self/status` so it covers both the
-/// "running as root" path and the "non-root with ambient cap" path
-/// (`AmbientCapabilities` in a systemd unit).
+/// effective set. Covers both the "running as root" path and the
+/// "non-root with ambient cap" path (`AmbientCapabilities` in a
+/// systemd unit).
 pub(crate) fn has_cap_net_admin() -> bool {
-    // include/uapi/linux/capability.h: CAP_NET_ADMIN = 12
-    const CAP_NET_ADMIN_BIT: u64 = 1 << 12;
-    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
-        return false;
-    };
-    let Some(hex) = status
-        .lines()
-        .find_map(|l| l.strip_prefix("CapEff:").map(str::trim))
-    else {
-        return false;
-    };
-    u64::from_str_radix(hex, 16).is_ok_and(|bits| bits & CAP_NET_ADMIN_BIT != 0)
+    bugpot_runtime::caps::has_effective_cap(bugpot_runtime::caps::CAP_NET_ADMIN)
 }
 
 /// Reclaim image cache dirs whose digest no bundle references and
