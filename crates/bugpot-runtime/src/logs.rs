@@ -145,11 +145,19 @@ pub(crate) async fn forward_log_file(path: PathBuf, app: String, stream: &'stati
     }
 }
 
-/// Spawn the two tail tasks for an app whose log dir is `log_dir`.
-/// Detached; cancellation happens when bugpot exits.
-pub(crate) fn spawn_log_tails(log_dir: &Path, app: &str) {
+/// Spawn the two tail tasks for an app whose log dir is `log_dir` and
+/// return their `JoinHandle`s. The caller is responsible for parking
+/// the handles somewhere they can be `.abort()`-ed when the app is
+/// removed (see `Runtime::ensure_log_tails` /
+/// `Runtime::cleanup_orphan_container`). Without that pairing the
+/// tasks leak — inotify watches survive container removal because
+/// the log files themselves are kept around for post-mortem
+/// (CLAUDE.md L333).
+pub(crate) fn spawn_log_tails(log_dir: &Path, app: &str) -> [tokio::task::JoinHandle<()>; 2] {
     let stdout_path = log_dir.join("stdout.log");
     let stderr_path = log_dir.join("stderr.log");
-    tokio::spawn(forward_log_file(stdout_path, app.to_owned(), "stdout"));
-    tokio::spawn(forward_log_file(stderr_path, app.to_owned(), "stderr"));
+    [
+        tokio::spawn(forward_log_file(stdout_path, app.to_owned(), "stdout")),
+        tokio::spawn(forward_log_file(stderr_path, app.to_owned(), "stderr")),
+    ]
 }
