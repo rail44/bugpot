@@ -449,40 +449,62 @@ async fn forward<R: UpstreamResolver + 'static>(
 
     strip_hop_by_hop_headers(req.headers_mut());
 
-    let pending = state.client.request(req);
-    let result = tokio::time::timeout(REQUEST_TIMEOUT, pending).await;
-    match result {
-        Ok(Ok(mut res)) => {
-            strip_hop_by_hop_headers(res.headers_mut());
-            // Bound the streaming half (per-frame idle + total bytes).
-            // `TimeoutLayer` only covers time-to-headers; without this
-            // wrap, slow-reading clients and runaway upstream bodies
-            // are unconstrained. Composed from two upstream layers:
-            // `Limited` enforces the byte ceiling and `TimeoutBody`
-            // enforces the per-frame idle timeout — same semantics
-            // we had with the home-grown wrapper, just delegated.
-            res.map(|body| {
-                let limited = Limited::new(body, MAX_RESPONSE_BODY_BYTES);
-                let timed = TimeoutBody::new(RESPONSE_FRAME_TIMEOUT, limited);
-                Body::new(timed)
-            })
-        }
+    let mut res = match send_upstream(&state.client, req, "request").await {
+        Ok(res) => res,
+        Err(resp) => return resp,
+    };
+    strip_hop_by_hop_headers(res.headers_mut());
+    // Bound the streaming half (per-frame idle + total bytes).
+    // `TimeoutLayer` only covers time-to-headers; without this wrap,
+    // slow-reading clients and runaway upstream bodies are
+    // unconstrained. Composed from two upstream layers: `Limited`
+    // enforces the byte ceiling and `TimeoutBody` enforces the
+    // per-frame idle timeout.
+    res.map(|body| {
+        let limited = Limited::new(body, MAX_RESPONSE_BODY_BYTES);
+        let timed = TimeoutBody::new(RESPONSE_FRAME_TIMEOUT, limited);
+        Body::new(timed)
+    })
+}
+
+/// Send a request to the upstream with `REQUEST_TIMEOUT` applied to
+/// the time-to-headers wait, mapping the two router-side error paths
+/// (transport failure → `BAD_GATEWAY`, header-wait timeout →
+/// `GATEWAY_TIMEOUT`) into ready-to-return `Response`s.
+///
+/// Returns the raw upstream `Response` (hop-by-hop headers still
+/// attached) on success; the caller decides how to wrap it
+/// (`forward` strips + bounds the body, `forward_upgrade` checks for
+/// 101 and otherwise forwards the response verbatim).
+///
+/// `kind` is a structured log field — "request" or "upgrade" — so
+/// the two callers' warn lines stay distinguishable when filtering
+/// router logs.
+async fn send_upstream(
+    client: &ProxyClient,
+    req: Request,
+    kind: &'static str,
+) -> std::result::Result<hyper::Response<hyper::body::Incoming>, Response> {
+    let pending = client.request(req);
+    match tokio::time::timeout(REQUEST_TIMEOUT, pending).await {
+        Ok(Ok(res)) => Ok(res),
         Ok(Err(e)) => {
-            warn!(error = %e, "upstream request failed");
-            error_response(
+            warn!(error = %e, kind, "upstream request failed");
+            Err(error_response(
                 StatusCode::BAD_GATEWAY,
                 "upstream connection failed\n".to_owned(),
-            )
+            ))
         }
         Err(_) => {
             warn!(
+                kind,
                 timeout_secs = REQUEST_TIMEOUT.as_secs(),
-                "upstream request timed out"
+                "upstream request timed out",
             );
-            error_response(
+            Err(error_response(
                 StatusCode::GATEWAY_TIMEOUT,
                 "upstream request timed out\n".to_owned(),
-            )
+            ))
         }
     }
 }
@@ -514,23 +536,9 @@ async fn forward_upgrade<R: UpstreamResolver + 'static>(
     // will resolve it once the response (with 101) is flushed.
     let client_upgrade = hyper::upgrade::on(&mut req);
 
-    let pending = state.client.request(req);
-    let mut upstream_res = match tokio::time::timeout(REQUEST_TIMEOUT, pending).await {
-        Ok(Ok(res)) => res,
-        Ok(Err(e)) => {
-            warn!(error = %e, "upstream upgrade request failed");
-            return error_response(
-                StatusCode::BAD_GATEWAY,
-                "upstream connection failed\n".to_owned(),
-            );
-        }
-        Err(_) => {
-            warn!("upstream upgrade request timed out");
-            return error_response(
-                StatusCode::GATEWAY_TIMEOUT,
-                "upstream request timed out\n".to_owned(),
-            );
-        }
+    let mut upstream_res = match send_upstream(&state.client, req, "upgrade").await {
+        Ok(res) => res,
+        Err(resp) => return resp,
     };
 
     if upstream_res.status() != StatusCode::SWITCHING_PROTOCOLS {
