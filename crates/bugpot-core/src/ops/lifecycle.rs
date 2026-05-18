@@ -11,19 +11,35 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use bugpot_config::AppSpec;
 use bugpot_egress::EgressOps;
 use bugpot_runtime::{ImageId, RuntimeOps};
-use metrics::histogram;
 use tracing::{debug, info, warn};
 
 use crate::AppHost;
 use crate::READINESS_TIMEOUT_DEFAULT;
 use crate::handle::{AppHandle, AppState, DigestCache, StartClaim};
 use crate::probe::wait_for_ready;
+
+/// Time an expression returning `Result<_>` and record its duration to
+/// a histogram **only on success**. Encodes the "completed phases
+/// only" semantic of `bugpot_cold_start_seconds` / `bugpot_freeze_seconds`
+/// / `bugpot_resume_seconds`: failure paths leave the distribution
+/// untouched.
+macro_rules! record_on_success {
+    ($metric:literal $(, $k:literal => $v:expr)* ; $body:expr) => {{
+        let __start = ::std::time::Instant::now();
+        let __res = $body;
+        if __res.is_ok() {
+            ::metrics::histogram!($metric $(, $k => $v)*)
+                .record(__start.elapsed().as_secs_f64());
+        }
+        __res
+    }};
+}
 
 impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
     /// Ensure the app is running, coalescing concurrent starts. Returns
@@ -138,15 +154,13 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
         name: &str,
         spec: &AppSpec,
     ) -> Result<bugpot_egress::Endpoint> {
-        let phase_start = Instant::now();
-        let endpoint = self
-            .egress
-            .allocate_endpoint(name, spec.egress.allow.clone())
-            .await
-            .with_context(|| format!("allocate endpoint for {name}"))?;
-        histogram!("bugpot_cold_start_seconds", "phase" => "endpoint")
-            .record(phase_start.elapsed().as_secs_f64());
-        Ok(endpoint)
+        record_on_success!(
+            "bugpot_cold_start_seconds", "phase" => "endpoint";
+            self.egress
+                .allocate_endpoint(name, spec.egress.allow.clone())
+                .await
+                .with_context(|| format!("allocate endpoint for {name}"))
+        )
     }
 
     /// Phase 2: pull, pinning to the cached digest if one was
@@ -159,7 +173,6 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
         plain_image_ref: &str,
     ) -> Result<ImageId> {
         let name = &handle.identity.name;
-        let phase_start = Instant::now();
         // If a prior pull on this handle resolved the tag to a digest
         // *for the same repo*, pin to it so the registry-side manifest
         // probe is skipped (`Puller::pull` short-circuits on digest
@@ -176,11 +189,13 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
             .filter(|cache| cache.repo == spec.repo)
             .map(|cache| cache.digest.clone());
         let image_ref = digest_pinned_ref(plain_image_ref, cached_digest.as_ref());
-        let image_id = self
-            .runtime
-            .pull_image(&image_ref, self.resolve_auth(&spec.repo))
-            .await
-            .with_context(|| format!("pull image for {name}"))?;
+        let image_id = record_on_success!(
+            "bugpot_cold_start_seconds", "phase" => "pull";
+            self.runtime
+                .pull_image(&image_ref, self.resolve_auth(&spec.repo))
+                .await
+                .with_context(|| format!("pull image for {name}"))
+        )?;
         // Persist the resolved digest paired with the repo it was
         // resolved against. Future reads will only honour it while
         // the repo still matches.
@@ -193,8 +208,6 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
                 });
             }
         }
-        histogram!("bugpot_cold_start_seconds", "phase" => "pull")
-            .record(phase_start.elapsed().as_secs_f64());
         Ok(image_id)
     }
 
@@ -205,15 +218,13 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
         image_id: &ImageId,
         endpoint: &bugpot_egress::Endpoint,
     ) -> Result<bugpot_runtime::RunningApp> {
-        let phase_start = Instant::now();
-        let running = self
-            .runtime
-            .start_app(spec, image_id, Some(&endpoint.netns_path))
-            .await
-            .with_context(|| format!("start container for {}", spec.name()))?;
-        histogram!("bugpot_cold_start_seconds", "phase" => "start")
-            .record(phase_start.elapsed().as_secs_f64());
-        Ok(running)
+        record_on_success!(
+            "bugpot_cold_start_seconds", "phase" => "start";
+            self.runtime
+                .start_app(spec, image_id, Some(&endpoint.netns_path))
+                .await
+                .with_context(|| format!("start container for {}", spec.name()))
+        )
     }
 
     /// Phase 4: TCP-bind or HTTP probe, until the app accepts traffic
@@ -231,11 +242,10 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
             .resolve_timeout(READINESS_TIMEOUT_DEFAULT)
             .map_err(|e| anyhow!("{name}: {e}"))?;
         let upstream = SocketAddr::from((container_ip, spec.port));
-        let phase_start = Instant::now();
-        wait_for_ready(upstream, spec.readiness.path.as_deref(), timeout).await?;
-        histogram!("bugpot_cold_start_seconds", "phase" => "readiness")
-            .record(phase_start.elapsed().as_secs_f64());
-        Ok(())
+        record_on_success!(
+            "bugpot_cold_start_seconds", "phase" => "readiness";
+            wait_for_ready(upstream, spec.readiness.path.as_deref(), timeout).await
+        )
     }
 
     /// Unfreeze a paused container. The endpoint and listen socket
@@ -244,9 +254,10 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
     async fn do_resume(&self, handle: &AppHandle, container_ip: Ipv4Addr) -> Result<Ipv4Addr> {
         let name = &handle.identity.name;
         info!(app = %name, "resuming from frozen");
-        let phase_start = Instant::now();
-        self.runtime.unfreeze_app(name).await?;
-        histogram!("bugpot_resume_seconds").record(phase_start.elapsed().as_secs_f64());
+        record_on_success!(
+            "bugpot_resume_seconds";
+            self.runtime.unfreeze_app(name).await
+        )?;
         Ok(container_ip)
     }
 
@@ -276,12 +287,13 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
             return Ok(());
         }
         let name = &handle.identity.name;
-        let phase_start = Instant::now();
-        if let Err(e) = self.runtime.freeze_app(name).await {
+        if let Err(e) = record_on_success!(
+            "bugpot_freeze_seconds";
+            self.runtime.freeze_app(name).await
+        ) {
             warn!(app = %name, error = %e, "freeze_app failed");
             return Err(e.into());
         }
-        histogram!("bugpot_freeze_seconds").record(phase_start.elapsed().as_secs_f64());
         {
             let mut inner = handle.inner.lock().await;
             inner.state = AppState::Frozen { container_ip };

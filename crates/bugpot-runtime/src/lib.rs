@@ -23,6 +23,7 @@
 #![allow(clippy::redundant_pub_crate)]
 
 mod auth;
+pub mod caps;
 mod cgroup_stats;
 mod error;
 mod image;

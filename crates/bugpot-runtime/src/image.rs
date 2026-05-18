@@ -591,23 +591,12 @@ fn unpack_tar(rootfs: &Path, data: &[u8]) -> Result<()> {
 /// Returns `true` iff the current process can `chown(2)` arbitrary
 /// uids/gids — either because it runs as root or because it holds
 /// `CAP_CHOWN` (the shipped systemd unit grants it via
-/// `AmbientCapabilities`).
-///
-/// Reads the effective capability mask from `/proc/self/status`;
-/// returns `false` on any failure to read or parse so the caller
-/// safely skips ownership preservation rather than tripping a
-/// surprising `EPERM` mid-extraction.
+/// `AmbientCapabilities`). Returns `false` on any failure to read
+/// or parse `/proc/self/status` so the caller safely skips
+/// ownership preservation rather than tripping a surprising `EPERM`
+/// mid-extraction.
 fn can_chown() -> bool {
-    // include/uapi/linux/capability.h: CAP_CHOWN = 0
-    const CAP_CHOWN_BIT: u64 = 1 << 0;
-    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
-        return false;
-    };
-    status
-        .lines()
-        .find_map(|l| l.strip_prefix("CapEff:").map(str::trim))
-        .and_then(|hex| u64::from_str_radix(hex, 16).ok())
-        .is_some_and(|bits| bits & CAP_CHOWN_BIT != 0)
+    crate::caps::has_effective_cap(crate::caps::CAP_CHOWN)
 }
 
 #[cfg(test)]
