@@ -1610,7 +1610,10 @@ mod tests {
             .runtime
             .push_pull(Err(RuntimeError::Other("registry unreachable".into())));
 
-        let handle = controller.find_handle("alpha").await.expect("handle present");
+        let handle = controller
+            .find_handle("alpha")
+            .await
+            .expect("handle present");
         let err = controller
             .set_rollout(&handle, "v1".to_owned())
             .await
@@ -1642,7 +1645,10 @@ mod tests {
             .env
             .insert("LOG_LEVEL".to_owned(), "debug".to_owned());
 
-        let handle = controller.find_handle("alpha").await.expect("handle present");
+        let handle = controller
+            .find_handle("alpha")
+            .await
+            .expect("handle present");
         let view = controller
             .update_app(&handle, updated)
             .await
@@ -1676,7 +1682,10 @@ mod tests {
 
         let mut renamed = spec_with_name("alpha");
         renamed.name = Some("beta".to_owned());
-        let handle = controller.find_handle("alpha").await.expect("handle present");
+        let handle = controller
+            .find_handle("alpha")
+            .await
+            .expect("handle present");
         let err = controller
             .update_app(&handle, renamed)
             .await
@@ -1697,7 +1706,10 @@ mod tests {
 
         let mut moved = spec_with_name("alpha");
         moved.subdomain = Some("alpha-renamed".to_owned());
-        let handle = controller.find_handle("alpha").await.expect("handle present");
+        let handle = controller
+            .find_handle("alpha")
+            .await
+            .expect("handle present");
         let err = controller
             .update_app(&handle, moved)
             .await
@@ -1723,7 +1735,10 @@ mod tests {
         let runtime_calls_before = controller.runtime.calls().len();
 
         // Re-PATCH with the same content.
-        let handle = controller.find_handle("alpha").await.expect("handle present");
+        let handle = controller
+            .find_handle("alpha")
+            .await
+            .expect("handle present");
         controller
             .update_app(&handle, spec_with_name("alpha"))
             .await
@@ -1760,7 +1775,10 @@ mod tests {
             .await
             .expect("register");
 
-        let handle = controller.find_handle("alpha").await.expect("handle present");
+        let handle = controller
+            .find_handle("alpha")
+            .await
+            .expect("handle present");
         // Seed the cache as if a prior start populated it.
         handle.inner.lock().await.image_digest =
             Some(bugpot_runtime::ImageId::new("sha256:oldcacheddigest"));
@@ -2201,7 +2219,10 @@ mod tests {
         let controller =
             make_controller(vec![stored_with_name("alpha", "v1")], tmp.path().to_owned());
 
-        let handle = controller.find_handle("alpha").await.expect("handle present");
+        let handle = controller
+            .find_handle("alpha")
+            .await
+            .expect("handle present");
         controller.remove_app(&handle).await.expect("remove_app");
 
         let rt_calls = controller.runtime.calls();
