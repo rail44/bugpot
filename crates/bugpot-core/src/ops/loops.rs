@@ -5,14 +5,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bugpot_egress::EgressOps;
-use bugpot_runtime::RuntimeOps;
-use metrics::counter;
+use bugpot_runtime::{ResourceUsage, RuntimeOps};
+use metrics::{counter, gauge};
 use tracing::{debug, info, warn};
 
 use crate::AppHost;
 use crate::handle::AppHandle;
 use crate::mempressure::read_mem_available;
-use crate::view::emit_resource_metrics;
 
 impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
     /// Background task: sweeps registered apps periodically to:
@@ -180,5 +179,43 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
                 warn!(app = %handle.identity.name, error = ?e, "freeze on idle failed");
             }
         }
+    }
+}
+
+/// Emit `bugpot_app_memory_bytes` (gauge) and
+/// `bugpot_app_cpu_microseconds_total` (counter) from a fresh cgroup
+/// sample. The CPU delta is computed against the per-handle baseline
+/// stored in `HandleInner.cpu_baseline`, which is updated in place.
+///
+/// CPU is exposed in microseconds (cgroup-v2's native unit) so the
+/// counter keeps full precision. Operators querying via Prometheus
+/// divide by 1e6: `rate(bugpot_app_cpu_microseconds_total[5m]) / 1000000`.
+///
+/// Co-located with its only caller (the sweep loop) rather than living
+/// in `view.rs` — projection types belong with the serialisable shape;
+/// side-effecting Prometheus emission belongs with the timer-driven
+/// loop that decides when to sample.
+async fn emit_resource_metrics(handle: &Arc<AppHandle>, usage: ResourceUsage) {
+    #[allow(clippy::cast_precision_loss)]
+    gauge!("bugpot_app_memory_bytes", "app" => handle.identity.name.clone())
+        .set(usage.memory_bytes as f64);
+
+    let mut inner = handle.inner.lock().await;
+    let last = inner.cpu_baseline;
+    inner.cpu_baseline = usage.cpu_usec;
+    drop(inner);
+
+    // A container restart resets the cgroup counter under us; treat
+    // any backwards step as a 0-baseline and increment by the new
+    // absolute value. Prometheus `rate()` tolerates the apparent
+    // reset.
+    let delta_usec = if usage.cpu_usec >= last {
+        usage.cpu_usec - last
+    } else {
+        usage.cpu_usec
+    };
+    if delta_usec > 0 {
+        counter!("bugpot_app_cpu_microseconds_total", "app" => handle.identity.name.clone())
+            .increment(delta_usec);
     }
 }
