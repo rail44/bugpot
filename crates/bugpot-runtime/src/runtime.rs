@@ -20,7 +20,7 @@ use tracing::{debug, info, warn};
 use crate::auth::Auth;
 use crate::cgroup_stats::{cgroup_path_for_pid, read_cpu_usec, read_memory_bytes};
 use crate::error::{Result, RuntimeError};
-use crate::image::{ImageId, Puller, gc_unused_images, load_cached_image};
+use crate::image::{ImageId, PulledImage, Puller, gc_unused_images, load_cached_image};
 use crate::logs::spawn_log_tails;
 use crate::spec::{SpecInputs, build_spec};
 use crate::volumes::{ensure_volume_host_dirs, remove_volume_dirs};
@@ -197,6 +197,120 @@ impl Runtime {
         }
         Container::load(root).map_err(Into::into)
     }
+
+    /// Reject the start if libcontainer already has a `Running` state
+    /// dir for `name`. Source of truth is libcontainer's on-disk
+    /// state, not any in-memory map: callers can crash and restart;
+    /// `reattach_running` skips `do_start` in that case, but a buggy
+    /// caller routing through `start_app` would otherwise wipe a live
+    /// container's state in `launch_container`'s stale-cleanup path.
+    fn reject_if_already_running(&self, name: &str) -> Result<()> {
+        let dir = self.containers_dir.join(name);
+        if dir.exists()
+            && Container::load(dir).is_ok_and(|c| c.status() == ContainerStatus::Running)
+        {
+            return Err(RuntimeError::AppAlreadyRunning(name.to_owned()));
+        }
+        Ok(())
+    }
+
+    /// Materialise the per-app log dir and open `stdout.log` /
+    /// `stderr.log` in `O_APPEND` mode for the container to write
+    /// through.
+    ///
+    /// Container stdout/stderr go to append-mode files on the host
+    /// (`<state>/logs/<app>/{stdout,stderr}.log`) rather than pipes
+    /// owned by bugpot. Reasons:
+    ///   - Files survive bugpot's death; a SIGKILL/crash no longer
+    ///     leaves the container writing to a closed pipe (SIGPIPE
+    ///     would kill the app on its next write — see #38).
+    ///   - On `reattach_running`, the new bugpot just tails the
+    ///     existing files; the container's fd 1/2 keep working
+    ///     through the restart.
+    ///
+    /// Volume bounding (rotation, rate limit) is deferred to #21.
+    fn open_log_files(&self, name: &str) -> Result<ContainerLogFiles> {
+        let dir = self.log_dir_for(name);
+        fs::create_dir_all(&dir).map_err(|e| RuntimeError::io(&dir, e))?;
+        let stdout = open_append(&dir.join("stdout.log"))?;
+        let stderr = open_append(&dir.join("stderr.log"))?;
+        Ok(ContainerLogFiles {
+            dir,
+            stdout,
+            stderr,
+        })
+    }
+
+    /// Build the container via libcontainer, transition it to running,
+    /// spawn the stdout/stderr tail tasks, and extract its pid.
+    ///
+    /// Consumes `logs.stdout` / `logs.stderr` because
+    /// `ContainerBuilder::with_stdout` / `with_stderr` take owned fds.
+    /// `logs.dir` is borrowed for `spawn_log_tails`. Returns just the
+    /// pid — the `Container` value isn't needed by the caller (later
+    /// lifecycle methods reload it via `try_load_container`).
+    fn launch_container(
+        &self,
+        name: &str,
+        bundle_dir: &Path,
+        logs: ContainerLogFiles,
+    ) -> Result<u32> {
+        // libcontainer's `with_root_path` is the *parent* directory
+        // under which it writes `<container_id>/state.json` (see
+        // libcontainer `init_builder.rs::create_container_dir`). So we
+        // pass `self.containers_dir` (parent), not
+        // `containers_dir/<name>`. The per-container dir is created by
+        // libcontainer itself; we only ensure stale state from a prior
+        // crash is gone first. The running-check at the top of
+        // `start_app` has already refused this start if the container
+        // were live, so anything we see now is genuinely stale.
+        let per_container_dir = self.containers_dir.join(name);
+        if per_container_dir.exists() {
+            warn!(?per_container_dir, "removing stale container state");
+            fs::remove_dir_all(&per_container_dir)
+                .map_err(|e| RuntimeError::io(&per_container_dir, e))?;
+        }
+
+        // `with_stdout`/`with_stderr` live on `ContainerBuilder`, so
+        // they must be called *before* `.as_init(...)` flips us into
+        // the init-builder type.
+        let mut container: Container = timed_step("libcontainer_build", || {
+            ContainerBuilder::new(name.to_owned(), SyscallType::Linux)
+                .with_root_path(&self.containers_dir)?
+                .with_stdout(logs.stdout)
+                .with_stderr(logs.stderr)
+                .as_init(bundle_dir)
+                .with_systemd(false)
+                .with_detach(true)
+                .build()
+                .map_err(RuntimeError::from)
+        })?;
+
+        // libcontainer `as_init().build()` runs the init process up to
+        // the "created" state. We then transition it to "running".
+        timed_step("libcontainer_start", || {
+            container.start().map_err(RuntimeError::from)
+        })?;
+
+        // Tail tasks read from the same files (read-only) and emit
+        // each new line via tracing so `just logs` still works. Seek
+        // to EOF so a fresh start doesn't replay historical lines; on
+        // reattach, the controller calls `ensure_log_tails` for the
+        // same effect.
+        spawn_log_tails(&logs.dir, name);
+
+        let raw_pid = container
+            .pid()
+            .ok_or_else(|| RuntimeError::Other("container has no pid after start".into()))?
+            .as_raw();
+        // `as_raw()` is i32; pids are always non-negative when
+        // running.
+        u32::try_from(raw_pid).map_err(|_| {
+            RuntimeError::Other(format!(
+                "unexpected negative pid from libcontainer: {raw_pid}"
+            ))
+        })
+    }
 }
 
 impl RuntimeOps for Runtime {
@@ -226,20 +340,7 @@ impl RuntimeOps for Runtime {
         netns_path: Option<&Path>,
     ) -> Result<RunningApp> {
         let name = spec.name().to_owned();
-
-        // Reject duplicates. Source of truth = libcontainer on-disk
-        // state, not an in-memory map: callers can crash and restart;
-        // the controller's reattach path will skip do_start in that
-        // case, but a defensive check here means a buggy caller can't
-        // wipe a live container's state below (the "stale state" cleanup
-        // assumes the dir is from a *dead* container).
-        let per_container_dir = self.containers_dir.join(&name);
-        if per_container_dir.exists()
-            && Container::load(per_container_dir.clone())
-                .is_ok_and(|c| c.status() == ContainerStatus::Running)
-        {
-            return Err(RuntimeError::AppAlreadyRunning(name));
-        }
+        self.reject_if_already_running(&name)?;
 
         // 1. Image: must already be in the on-disk cache. Callers do
         // `pull_image` first; passing the result here avoids a second
@@ -251,11 +352,10 @@ impl RuntimeOps for Runtime {
         })?;
 
         // 2. Bundle.
-        let step = Instant::now();
         let bundle_dir = self.bundles_dir.join(&name);
-        prepare_bundle_dir(&bundle_dir, &image.rootfs())?;
-        histogram!("bugpot_container_start_seconds", "step" => "bundle")
-            .record(step.elapsed().as_secs_f64());
+        timed_step("bundle", || {
+            prepare_bundle_dir(&bundle_dir, &image.rootfs())
+        })?;
 
         // 3. Volumes.
         //
@@ -268,113 +368,14 @@ impl RuntimeOps for Runtime {
         let volume_host_paths = ensure_volume_host_dirs(&self.volumes_dir, &name, &spec.volumes)?;
 
         // 4. Spec.
-        //
-        // Pass the absolute path `<bundle_dir>/rootfs` (a symlink set up by
-        // `prepare_bundle_dir` that points at the image cache). libcontainer
-        // accepts an absolute `root.path`; we also need an absolute path so
-        // `build_spec`'s named-user resolver can read
-        // `<rootfs>/etc/{passwd,group}` at spec-build time.
-        let step = Instant::now();
-        let bundle_rootfs = bundle_dir.join("rootfs");
-        let runtime_spec = build_spec(&SpecInputs {
-            spec,
-            image_config: &image.config,
-            rootfs: &bundle_rootfs,
-            netns_path,
-            volume_host_paths: &volume_host_paths,
+        timed_step("spec", || {
+            write_runtime_spec(&bundle_dir, spec, &image, netns_path, &volume_host_paths)
         })?;
-        let config_path = bundle_dir.join("config.json");
-        runtime_spec
-            .save(&config_path)
-            .map_err(RuntimeError::from)?;
-        histogram!("bugpot_container_start_seconds", "step" => "spec")
-            .record(step.elapsed().as_secs_f64());
 
-        // 4. Build container.
-        //
-        // libcontainer's `with_root_path` is the *parent* directory under
-        // which it writes `<container_id>/state.json` (see libcontainer
-        // `init_builder.rs::create_container_dir`). So we pass
-        // `self.containers_dir` (parent), not `containers_dir/<name>`. The
-        // per-container dir is created by libcontainer itself; we only
-        // ensure stale state from a prior crash is gone first. The
-        // running-check above has already refused this start if the
-        // container were live, so anything we see now is genuinely
-        // stale.
-        if per_container_dir.exists() {
-            warn!(?per_container_dir, "removing stale container state");
-            fs::remove_dir_all(&per_container_dir)
-                .map_err(|e| RuntimeError::io(&per_container_dir, e))?;
-        }
-        // `containers_dir` itself must exist (created by `Runtime::new`).
-
+        // 5. Launch.
         info!(app = %name, bundle = %bundle_dir.display(), "creating container");
-
-        // Container stdout/stderr go to append-mode files on the host
-        // (`<state>/logs/<app>/{stdout,stderr}.log`) rather than pipes
-        // owned by bugpot. Reasons:
-        //   - Files survive bugpot's death; a SIGKILL/crash no longer
-        //     leaves the container writing to a closed pipe (SIGPIPE
-        //     would kill the app on its next write — see #38).
-        //   - On `reattach_running`, the new bugpot just tails the
-        //     existing files; the container's fd 1/2 keep working
-        //     through the restart.
-        // Volume bounding (rotation, rate limit) is deferred to #21.
-        let log_dir = self.log_dir_for(&name);
-        fs::create_dir_all(&log_dir).map_err(|e| RuntimeError::io(&log_dir, e))?;
-        let stdout_path = log_dir.join("stdout.log");
-        let stderr_path = log_dir.join("stderr.log");
-        let stdout_file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&stdout_path)
-            .map_err(|e| RuntimeError::io(&stdout_path, e))?;
-        let stderr_file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&stderr_path)
-            .map_err(|e| RuntimeError::io(&stderr_path, e))?;
-        let stdout_fd: OwnedFd = stdout_file.into();
-        let stderr_fd: OwnedFd = stderr_file.into();
-
-        // `with_stdout`/`with_stderr` live on `ContainerBuilder`, so they
-        // must be called *before* `.as_init(...)` flips us into the
-        // init-builder type.
-        let step = Instant::now();
-        let mut container: Container = ContainerBuilder::new(name.clone(), SyscallType::Linux)
-            .with_root_path(&self.containers_dir)?
-            .with_stdout(stdout_fd)
-            .with_stderr(stderr_fd)
-            .as_init(&bundle_dir)
-            .with_systemd(false)
-            .with_detach(true)
-            .build()?;
-        histogram!("bugpot_container_start_seconds", "step" => "libcontainer_build")
-            .record(step.elapsed().as_secs_f64());
-
-        // libcontainer `as_init().build()` runs the init process up to the
-        // "created" state. We then transition it to "running".
-        let step = Instant::now();
-        container.start()?;
-        histogram!("bugpot_container_start_seconds", "step" => "libcontainer_start")
-            .record(step.elapsed().as_secs_f64());
-
-        // Tail tasks read from the same files (read-only) and emit each
-        // new line via tracing so `just logs` still works. Seek to EOF
-        // so a fresh start doesn't replay historical lines; on reattach,
-        // the controller calls `ensure_log_tails` for the same effect.
-        spawn_log_tails(&log_dir, &name);
-
-        let raw_pid = container
-            .pid()
-            .ok_or_else(|| RuntimeError::Other("container has no pid after start".into()))?
-            .as_raw();
-        // `as_raw()` is i32; pids are always non-negative when running.
-        let pid = u32::try_from(raw_pid).map_err(|_| {
-            RuntimeError::Other(format!(
-                "unexpected negative pid from libcontainer: {raw_pid}"
-            ))
-        })?;
+        let logs = self.open_log_files(&name)?;
+        let pid = self.launch_container(&name, &bundle_dir, logs)?;
 
         Ok(RunningApp {
             name,
@@ -560,6 +561,72 @@ impl Runtime {
         let live = self.live_image_digests()?;
         gc_unused_images(&self.images_dir, &live)
     }
+}
+
+/// Owned stdout/stderr file descriptors + log dir for a single
+/// container's launch path. Passed from `open_log_files` (which opens
+/// them) to `launch_container` (which hands them to libcontainer and
+/// then uses the dir for `spawn_log_tails`).
+struct ContainerLogFiles {
+    dir: PathBuf,
+    stdout: OwnedFd,
+    stderr: OwnedFd,
+}
+
+/// Open `path` for appending, creating it if missing, and return the
+/// owned fd. `O_APPEND` makes each write atomically seek to the file's
+/// end, which is what container stdout/stderr need.
+fn open_append(path: &Path) -> Result<OwnedFd> {
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| RuntimeError::io(path, e))?;
+    Ok(file.into())
+}
+
+/// Time `f` and record its duration to
+/// `bugpot_container_start_seconds{step=<step>}`. The histogram is
+/// observed regardless of success/failure so a stuck phase still shows
+/// up — distinguishing "stuck pull" from "succeeded but slow" is what
+/// the bucket distribution conveys.
+fn timed_step<T>(step: &'static str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    let start = Instant::now();
+    let out = f();
+    histogram!("bugpot_container_start_seconds", "step" => step)
+        .record(start.elapsed().as_secs_f64());
+    out
+}
+
+/// Build the OCI runtime `Spec` for an app and persist it to
+/// `<bundle_dir>/config.json`. Wraps the `build_spec` +
+/// `runtime_spec.save(...)` pair so `start_app` can call it inside
+/// `timed_step` without spelling out the inputs struct at every site.
+fn write_runtime_spec(
+    bundle_dir: &Path,
+    spec: &AppSpec,
+    image: &PulledImage,
+    netns_path: Option<&Path>,
+    volume_host_paths: &[PathBuf],
+) -> Result<()> {
+    // The `<bundle_dir>/rootfs` path is the symlink set up by
+    // `prepare_bundle_dir`; libcontainer accepts an absolute
+    // `root.path`, and `build_spec`'s named-user resolver also needs
+    // an absolute path to read `<rootfs>/etc/{passwd,group}` at
+    // spec-build time.
+    let bundle_rootfs = bundle_dir.join("rootfs");
+    let runtime_spec = build_spec(&SpecInputs {
+        spec,
+        image_config: &image.config,
+        rootfs: &bundle_rootfs,
+        netns_path,
+        volume_host_paths,
+    })?;
+    let config_path = bundle_dir.join("config.json");
+    runtime_spec
+        .save(&config_path)
+        .map_err(RuntimeError::from)?;
+    Ok(())
 }
 
 /// Prepare `<bundle_dir>/rootfs` so libcontainer can use it.
