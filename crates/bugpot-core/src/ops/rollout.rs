@@ -1,37 +1,101 @@
-//! Image rollout pipeline: pull → record → restart.
+//! Image rollout pipeline: blue-green deployment with readiness
+//! gate, atomic switch, drain, and auto-rollback on failure.
 //!
-//! Sequenced with the lifecycle methods (`stop`, `ensure_running`)
-//! defined in `lifecycle.rs` and the digest-cache update co-located
-//! with the rollouts deque so the two stay atomic.
+//! Flow when the app is `Running` or `Frozen` (= has a *from*
+//! container worth keeping live during the rollover):
+//!
+//! ```text
+//!   set_rollout(tag)
+//!     │
+//!     ├─ pull(tag) ─ failures classified as ImageAuth / ImagePull
+//!     ├─ record_rollout + persist (durable before any container work)
+//!     ├─ enter_rolling_over (thaw if Frozen) → state := RollingOver{from_ip}
+//!     │     (resolver keeps returning from_ip for the whole window
+//!     │      below; see handle.rs::claim_start_slot)
+//!     ├─ build_to_slot(to_id)
+//!     │     ├─ allocate endpoint in opposite slot
+//!     │     ├─ pull (cache-hit; digest already resolved above)
+//!     │     ├─ start container
+//!     │     └─ readiness probe
+//!     ├─ on Ok(new_ip):
+//!     │     ├─ state := Running{new_ip}; current_slot.flip
+//!     │     ├─ drain active_upgrades (60 s cap)
+//!     │     └─ teardown from-slot
+//!     └─ on Err:
+//!           ├─ state := Running{from_ip}  (rollback; current_slot unchanged)
+//!           └─ teardown to-slot
+//! ```
+//!
+//! The `Stopped` branch skips the blue-green path entirely and
+//! delegates to the normal cold-start (`ensure_running` on the
+//! current slot) — there's no "from" container to switch off of.
+//!
+//! `RollingOver`'s `from_ip` field is the single source of truth
+//! for "where should the resolver send traffic right now": once it
+//! flips back to `Running { container_ip }` (success) or
+//! `Running { container_ip = from_ip }` (rollback), the resolver
+//! reads whichever IP is in `state` on its next access. No
+//! `Notify` is needed because there are no waiters — the resolver
+//! never blocks during a rollover.
 
+use std::net::Ipv4Addr;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant, SystemTime};
 
+use anyhow::anyhow;
 use bugpot_config::Rollout;
 use bugpot_egress::EgressOps;
 use bugpot_runtime::{ImageId, RuntimeOps};
-use tracing::warn;
+use tokio::time::sleep;
+use tracing::{info, warn};
 
 use crate::AppHost;
 use crate::RolloutError;
 use crate::error::classify_pull_error_for_rollout;
-use crate::handle::{AppHandle, DigestCache, MAX_ROLLOUT_HISTORY};
+use crate::handle::{AppHandle, AppState, DigestCache, MAX_ROLLOUT_HISTORY, container_id};
+
+/// Wall-clock cap on the post-switch drain: how long to wait for
+/// in-flight WebSocket / SSE splices to finish on the *from* slot
+/// before tearing it down. Defensive default; not user-configurable
+/// by design — the app's own per-connection timeout is the
+/// correctness mechanism, this is just a safety net so a misbehaving
+/// upstream can't pin the old container indefinitely.
+const DRAIN_TIMEOUT: Duration = Duration::from_mins(1);
+
+/// Drain poll interval. Short enough that a sub-second-bursty upgrade
+/// cliff finishes fast; long enough that an idle `active_upgrades`
+/// stays in the cache without churning.
+const DRAIN_POLL: Duration = Duration::from_millis(100);
+
+/// Outcome of `enter_rolling_over` — tells `set_rollout` which
+/// container-bring-up path applies for this state of the world.
+enum RolloverEntry {
+    /// No `from` container exists; treat the rollout as a normal
+    /// cold start on the current slot. Resolver returns the new IP
+    /// directly once `ensure_running` lands.
+    ColdStart,
+    /// `from` container is live (or just thawed). State has been
+    /// transitioned to `RollingOver { from_ip }`; caller now owns
+    /// the blue-green ladder.
+    BlueGreen { from_ip: Ipv4Addr },
+}
 
 impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
-    /// Append a new rollout to `name` and bring the app to that tag.
+    /// Append a new rollout to the app's history and bring traffic to
+    /// it. Blue-green when a from-side exists; otherwise a normal
+    /// cold start.
     ///
-    /// Steps:
-    ///   1. Pull `{repo}:{tag}`.
-    ///   2. Push to the rollout history (popping the oldest entry
-    ///      when the deque is full).
-    ///   3. Persist `<apps_dir>/<name>.toml` with the new current
-    ///      rollout.
-    ///   4. If the app is `Running`, stop it; then start under the
-    ///      new rollout.
-    ///   5. If `Stopped`, start now (so callers observe a deployed
-    ///      app on return).
-    ///   6. If `Starting` / `Stopping`, return [`RolloutError::Conflict`]
-    ///      and let the caller retry.
+    /// Error semantics:
+    /// - [`RolloutError::EmptyTag`]: caller passed an empty tag.
+    /// - [`RolloutError::Conflict`]: state is `Starting` /
+    ///   `Stopping` / already `RollingOver`. Caller retries.
+    /// - [`RolloutError::ImageAuth`] / [`RolloutError::ImagePull`]:
+    ///   pull-side failures (classified pre-state-transition, no
+    ///   cleanup needed).
+    /// - [`RolloutError::StartFailed`]: container failed to start
+    ///   or pass readiness on the *new* slot. The *from* side is
+    ///   intact and serving — this is the auto-rollback case.
     pub async fn set_rollout(
         &self,
         handle: &Arc<AppHandle>,
@@ -42,8 +106,10 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
         }
         let name = handle.name().to_owned();
 
-        // Conflict check: refuse mid-transition. Done before pull so
-        // we don't waste a registry round-trip on a doomed call.
+        // Pre-flight conflict check. Done before pull so a doomed
+        // call doesn't burn a registry round-trip. Re-verified inside
+        // `enter_rolling_over` because state can drift across the
+        // pull await.
         {
             let inner = handle.inner.lock().await;
             if inner.state.is_busy() {
@@ -60,31 +126,215 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
         let resolved_digest = self.pull_for_rollout(handle, &repo, &tag).await?;
 
         // 2. Append to history and update the digest cache so the
-        // next `do_start` uses *this* rollout's digest, not the
-        // previous rollout's (which may have been a different tag).
+        // next start (cold or blue-green) uses *this* rollout's
+        // digest, not the previous rollout's.
         let rollout = Rollout {
             tag,
             created_at: SystemTime::now(),
         };
         record_rollout(handle, rollout.clone(), repo, resolved_digest).await;
 
-        // 3. Persist the rollout to its own state file. Spec doesn't
-        // change here, so no spec rewrite needed.
+        // 3. Persist before any container work — a crash mid-flight
+        // must leave the new tag durable so reattach picks it up.
         if let Err(e) = self.store.persist_rollouts(handle).await {
             warn!(app = %name, error = ?e, "failed to persist rollouts");
         }
 
-        // 4 + 5: bring the container to the new image. If it was
-        // running, stop first so the start uses the new digest cache.
-        let was_running = handle.inner.lock().await.state.is_running();
-        if was_running && let Err(e) = self.stop(handle).await {
-            warn!(app = %name, error = ?e, "stop before rollout-restart failed");
+        // 4. Decide dispatch under the same lock that performs the
+        // RollingOver transition.
+        match self.enter_rolling_over(handle).await? {
+            RolloverEntry::ColdStart => {
+                self.ensure_running(handle)
+                    .await
+                    .map_err(RolloutError::StartFailed)?;
+            }
+            RolloverEntry::BlueGreen { from_ip } => {
+                self.do_blue_green(handle, from_ip).await?;
+            }
         }
-        if let Err(e) = self.ensure_running(handle).await {
-            return Err(RolloutError::StartFailed(e));
+        Ok(rollout)
+    }
+
+    /// Atomic gate at the boundary between "rollout pipeline pulled
+    /// and recorded the new tag" and "rollout pipeline starts touching
+    /// containers". Resolves the race window across the pull await.
+    ///
+    /// - `Stopped`: trivial — no thaw, no transition, caller goes the
+    ///   cold-start path.
+    /// - `Frozen`: thaw to `Running` first so the from-side serves
+    ///   any request that lands during the rollover window. (Without
+    ///   this, the resolver returns a frozen IP and requests stall on
+    ///   the paused container's listen socket.)
+    /// - `Running`: transition to `RollingOver`; caller owns the
+    ///   blue-green flow.
+    /// - Other states (`Starting` / `Stopping` / `RollingOver`):
+    ///   conflict — drifted in across the pull.
+    async fn enter_rolling_over(
+        &self,
+        handle: &Arc<AppHandle>,
+    ) -> std::result::Result<RolloverEntry, RolloutError> {
+        let name = handle.name().to_owned();
+
+        // Thaw step. Done outside the second lock because
+        // `unfreeze_app` is a kernel write that can block on the
+        // freezer file, and we don't want to hold the state lock
+        // across it. The post-thaw lock acquisition re-verifies.
+        let needs_thaw = handle.inner.lock().await.state.is_frozen();
+        if needs_thaw {
+            let cid = handle.current_id().await;
+            if let Err(e) = self.runtime.unfreeze_app(&cid).await {
+                return Err(RolloutError::StartFailed(anyhow!(
+                    "unfreeze for rollover: {e:#}"
+                )));
+            }
+            let mut inner = handle.inner.lock().await;
+            if let AppState::Frozen { container_ip } = inner.state {
+                inner.state = AppState::Running { container_ip };
+            }
         }
 
-        Ok(rollout)
+        // Atomic transition. Lock scoped tightly: the guard releases
+        // before the caller starts building the new slot, so the
+        // resolver path (which also takes this lock) can't be blocked
+        // by the build phase.
+        let mut inner = handle.inner.lock().await;
+        let outcome = match inner.state {
+            AppState::Stopped => Ok(RolloverEntry::ColdStart),
+            AppState::Running { container_ip } => {
+                inner.state = AppState::RollingOver {
+                    from_ip: container_ip,
+                };
+                Ok(RolloverEntry::BlueGreen {
+                    from_ip: container_ip,
+                })
+            }
+            AppState::Frozen { .. }
+            | AppState::Starting { .. }
+            | AppState::Stopping
+            | AppState::RollingOver { .. } => Err(RolloutError::Conflict(name)),
+        };
+        drop(inner);
+        outcome
+    }
+
+    /// Blue-green ladder: build the new slot, atomically switch, drain,
+    /// tear down the old slot. On any build / readiness failure the
+    /// from-side stays serving and we tear down the partial new slot
+    /// — the caller (`set_rollout`) translates the error to
+    /// `RolloutError::StartFailed`.
+    async fn do_blue_green(
+        &self,
+        handle: &Arc<AppHandle>,
+        from_ip: Ipv4Addr,
+    ) -> std::result::Result<(), RolloutError> {
+        let app_name = handle.identity.name.clone();
+        let (from_slot, to_slot) = {
+            let inner = handle.inner.lock().await;
+            (inner.current_slot, inner.current_slot.other())
+        };
+        let to_id = container_id(&app_name, to_slot);
+
+        info!(
+            app = %app_name,
+            from = %container_id(&app_name, from_slot),
+            to = %to_id,
+            "rollover: building new slot",
+        );
+
+        let build_result = self.build_to_slot(handle, &to_id).await;
+
+        match build_result {
+            Ok(new_ip) => {
+                // Atomic switch. Order is important: state transition
+                // first, *then* drain + teardown — between the two,
+                // new traffic lands on `new_ip` (the resolver re-reads
+                // `state`) and the from-side only carries connections
+                // already spliced through the router.
+                {
+                    let mut inner = handle.inner.lock().await;
+                    inner.state = AppState::Running {
+                        container_ip: new_ip,
+                    };
+                    inner.current_slot = to_slot;
+                }
+                info!(
+                    app = %app_name,
+                    %from_ip,
+                    %new_ip,
+                    "rollover: switched",
+                );
+
+                drain_active_upgrades(&handle.active_upgrades, &app_name).await;
+
+                let from_id = container_id(&app_name, from_slot);
+                self.teardown_containers(&app_name, &[from_id]).await;
+                Ok(())
+            }
+            Err(e) => {
+                // Rollback: from-side current_slot stays put, state
+                // returns to Running{from_ip}. New side is partially
+                // built — clean it up.
+                {
+                    let mut inner = handle.inner.lock().await;
+                    inner.state = AppState::Running {
+                        container_ip: from_ip,
+                    };
+                }
+                warn!(
+                    app = %app_name,
+                    error = ?e,
+                    "rollover: new-slot build failed; rolled back to from-side",
+                );
+                self.teardown_containers(&app_name, &[to_id]).await;
+                Err(RolloutError::StartFailed(e))
+            }
+        }
+    }
+
+    /// Run the same phase sequence `do_start` uses, but parameterised
+    /// by an explicit `container_id` (the to-slot's, not the
+    /// handle's current). Each phase's error path is responsible for
+    /// reverting its own side-effect (endpoint release, container
+    /// stop) before returning — the caller (`do_blue_green`) layers a
+    /// further sweep on top via `teardown_containers` to catch the
+    /// edge where libcontainer state landed on disk but `start_app`
+    /// returned `Err` after that.
+    async fn build_to_slot(
+        &self,
+        handle: &Arc<AppHandle>,
+        to_id: &str,
+    ) -> anyhow::Result<Ipv4Addr> {
+        let spec = handle.spec.read().await.clone();
+        let plain_image_ref = self.resolve_image_ref(handle, &spec).await?;
+
+        let endpoint = self.allocate_endpoint_phase(to_id, &spec).await?;
+
+        let image_id = match self.pull_image_phase(handle, &spec, &plain_image_ref).await {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = self.egress.release_endpoint(to_id).await;
+                return Err(e);
+            }
+        };
+
+        if let Err(e) = self
+            .start_container_phase(to_id, &spec, &image_id, &endpoint)
+            .await
+        {
+            let _ = self.egress.release_endpoint(to_id).await;
+            return Err(e);
+        }
+
+        if let Err(e) = self
+            .readiness_phase(&handle.identity.name, endpoint.container_ip, &spec)
+            .await
+        {
+            let _ = self.runtime.stop_app(to_id).await;
+            let _ = self.egress.release_endpoint(to_id).await;
+            return Err(e);
+        }
+
+        Ok(endpoint.container_ip)
     }
 
     /// Pull `{repo}:{tag}` for an in-flight `set_rollout`. Classifies
@@ -110,6 +360,36 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
     /// handle is registered — pass the value from `find_handle`.
     pub async fn list_rollouts(&self, handle: &Arc<AppHandle>) -> Vec<Rollout> {
         handle.inner.lock().await.rollouts.iter().cloned().collect()
+    }
+}
+
+/// Wait for the from-slot's spliced upgrades (WebSocket / SSE) to
+/// drain, capped at `DRAIN_TIMEOUT`. Polls every `DRAIN_POLL` rather
+/// than subscribing because each splice updates the counter from its
+/// own task and a notify-on-zero would race against the next
+/// increment; the polling cost is negligible against the cap.
+///
+/// HTTP request/response is *not* drained here — the router's
+/// `REQUEST_TIMEOUT` (30 s) bounds those independently, and starting
+/// a teardown on the from-slot while a request is mid-flight only
+/// returns whatever error the upstream chose; the new slot already
+/// owns subsequent traffic.
+async fn drain_active_upgrades(upgrades: &Arc<AtomicUsize>, app_name: &str) {
+    let start = Instant::now();
+    loop {
+        let active = upgrades.load(Ordering::Relaxed);
+        if active == 0 {
+            return;
+        }
+        if start.elapsed() >= DRAIN_TIMEOUT {
+            warn!(
+                app = %app_name,
+                active,
+                "rollover drain: timeout — tearing down with upgrades still spliced",
+            );
+            return;
+        }
+        sleep(DRAIN_POLL).await;
     }
 }
 

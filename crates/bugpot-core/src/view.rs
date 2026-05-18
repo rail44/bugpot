@@ -39,6 +39,10 @@ pub enum AppStateView {
     /// Container is paused (cgroup freezer). RAM resident, CPU 0.
     /// Next request resumes it in sub-ms (no cold start).
     Frozen,
+    /// Blue-green rollout in flight. The previously-running container
+    /// is still serving traffic; a new container in the opposite slot
+    /// is being built and readiness-probed in the background.
+    RollingOver,
     Stopping,
 }
 
@@ -50,6 +54,7 @@ pub(crate) async fn view_of(handle: &Arc<AppHandle>) -> AppView {
             AppState::Starting { .. } => AppStateView::Starting,
             AppState::Running { .. } => AppStateView::Running,
             AppState::Frozen { .. } => AppStateView::Frozen,
+            AppState::RollingOver { .. } => AppStateView::RollingOver,
             AppState::Stopping => AppStateView::Stopping,
         };
         (state, inner.rollouts.back().cloned())
