@@ -37,10 +37,6 @@ idle_timeout = "5m"
 path = "/health"
 timeout = "30s"
 
-[resources]
-memory = "256MiB"
-cpu = "500m"
-
 [env]
 LD_SUPERUSER_NAME = "admin"
 LD_DISABLE_BACKGROUND_TASKS = "False"
@@ -66,10 +62,6 @@ idle_timeout = "1h"
 [readiness]
 path = "/api/health"
 timeout = "60s"
-
-[resources]
-memory = "2GiB"
-cpu = "2"
 
 [env]
 A = "1"

@@ -17,7 +17,7 @@ use axum::{
     response::Response,
     routing::any,
 };
-use bugpot_config::{AppSpec, EgressSpec, Readiness, Resources, Scaling};
+use bugpot_config::{AppSpec, EgressSpec, Readiness, Scaling};
 use bugpot_router::{ResolveError, RouterConfig, Upstream, UpstreamResolver, serve, subdomain_of};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
@@ -73,7 +73,6 @@ fn fake_app(name: &str, port: u16) -> AppSpec {
         env: HashMap::default(),
         scaling: Scaling::default(),
         readiness: Readiness::default(),
-        resources: Resources::default(),
         volumes: Vec::new(),
     }
 }

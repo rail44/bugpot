@@ -297,20 +297,11 @@ A user namespace was investigated and **deferred**: libcontainer creates the use
 
 **Freeze vs stop.** The default scale-to-zero path is **freeze, not stop** (cgroup v2 freezer). Frozen apps keep their full RSS resident but consume zero CPU; the next request resumes in sub-ms (no image pull, no libcontainer fork, no TCP readiness probe). The trade-off — RAM stays allocated — is bounded by a memory-pressure handler that polls `MemAvailable` and evicts oldest-frozen apps to `Stopped` when memory drops below `BUGPOT_FREEZE_MEM_LO`. This shifts the bottleneck from "cold-start CPU spike on every long-idle hit" to "RAM in steady state", which is what's wanted for the "many small self-hosted apps on a cheap VM" use case (Vaultwarden / Grafana / Linkding-class). Set `BUGPOT_FREEZE_ENABLED=false` to restore the pre-freeze idle = stop behavior. The router's `forward_upgrade` increments `AppHandle::active_upgrades` for the lifetime of every WebSocket / SSE splice, and the idle reaper refuses to freeze while that counter is non-zero — so long-lived upgraded connections survive idle gaps without being silently stranded.
 
-### Resource allocation (soft, not hard)
+### Resource allocation: kernel defaults
 
-Per-app `[resources]` in app TOML are **soft targets / relative weights**, not hard caps. The premise is "the whole instance is bugpot's" — leaving idle apps' slices stranded is the wrong trade.
+No per-app cgroup limits. The premise is "the whole instance is bugpot's" — fair-share `cpu.weight = 100` (the kernel default) across every container plus host-wide LRU on memory is the right model. Idle apps yield their CPU automatically; memory pressure is bounded by the freeze + `BUGPOT_FREEZE_MEM_LO` / `BUGPOT_FREEZE_MEM_HI` eviction handler (see Scale-to-zero), and worst-case host OOM is accepted.
 
-- `memory = "256MiB"` → cgroup v2 `memory.high` (soft throttle via direct reclaim). An app that legitimately needs more bursts upward; the kernel slows the offender via reclaim before any kill.
-- `cpu = "2.0"` → cgroup v2 `cpu.weight` (proportional share). An app at `"2.0"` takes twice the CPU of one at `"1.0"` **only while both are saturating the same core**; otherwise each gets whatever's idle. The default `"1.0"` (= 1024 shares = weight 100) is the kernel's neutral default, so an app on the host alone uses everything available.
-
-Defaults (when `[resources]` is omitted): memory 128 MB soft, cpu 1.0 (neutral weight). Translation lives in `bugpot-runtime/src/resources.rs::{parse_memory, parse_cpu}`; the OCI spec wiring is in `bugpot-runtime/src/spec.rs::build_resources`.
-
-**Worst-case backstops are at the host level**, not per-app:
-- Memory: `memory.high` doesn't OOM-kill. A genuinely runaway leaky app can keep eating reclaimable memory until the kernel's host-level OOM kicks in. The freeze/memory-pressure handler (`BUGPOT_FREEZE_MEM_LO` / `BUGPOT_FREEZE_MEM_HI`) reduces pressure earlier by evicting oldest-frozen apps to `Stopped`.
-- CPU: `cpu.weight` can't OOM anything; under contention the kernel just interleaves more aggressively.
-
-This is the explicit trade for higher steady-state utilisation on the "small VM with many apps" deployment shape.
+If priorities ever become necessary (e.g. "Grafana > batch worker"), the OCI spec wiring lives in `bugpot-runtime/src/spec.rs::build_spec` and a per-app `cpu.weight` knob can be added back — there's just no AppSpec field for it today.
 
 ### Readiness probe
 
