@@ -162,7 +162,7 @@ pub struct Runtime {
     /// `<state>/logs/<app>/{stdout,stderr}.log` via inotify.
     /// `ensure_log_tails` inserts on first spawn (idempotent;
     /// re-entry is a no-op so reattach + start-time spawns can't
-    /// double up). `cleanup_orphan_container` removes + aborts on
+    /// double up). `cleanup_app_assets` removes + aborts on
     /// app removal — without that the inotify watches outlive the
     /// container because the log files themselves are kept around
     /// for post-mortem (CLAUDE.md L333). `std::sync::Mutex` (not
@@ -398,13 +398,20 @@ impl RuntimeOps for Runtime {
         // for an existing volume is a no-op aside from re-asserting
         // ownership (so a TOML `user` change does the right thing on
         // next start). Data survives across container restarts and
-        // rollouts; only `cleanup_orphan_container` removes the dir.
+        // rollouts; only `cleanup_app_assets` removes the dir.
         let volume_host_paths =
             ensure_volume_host_dirs(&self.volumes_dir, app_name, &spec.volumes)?;
 
         // 4. Spec.
         timed_step("spec", || {
-            write_runtime_spec(&bundle_dir, spec, &image, netns_path, &volume_host_paths)
+            write_runtime_spec(
+                &bundle_dir,
+                container_id,
+                spec,
+                &image,
+                netns_path,
+                &volume_host_paths,
+            )
         })?;
 
         // 5. Launch. Log files are app-keyed (shared across slots for
@@ -674,6 +681,7 @@ fn timed_step<T>(step: &'static str, f: impl FnOnce() -> Result<T>) -> Result<T>
 /// `timed_step` without spelling out the inputs struct at every site.
 fn write_runtime_spec(
     bundle_dir: &Path,
+    container_id: &str,
     spec: &AppSpec,
     image: &PulledImage,
     netns_path: Option<&Path>,
@@ -687,6 +695,7 @@ fn write_runtime_spec(
     let bundle_rootfs = bundle_dir.join("rootfs");
     let runtime_spec = build_spec(&SpecInputs {
         spec,
+        container_id,
         image_config: &image.config,
         rootfs: &bundle_rootfs,
         netns_path,

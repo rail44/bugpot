@@ -151,11 +151,12 @@ pub(crate) struct HandleInner {
     pub(crate) current_slot: Slot,
     pub(crate) last_access: Instant,
     /// Bounded rollout history, co-located with `state` because the
-    /// two move together: a rollout push advances both the rollout
-    /// list and the state (Stopped → Running, or Running → Stopping →
-    /// Running with the new image). The back of the deque is the
-    /// current rollout (the tag bugpot pulls and runs). Empty = the
-    /// app is registered but not yet deployed, in which case
+    /// two move together: a rollout push advances the rollout list
+    /// and either cold-starts the app (Stopped → Running on the
+    /// current slot) or blue-greens it (Running → `RollingOver` →
+    /// Running on the *opposite* slot). The back of the deque is
+    /// the current rollout (the tag bugpot pulls and runs). Empty =
+    /// the app is registered but not yet deployed, in which case
     /// `ensure_running` will fail.
     pub(crate) rollouts: VecDeque<Rollout>,
     /// Resolved image digest from the first successful pull, paired

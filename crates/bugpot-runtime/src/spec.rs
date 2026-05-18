@@ -20,6 +20,13 @@ use crate::error::{Result, RuntimeError};
 /// makes the builder easier to test in isolation.
 pub(crate) struct SpecInputs<'a> {
     pub spec: &'a AppSpec,
+    /// The slot-suffixed container ID (e.g. `"myapp-a"`). Used as the
+    /// cgroup leaf so blue-green rollovers can stop one slot's cgroup
+    /// without killing the other's processes — earlier we keyed the
+    /// cgroup off `spec.name()`, which made both slots share a cgroup
+    /// and turned a perfectly correct `stop_app(from)` into a kill of
+    /// the new slot's container.
+    pub container_id: &'a str,
     pub image_config: &'a ImageConfigFile,
     /// Absolute path to the prepared rootfs (image layers, already
     /// extracted somewhere bugpot owns).
@@ -41,6 +48,7 @@ pub(crate) struct SpecInputs<'a> {
 pub(crate) fn build_spec(inputs: &SpecInputs<'_>) -> Result<Spec> {
     let SpecInputs {
         spec,
+        container_id,
         image_config,
         rootfs,
         netns_path,
@@ -98,7 +106,7 @@ pub(crate) fn build_spec(inputs: &SpecInputs<'_>) -> Result<Spec> {
     let linux = LinuxBuilder::default()
         .namespaces(namespaces)
         .seccomp(seccomp)
-        .cgroups_path(PathBuf::from(format!("/bugpot/{}", spec.name())))
+        .cgroups_path(PathBuf::from(format!("/bugpot/{container_id}")))
         .build()?;
 
     // ---- Mounts ----
@@ -418,6 +426,7 @@ LOG_LEVEL = "info"
         let rootfs = PathBuf::from("/tmp/bugpot-test-rootfs");
         let spec = build_spec(&SpecInputs {
             spec: &app,
+            container_id: "test-a",
             image_config: &image,
             rootfs: &rootfs,
             netns_path: None,
@@ -487,6 +496,7 @@ LOG_LEVEL = "info"
 
         let spec = build_spec(&SpecInputs {
             spec: &app,
+            container_id: "test-a",
             image_config: &image,
             rootfs: &rootfs,
             netns_path: Some(&netns),
@@ -511,6 +521,7 @@ LOG_LEVEL = "info"
         let image = make_image_config(vec!["/bin/run"], vec![]);
         let spec = build_spec(&SpecInputs {
             spec: &app,
+            container_id: "test-a",
             image_config: &image,
             rootfs: Path::new("/tmp/rootfs"),
             netns_path: None,
@@ -545,6 +556,7 @@ PORT = "9999"
         let image = make_image_config(vec!["/run"], vec![]);
         let spec = build_spec(&SpecInputs {
             spec: &app,
+            container_id: "test-a",
             image_config: &image,
             rootfs: Path::new("/tmp/rootfs"),
             netns_path: None,
@@ -581,6 +593,7 @@ PORT = "9999"
         ];
         let spec = build_spec(&SpecInputs {
             spec: &app,
+            container_id: "test-a",
             image_config: &image,
             rootfs: Path::new("/tmp/rootfs"),
             netns_path: None,
@@ -626,6 +639,7 @@ PORT = "9999"
         };
         let err = build_spec(&SpecInputs {
             spec: &app,
+            container_id: "test-a",
             image_config: &image,
             rootfs: Path::new("/tmp/rootfs"),
             netns_path: None,

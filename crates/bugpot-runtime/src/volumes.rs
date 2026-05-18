@@ -3,7 +3,7 @@
 //! Each volume in an `AppSpec` maps to `<state>/volumes/<app>/<name>/`.
 //! Bugpot creates these on first start, optionally chowns them to a
 //! caller-declared UID (so the container's non-root user can write),
-//! and reclaims them when `cleanup_orphan_container` runs on the
+//! and reclaims them when `cleanup_app_assets` runs on the
 //! explicit-remove path.
 
 use std::fs;
@@ -54,7 +54,7 @@ pub(crate) fn ensure_volume_host_dirs(
 }
 
 /// Remove all volume directories belonging to `app`. Called by
-/// `cleanup_orphan_container` on the explicit-remove path.
+/// `cleanup_app_assets` on the explicit-remove path.
 ///
 /// Best-effort: an IO failure is surfaced, but a missing dir is
 /// fine (the app may never have started, or its TOML may never

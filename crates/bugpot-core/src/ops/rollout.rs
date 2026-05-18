@@ -140,19 +140,38 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
             warn!(app = %name, error = ?e, "failed to persist rollouts");
         }
 
-        // 4. Decide dispatch under the same lock that performs the
-        // RollingOver transition.
-        match self.enter_rolling_over(handle).await? {
-            RolloverEntry::ColdStart => {
-                self.ensure_running(handle)
-                    .await
-                    .map_err(RolloutError::StartFailed)?;
-            }
-            RolloverEntry::BlueGreen { from_ip } => {
-                self.do_blue_green(handle, from_ip).await?;
-            }
-        }
+        // 4. Bring the container to the new state. Shared with the
+        // `PATCH /apps/<name>` path so spec changes get the same
+        // zero-gap deployment behaviour as tag changes.
+        self.apply_change(handle).await?;
         Ok(rollout)
+    }
+
+    /// Bring a handle's live container(s) into alignment with whatever
+    /// the spec + rollout history currently say. Shared by:
+    /// - `set_rollout` after recording the new tag,
+    /// - `update_app` after rewriting the spec.
+    ///
+    /// Dispatch:
+    /// - `Stopped` → cold-start on `current_slot` (`ensure_running`).
+    ///   Returns once readiness passes; on failure surfaces as
+    ///   `RolloutError::StartFailed`.
+    /// - `Running` / `Frozen` → blue-green to the opposite slot.
+    ///   `Frozen` is thawed first inside `enter_rolling_over` so the
+    ///   from-side serves traffic during the build window.
+    /// - `Starting` / `Stopping` / `RollingOver` → `Conflict`.
+    pub(crate) async fn apply_change(
+        &self,
+        handle: &Arc<AppHandle>,
+    ) -> std::result::Result<(), RolloutError> {
+        match self.enter_rolling_over(handle).await? {
+            RolloverEntry::ColdStart => self
+                .ensure_running(handle)
+                .await
+                .map(|_| ())
+                .map_err(RolloutError::StartFailed),
+            RolloverEntry::BlueGreen { from_ip } => self.do_blue_green(handle, from_ip).await,
+        }
     }
 
     /// Atomic gate at the boundary between "rollout pipeline pulled
@@ -222,7 +241,7 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
     /// from-side stays serving and we tear down the partial new slot
     /// — the caller (`set_rollout`) translates the error to
     /// `RolloutError::StartFailed`.
-    async fn do_blue_green(
+    pub(crate) async fn do_blue_green(
         &self,
         handle: &Arc<AppHandle>,
         from_ip: Ipv4Addr,
@@ -245,17 +264,39 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
 
         match build_result {
             Ok(new_ip) => {
-                // Atomic switch. Order is important: state transition
-                // first, *then* drain + teardown — between the two,
-                // new traffic lands on `new_ip` (the resolver re-reads
-                // `state`) and the from-side only carries connections
-                // already spliced through the router.
-                {
+                // Atomic switch — but only if state is *still*
+                // `RollingOver`. A concurrent `stop` / `remove_app`
+                // can flip state to `Stopping` and reap both slots
+                // while we were busy building. In that case the
+                // teardown has already happened; we must not
+                // overwrite the operator's `Stopping` with a fresh
+                // `Running` and revive a dead container in the
+                // resolver's eyes.
+                //
+                // Pattern is "compare-and-swap on RollingOver": the
+                // guard read + write live under one lock; if the
+                // state slot drifted, we abandon the switch and
+                // clean up the new container we just built.
+                let switched = {
                     let mut inner = handle.inner.lock().await;
-                    inner.state = AppState::Running {
-                        container_ip: new_ip,
-                    };
-                    inner.current_slot = to_slot;
+                    if matches!(inner.state, AppState::RollingOver { .. }) {
+                        inner.state = AppState::Running {
+                            container_ip: new_ip,
+                        };
+                        inner.current_slot = to_slot;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if !switched {
+                    warn!(
+                        app = %app_name,
+                        "rollover: state drifted off RollingOver before switch \
+                         (concurrent stop/remove?); tearing down new slot",
+                    );
+                    self.teardown_containers(&app_name, &[to_id]).await;
+                    return Err(RolloutError::Conflict(app_name));
                 }
                 info!(
                     app = %app_name,
@@ -271,20 +312,37 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
                 Ok(())
             }
             Err(e) => {
-                // Rollback: from-side current_slot stays put, state
-                // returns to Running{from_ip}. New side is partially
-                // built — clean it up.
-                {
+                // Rollback: same compare-and-swap discipline. If state
+                // drifted (concurrent stop/remove), don't restore
+                // `Running{from_ip}` — the operator's transition wins.
+                // We still reap the partial new slot unconditionally;
+                // `teardown_containers` is idempotent so racing the
+                // concurrent stop here is harmless.
+                let restored = {
                     let mut inner = handle.inner.lock().await;
-                    inner.state = AppState::Running {
-                        container_ip: from_ip,
-                    };
+                    if matches!(inner.state, AppState::RollingOver { .. }) {
+                        inner.state = AppState::Running {
+                            container_ip: from_ip,
+                        };
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if restored {
+                    warn!(
+                        app = %app_name,
+                        error = ?e,
+                        "rollover: new-slot build failed; rolled back to from-side",
+                    );
+                } else {
+                    warn!(
+                        app = %app_name,
+                        error = ?e,
+                        "rollover: new-slot build failed and state drifted off \
+                         RollingOver; not restoring from-side",
+                    );
                 }
-                warn!(
-                    app = %app_name,
-                    error = ?e,
-                    "rollover: new-slot build failed; rolled back to from-side",
-                );
                 self.teardown_containers(&app_name, &[to_id]).await;
                 Err(RolloutError::StartFailed(e))
             }

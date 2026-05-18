@@ -3,10 +3,27 @@
 //! Each app handle is a small state machine:
 //!
 //! ```text
-//!  Stopped ─request─► Starting ─ok─► Running ─idle─► Stopping ─► Stopped
-//!     ▲                  │ err                                    │
-//!     └──────────────────┴────────────────────────────────────────┘
+//!                        ┌─── idle ───────────► Frozen
+//!                        │                        │
+//!  Stopped ─request─► Starting ─ok─► Running ◄────┘ request
+//!     ▲                  │ err          │
+//!     │                  └──────────────►│
+//!     │                                  │ rollout / update_app
+//!     │                                  ▼
+//!     │                             RollingOver
+//!     │                             (from-side serves; new
+//!     │                              container builds in
+//!     │                              opposite slot)
+//!     │                                  │
+//!     │              switch ◄────────────┤
+//!     │              or rollback         │
+//!     │                                  ▼
+//!     └─────────── Stopping ◄────── Running (new slot or rollback)
 //! ```
+//!
+//! - `Frozen` is the idle-timeout target (cgroup v2 freezer); resume is sub-ms.
+//! - `RollingOver` keeps `from_ip` serving traffic while a new container
+//!   builds in the opposite slot — see [`mod ops::rollout`].
 //!
 //! The set of registered apps is held in a `RwLock<HashMap<..>>` so adapter
 //! crates (HTTP admin, future webhook / poller / CLI frontends) can mutate
@@ -1487,6 +1504,144 @@ mod tests {
         let handle = controller.find_handle(name).await.unwrap();
         let inner = handle.inner.lock().await;
         inner.state.clone()
+    }
+
+    /// State-drift race: while `do_blue_green` is mid-build, a
+    /// concurrent `stop`/`remove_app` flips state to `Stopping` and
+    /// reaps both slots. The rollover's switch / rollback paths must
+    /// NOT overwrite the operator's transition by writing a fresh
+    /// `Running` back in.
+    ///
+    /// We simulate the race by hand: pre-set the handle to
+    /// `RollingOver` (which is what `enter_rolling_over` does), then
+    /// flip it to `Stopped` *before* the build resolves. Then drive
+    /// `do_blue_green` directly and assert the final state stays
+    /// `Stopped` (not `Running { from_ip }`).
+    ///
+    /// Direct invocation of `do_blue_green` is fine here because it's
+    /// `pub(super)` and the test is in the same crate; the alternative
+    /// (driving via `set_rollout` and triggering a real concurrent
+    /// stop) needs full tokio orchestration that the existing mocks
+    /// don't model.
+    #[tokio::test]
+    async fn blue_green_does_not_clobber_state_after_concurrent_stop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let controller =
+            make_controller(vec![stored_with_name("alpha", "v1")], tmp.path().to_owned());
+        let handle = controller.find_handle("alpha").await.unwrap();
+        let from_ip = Ipv4Addr::new(10, 0, 0, 99);
+
+        // Initial transition: enter RollingOver as if `enter_rolling_over`
+        // already ran.
+        {
+            let mut inner = handle.inner.lock().await;
+            inner.state = AppState::RollingOver { from_ip };
+        }
+
+        // Two pulls succeed; no start response queued → build_to_slot
+        // fails. We want the rollback path to run.
+        controller
+            .runtime
+            .push_pull(Ok(ImageId::new("sha256:newdigest")));
+        controller
+            .runtime
+            .push_pull(Ok(ImageId::new("sha256:newdigest")));
+
+        // Simulate the race: before do_blue_green resolves, flip
+        // state to Stopped. (In production this would be done by a
+        // concurrent `stop` task.)
+        {
+            let mut inner = handle.inner.lock().await;
+            inner.state = AppState::Stopped;
+        }
+
+        let _ = controller.do_blue_green(&handle, from_ip).await;
+
+        // State must STILL be Stopped — the rollback path saw the
+        // drift and skipped the `Running { from_ip }` write.
+        let state = handle_state(&controller, "alpha").await;
+        assert!(
+            matches!(state, AppState::Stopped),
+            "state drifted off RollingOver before rollback fired; \
+             do_blue_green must respect the new state, got {state:?}"
+        );
+    }
+
+    /// `PATCH /apps/<name>` on a `Running` app now uses blue-green
+    /// instead of stop-then-start. New container in opposite slot,
+    /// readiness gate, atomic switch, from-slot teardown.
+    #[tokio::test]
+    async fn update_app_running_uses_blue_green() {
+        let tmp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut spec = spec_with_name("alpha");
+        spec.port = port;
+        let stored = (
+            spec,
+            Some(Rollout {
+                tag: "v1".into(),
+                created_at: SystemTime::UNIX_EPOCH,
+            }),
+        );
+        let controller = make_controller(vec![stored], tmp.path().to_owned());
+
+        let handle = controller.find_handle("alpha").await.unwrap();
+        force_running(&handle).await;
+
+        // PATCH body: same port (readiness must hit it) but a new
+        // env var so the spec actually differs.
+        let mut new_spec = handle.spec.read().await.clone();
+        new_spec.env.insert("BUGPOT_TEST".into(), "1".into());
+
+        controller
+            .runtime
+            .push_pull(Ok(ImageId::new("sha256:newdigest")));
+        controller.runtime.push_start(Ok(RunningApp {
+            name: "alpha-b".into(),
+            pid: 77,
+            image: ImageId::new("sha256:newdigest"),
+        }));
+
+        controller
+            .update_app(&handle, new_spec)
+            .await
+            .expect("update_app should run blue-green");
+
+        let (slot, state) = {
+            let inner = handle.inner.lock().await;
+            (inner.current_slot, inner.state.clone())
+        };
+        assert_eq!(slot, Slot::B, "current_slot must have advanced");
+        assert!(
+            matches!(state, AppState::Running { .. }),
+            "expected Running after PATCH, got {state:?}"
+        );
+
+        let rt = controller.runtime.calls();
+        let eg = controller.egress.calls();
+        assert!(
+            eg.iter().any(|c| c == "allocate_endpoint(alpha-b)"),
+            "PATCH must allocate the to-slot endpoint; got {eg:?}"
+        );
+        assert!(
+            rt.iter().any(|c| c == "start_app(alpha-b)"),
+            "PATCH must start the to-slot container; got {rt:?}"
+        );
+        assert!(
+            rt.iter().any(|c| c == "stop_app(alpha-a)"),
+            "PATCH must tear down from-slot after switch; got {rt:?}"
+        );
+        // Critically: stop_app(alpha-a) happens AFTER start_app(alpha-b).
+        // The old stop-then-start would have had stop_app first.
+        let start_idx = rt.iter().position(|c| c == "start_app(alpha-b)").unwrap();
+        let stop_idx = rt.iter().position(|c| c == "stop_app(alpha-a)").unwrap();
+        assert!(
+            start_idx < stop_idx,
+            "to-slot start must precede from-slot stop; \
+             stop-then-start regression detected. rt={rt:?}"
+        );
+        drop(listener);
     }
 
     /// Removing a never-started app skips per-slot cleanup (nothing

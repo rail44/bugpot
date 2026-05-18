@@ -122,7 +122,18 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
             return Ok(view_of(handle).await);
         }
 
-        let was_running = handle.inner.lock().await.state.is_running();
+        // "Has a live container" = Running or Frozen. Both go through
+        // the blue-green path below so a PATCH that changes `port` /
+        // `env` / etc. takes effect immediately rather than only on
+        // the next cold-start. `Stopped` apps skip — the next
+        // request will cold-start under the new spec naturally.
+        let has_live_container = {
+            let inner = handle.inner.lock().await;
+            matches!(
+                inner.state,
+                crate::handle::AppState::Running { .. } | crate::handle::AppState::Frozen { .. }
+            )
+        };
 
         // Replace under the write lock. The digest cache doesn't
         // need an explicit clear — `DigestCache` carries the `repo`
@@ -141,30 +152,32 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
             return Err(UpdateError::Internal(e));
         }
 
-        if was_running {
-            self.restart_after_spec_change(handle).await?;
+        if has_live_container {
+            self.apply_spec_change(handle).await?;
         }
 
         Ok(view_of(handle).await)
     }
 
-    /// Stop + start cycle for an app whose spec was just rewritten.
-    /// Errors map to [`UpdateError::RestartFailed`] with a phase
-    /// label so operators can tell whether the failure was on the
-    /// way down or on the way back up.
-    async fn restart_after_spec_change(
+    /// Bring a `Running` or `Frozen` app to its newly-rewritten spec
+    /// via the shared blue-green pipeline — same machinery that
+    /// `set_rollout` uses, so a PATCH that changes `port` / `env` /
+    /// etc. flips traffic to the new container the instant readiness
+    /// passes, with auto-rollback to the old container on failure.
+    /// Maps `RolloutError` variants to `UpdateError`'s shape; `apply_change`
+    /// only emits `Conflict` (state drifted under us) or `StartFailed`
+    /// (build / readiness on the new slot failed) in this context, so
+    /// the other variants funnel into the same `RestartFailed`
+    /// bucket with the original error preserved.
+    async fn apply_spec_change(
         &self,
         handle: &Arc<AppHandle>,
     ) -> std::result::Result<(), UpdateError> {
-        if let Err(e) = self.stop(handle).await {
-            return Err(UpdateError::RestartFailed(anyhow!(
-                "stop before reconfigure: {e:#}"
-            )));
-        }
-        self.ensure_running(handle)
-            .await
-            .map(|_| ())
-            .map_err(|e| UpdateError::RestartFailed(anyhow!("restart after reconfigure: {e:#}")))
+        self.apply_change(handle).await.map_err(|e| match e {
+            crate::RolloutError::Conflict(name) => UpdateError::Conflict(name),
+            crate::RolloutError::StartFailed(inner) => UpdateError::RestartFailed(inner),
+            other => UpdateError::RestartFailed(anyhow!("reconfigure: {other:#}")),
+        })
     }
 
     /// Unregister an app. Stops the container (if running), drops
