@@ -104,6 +104,20 @@ pub struct AppHost<R: RuntimeOps, E: EgressOps> {
     reattach_done: AtomicBool,
 }
 
+/// The fully-resolved [`AppHost`] used by the bugpot daemon.
+///
+/// `AppHost<R, E>` is generic so the controller's own tests can swap
+/// in mocks for `RuntimeOps` / `EgressOps`. Adapter crates
+/// (`bugpot-admin`, future webhook / poller / CLI frontends), on the
+/// other hand, only ever hold the one production combination — so
+/// spelling it out here lets them depend on `bugpot-core` alone and
+/// stay out of the Linux-side `bugpot-runtime` / `bugpot-egress`
+/// import graph at the source level. The compiler still monomorphises
+/// against the same concrete types (the dep is unchanged at the
+/// artifact level), but admin no longer has to *say* `bugpot_runtime`
+/// or `bugpot_egress` in any of its handler signatures.
+pub type BugpotAppHost = AppHost<bugpot_runtime::Runtime, bugpot_egress::Egress>;
+
 impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
     /// Create a controller, materialising the daemon-owned state
     /// directories and rehydrating any apps + rollouts persisted by
