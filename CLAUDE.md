@@ -120,6 +120,9 @@ under `scripts/` are still the canonical end-to-end tests:
 - `scripts/smoke-infra.sh` — bring-up only (no apps, validates bridge/nft/DNS)
 - `scripts/smoke-app.sh` — single-app end-to-end (pull → start → HTTP → shutdown)
 - `scripts/smoke-multi.sh` — Host-header dispatch between two apps
+- `scripts/smoke-freeze.sh` — freezer-based scale-to-zero: idle → `frozen` (not `stopped`), resume in sub-ms
+- `scripts/smoke-readiness.sh` — `[readiness] path` HTTP probe: cold-start blocks until 2xx
+- `scripts/smoke-volume.sh` — `[[volumes]]` bind-mounts survive freeze / rollout / eviction
 
 These scripts DO tear down `bugpot0` + the `nft` table on exit because
 they're explicit single-shot tests. The dev-server intentionally does not.
@@ -244,6 +247,10 @@ cmd/bugpotd (main: wires everything; no business logic)
    └─► bugpot-metrics    : Prometheus recorder + /metrics + /healthz listener
 
 cmd/bugpot (CLI; pure-Rust, also builds on macOS — talks to bugpotd's admin API)
+
+scripts/analysis (`bugpot-analyzer`; dev-only static-analysis CLI for
+                  `just hotspots` / `just modules` / `just depgraph`.
+                  Workspace member, not in the runtime path.)
 ```
 
 `experiments/youki-sandbox` is a standalone playground for oci-client/libcontainer experiments; it isn't part of the runtime path.
@@ -252,7 +259,7 @@ cmd/bugpot (CLI; pure-Rust, also builds on macOS — talks to bugpotd's admin AP
 
 1. Router receives HTTP, extracts first DNS label of `Host` (see `subdomain_of` in `bugpot-router`).
 2. Calls `UpstreamResolver::resolve` — the controller's impl, which **may take seconds** (cold start).
-3. Controller's `AppHandle` state machine (`Stopped → Starting → Running → Stopping`) gates work: concurrent starts on the same app coalesce on a per-handle `Notify`.
+3. Controller's `AppHandle` state machine (`Stopped → Starting → Running ↔ Frozen → Stopping → Stopped`) gates work: concurrent starts on the same app coalesce on a per-handle `Notify`. `Frozen` is the idle-timeout target (see Scale-to-zero below); the `Running ↔ Frozen` edge is bidirectional (freeze on idle, resume on request).
 4. On cold start: `Egress::allocate_endpoint` (netns + veth + IP + DNS registry) → `Runtime::pull_image` → `Runtime::start_app` (passes the netns path to libcontainer) → readiness probe on the app's declared port (TCP-bind by default; HTTP GET when `[readiness] path` is set — see below).
 5. Router proxies via `hyper_util` legacy client; HTTP/1.1 Upgrade (e.g. WebSocket) is spliced bidirectionally.
 
@@ -320,7 +327,7 @@ user = 33           # optional: chown the host dir to this UID at start
 
 **Permissions trap.** Containers typically run as a non-root user (Linkding uid=33, Vaultwarden uid=1000, …). The host-side directory inherits root ownership at creation; without setting `user` the app will get `EACCES` on first write. bugpot chowns to `user:user` on every start (idempotent for unchanged values; correctly re-chowns if the operator updates the TOML).
 
-**Lifecycle.** Volumes are created lazily on first start (`Runtime::ensure_volume_host_dirs`), preserved across freeze / rollouts / memory-pressure eviction, and removed only when the app itself is removed (`DELETE /apps/<name>` flows through `cleanup_orphan_container`, which now also drops the volume dir). Removing the `[[volumes]]` entry from a TOML without deleting the app leaves the host directory on disk — operators can re-add the same `name` and the data is still there.
+**Lifecycle.** Volumes are created lazily on first start (`volumes::ensure_volume_host_dirs`, a `bugpot-runtime` free fn called from `Runtime::start_app`), preserved across freeze / rollouts / memory-pressure eviction, and removed only when the app itself is removed (`DELETE /apps/<name>` flows through `cleanup_orphan_container`, which now also drops the volume dir). Removing the `[[volumes]]` entry from a TOML without deleting the app leaves the host directory on disk — operators can re-add the same `name` and the data is still there.
 
 **Reserved paths.** Volumes cannot target `/`, `/proc`, `/sys`, `/dev`, `/dev/pts`, `/dev/shm`, `/dev/mqueue`, or `/etc/resolv.conf` — these are owned by the OCI default mounts or bugpot's DNS bind. `validate_volumes` rejects collisions at deploy time so a bad TOML never reaches `start_app`.
 
@@ -387,7 +394,7 @@ The console UI lists every tokio task with its busy / idle ratio and the longest
 
 ## Conventions
 
-- Workspace edition 2024, MSRV 1.85. Lints: `unsafe_code = "deny"` workspace-wide; clippy `all`/`pedantic`/`nursery`/`cargo` enabled.
+- Workspace edition 2024, MSRV 1.95. Lints: `unsafe_code = "deny"` workspace-wide; clippy `all`/`pedantic`/`nursery`/`cargo` enabled.
 - App TOML is the only config surface. `name` defaults to the file stem; `subdomain` defaults to `name`.
 - Tests that need root, network, or a real kernel namespace setup are marked `#[ignore]` with a reason string — never silently skipped.
 - `bugpot-egress` keeps host-touching code (`nft`, `ip`) and pure logic (allowlist, allocator, nft text rendering) in separate modules so the latter can be unit-tested without root.
