@@ -137,8 +137,10 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
             return;
         }
 
+        let container_id = handle.current_id().await;
+
         // 1. Liveness: did the container die under us?
-        if !self.runtime.is_container_running(&handle.identity.name) {
+        if !self.runtime.is_container_running(&container_id) {
             info!(app = %handle.identity.name, "container exited unexpectedly, cleaning up");
             counter!(
                 "bugpot_container_crashes_total",
@@ -155,7 +157,7 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
         // resolve to nothing (cgroup v1 host or transient /proc
         // races) — the gauge stops updating, the counter doesn't
         // move.
-        if let Some(usage) = self.runtime.resource_usage(&handle.identity.name) {
+        if let Some(usage) = self.runtime.resource_usage(&container_id) {
             emit_resource_metrics(&handle, usage).await;
         }
 

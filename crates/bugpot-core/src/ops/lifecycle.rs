@@ -89,27 +89,32 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
     /// decide how to unwind.
     async fn do_start(&self, handle: &AppHandle) -> Result<Ipv4Addr> {
         let name = &handle.identity.name;
+        // Container ID for everything below the controller (runtime,
+        // egress, libcontainer state, netns). `name` stays the
+        // operator-facing identifier — log lines, persisted state,
+        // metrics labels.
+        let container_id = handle.current_id().await;
         let spec = handle.spec.read().await.clone();
         let plain_image_ref = self.resolve_image_ref(handle, &spec).await?;
         info!(app = %name, image = %plain_image_ref, "starting");
 
-        let endpoint = self.allocate_endpoint_phase(name, &spec).await?;
+        let endpoint = self.allocate_endpoint_phase(&container_id, &spec).await?;
 
         let image_id = match self.pull_image_phase(handle, &spec, &plain_image_ref).await {
             Ok(id) => id,
             Err(e) => {
-                let _ = self.egress.release_endpoint(name).await;
+                let _ = self.egress.release_endpoint(&container_id).await;
                 return Err(e);
             }
         };
 
         let running = match self
-            .start_container_phase(&spec, &image_id, &endpoint)
+            .start_container_phase(&container_id, &spec, &image_id, &endpoint)
             .await
         {
             Ok(r) => r,
             Err(e) => {
-                let _ = self.egress.release_endpoint(name).await;
+                let _ = self.egress.release_endpoint(&container_id).await;
                 return Err(e);
             }
         };
@@ -125,8 +130,8 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
             .await
         {
             warn!(app = %name, error = %e, "readiness probe failed");
-            let _ = self.runtime.stop_app(name).await;
-            let _ = self.egress.release_endpoint(name).await;
+            let _ = self.runtime.stop_app(&container_id).await;
+            let _ = self.egress.release_endpoint(&container_id).await;
             return Err(e);
         }
         Ok(endpoint.container_ip)
@@ -148,18 +153,20 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
     }
 
     /// Phase 1 of `do_start`: claim a netns + container IP + DNS
-    /// allowlist slot from `bugpot-egress`.
+    /// allowlist slot from `bugpot-egress`. Keyed by the slot-suffixed
+    /// `container_id` so blue-green rollovers can hold two endpoints
+    /// for the same app simultaneously.
     async fn allocate_endpoint_phase(
         &self,
-        name: &str,
+        container_id: &str,
         spec: &AppSpec,
     ) -> Result<bugpot_egress::Endpoint> {
         record_on_success!(
             "bugpot_cold_start_seconds", "phase" => "endpoint";
             self.egress
-                .allocate_endpoint(name, spec.egress.allow.clone())
+                .allocate_endpoint(container_id, spec.egress.allow.clone())
                 .await
-                .with_context(|| format!("allocate endpoint for {name}"))
+                .with_context(|| format!("allocate endpoint for {container_id}"))
         )
     }
 
@@ -214,6 +221,7 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
     /// Phase 3: hand off to libcontainer.
     async fn start_container_phase(
         &self,
+        container_id: &str,
         spec: &AppSpec,
         image_id: &ImageId,
         endpoint: &bugpot_egress::Endpoint,
@@ -221,9 +229,9 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
         record_on_success!(
             "bugpot_cold_start_seconds", "phase" => "start";
             self.runtime
-                .start_app(spec, image_id, Some(&endpoint.netns_path))
+                .start_app(container_id, spec, image_id, Some(&endpoint.netns_path))
                 .await
-                .with_context(|| format!("start container for {}", spec.name()))
+                .with_context(|| format!("start container for {container_id}"))
         )
     }
 
@@ -253,10 +261,11 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
     /// (via libcontainer) wakes the process.
     async fn do_resume(&self, handle: &AppHandle, container_ip: Ipv4Addr) -> Result<Ipv4Addr> {
         let name = &handle.identity.name;
+        let container_id = handle.current_id().await;
         info!(app = %name, "resuming from frozen");
         record_on_success!(
             "bugpot_resume_seconds";
-            self.runtime.unfreeze_app(name).await
+            self.runtime.unfreeze_app(&container_id).await
         )?;
         Ok(container_ip)
     }
@@ -287,9 +296,10 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
             return Ok(());
         }
         let name = &handle.identity.name;
+        let container_id = handle.current_id().await;
         if let Err(e) = record_on_success!(
             "bugpot_freeze_seconds";
-            self.runtime.freeze_app(name).await
+            self.runtime.freeze_app(&container_id).await
         ) {
             warn!(app = %name, error = %e, "freeze_app failed");
             return Err(e.into());
@@ -321,11 +331,12 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
 
     async fn do_stop(&self, handle: &AppHandle) -> Result<()> {
         let name = &handle.identity.name;
+        let container_id = handle.current_id().await;
         info!(app = %name, "stopping");
-        if let Err(e) = self.runtime.stop_app(name).await {
+        if let Err(e) = self.runtime.stop_app(&container_id).await {
             warn!(app = %name, error = %e, "stop_app failed");
         }
-        if let Err(e) = self.egress.release_endpoint(name).await {
+        if let Err(e) = self.egress.release_endpoint(&container_id).await {
             warn!(app = %name, error = %e, "release_endpoint failed");
         }
         Ok(())

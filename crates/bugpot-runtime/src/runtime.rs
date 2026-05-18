@@ -73,8 +73,18 @@ pub trait RuntimeOps: Send + Sync + std::fmt::Debug + 'static {
 
     // ----- container lifecycle + observation ---------------------------------
 
+    /// Start a container.
+    ///
+    /// `container_id` is the libcontainer / nft identifier — bugpot
+    /// composes it from `(spec.name(), slot)` in `bugpot-core` so the
+    /// two blue-green slots can coexist briefly during a rollover
+    /// without colliding on the bundle dir, the libcontainer state
+    /// dir, or the netns name. The log dir and volume dirs stay
+    /// keyed by `spec.name()` (app-level: logs share a destination
+    /// for post-mortem; volumes survive across slots).
     fn start_app<'a>(
         &'a self,
+        container_id: &'a str,
         spec: &'a AppSpec,
         image_id: &'a ImageId,
         netns_path: Option<&'a Path>,
@@ -96,12 +106,18 @@ pub trait RuntimeOps: Send + Sync + std::fmt::Debug + 'static {
     fn resource_usage(&self, name: &str) -> Option<ResourceUsage>;
     /// Reap a leftover container whose `AppSpec` is no longer registered
     /// (TOML deleted while bugpot was down). Stops and removes
-    /// libcontainer state if it exists, deletes the bundle dir. The
-    /// per-app log directory is intentionally left alone — operators
-    /// may want to read it post-mortem.
+    /// libcontainer state if it exists, deletes the bundle dir, and
+    /// tears down app-level assets (log-tail tasks, volume dirs)
+    /// inferred from `container_id` by stripping the trailing
+    /// `-a` / `-b` slot suffix. The per-app log *directory* is
+    /// intentionally left on disk — operators may want to read it
+    /// post-mortem.
     ///
-    /// Idempotent: returns Ok when nothing exists for `name`.
-    fn cleanup_orphan_container(&self, name: &str) -> impl Future<Output = Result<()>> + Send;
+    /// Idempotent: returns Ok when nothing exists for `container_id`.
+    fn cleanup_orphan_container(
+        &self,
+        container_id: &str,
+    ) -> impl Future<Output = Result<()>> + Send;
 
     // ----- log forwarding ----------------------------------------------------
 
@@ -299,16 +315,10 @@ impl Runtime {
             container.start().map_err(RuntimeError::from)
         })?;
 
-        // Tail tasks read from the same files (read-only) and emit
-        // each new line via tracing so `just logs` still works. Seek
-        // to EOF so a fresh start doesn't replay historical lines; on
-        // reattach, the controller calls `ensure_log_tails` for the
-        // same effect. Routed through `ensure_log_tails` (not the
-        // free fn) so the spawned `JoinHandle`s land in the per-app
-        // map and `cleanup_orphan_container` can abort them when the
-        // app is removed.
-        <Self as RuntimeOps>::ensure_log_tails(self, name);
-
+        // Log-tail spawning is the caller's job (`start_app`) because
+        // tails are keyed by *app name* (shared across blue-green
+        // slots) while libcontainer is keyed by *container ID* — and
+        // this helper only knows the latter.
         let raw_pid = container
             .pid()
             .ok_or_else(|| RuntimeError::Other("container has no pid after start".into()))?
@@ -345,12 +355,13 @@ impl RuntimeOps for Runtime {
     #[allow(clippy::unused_async)] // pre-pull moved to caller; kept async for API symmetry
     async fn start_app(
         &self,
+        container_id: &str,
         spec: &AppSpec,
         image_id: &ImageId,
         netns_path: Option<&Path>,
     ) -> Result<RunningApp> {
-        let name = spec.name().to_owned();
-        self.reject_if_already_running(&name)?;
+        let app_name = spec.name();
+        self.reject_if_already_running(container_id)?;
 
         // 1. Image: must already be in the on-disk cache. Callers do
         // `pull_image` first; passing the result here avoids a second
@@ -361,13 +372,17 @@ impl RuntimeOps for Runtime {
             ))
         })?;
 
-        // 2. Bundle.
-        let bundle_dir = self.bundles_dir.join(&name);
+        // 2. Bundle. Keyed by `container_id` (slot-suffixed) so the
+        // two blue-green slots have independent bundle dirs during a
+        // rollover.
+        let bundle_dir = self.bundles_dir.join(container_id);
         timed_step("bundle", || {
             prepare_bundle_dir(&bundle_dir, &image.rootfs())
         })?;
 
-        // 3. Volumes.
+        // 3. Volumes. Keyed by `app_name`, not `container_id`: data
+        // must survive a slot flip, so both slots bind-mount the same
+        // host dir.
         //
         // Materialise the per-app, per-volume host dirs *before* the
         // spec build needs their paths. Idempotent — re-running this
@@ -375,20 +390,28 @@ impl RuntimeOps for Runtime {
         // ownership (so a TOML `user` change does the right thing on
         // next start). Data survives across container restarts and
         // rollouts; only `cleanup_orphan_container` removes the dir.
-        let volume_host_paths = ensure_volume_host_dirs(&self.volumes_dir, &name, &spec.volumes)?;
+        let volume_host_paths =
+            ensure_volume_host_dirs(&self.volumes_dir, app_name, &spec.volumes)?;
 
         // 4. Spec.
         timed_step("spec", || {
             write_runtime_spec(&bundle_dir, spec, &image, netns_path, &volume_host_paths)
         })?;
 
-        // 5. Launch.
-        info!(app = %name, bundle = %bundle_dir.display(), "creating container");
-        let logs = self.open_log_files(&name)?;
-        let pid = self.launch_container(&name, &bundle_dir, logs)?;
+        // 5. Launch. Log files are app-keyed (shared across slots for
+        // post-mortem continuity); the libcontainer state dir is
+        // container-keyed.
+        info!(container = %container_id, bundle = %bundle_dir.display(), "creating container");
+        let logs = self.open_log_files(app_name)?;
+        let pid = self.launch_container(container_id, &bundle_dir, logs)?;
+        // Spawn tail tasks under the *app name* so both slots of a
+        // blue-green pair feed into one set of inotify watches; the
+        // map is idempotent, so a slot flip mid-rollover is a no-op
+        // here.
+        <Self as RuntimeOps>::ensure_log_tails(self, app_name);
 
         Ok(RunningApp {
-            name,
+            name: container_id.to_owned(),
             pid,
             image: image.id,
         })
@@ -467,7 +490,17 @@ impl RuntimeOps for Runtime {
     }
 
     #[allow(clippy::unused_async)]
-    async fn cleanup_orphan_container(&self, name: &str) -> Result<()> {
+    async fn cleanup_orphan_container(&self, container_id: &str) -> Result<()> {
+        // App name is `container_id` with the `-a` / `-b` slot suffix
+        // stripped. Pre-PR1 orphans (no slot suffix) collapse to
+        // `container_id`. The only ambiguous case is an app whose
+        // name itself ends in `-a` / `-b` and has a pre-PR1 orphan:
+        // we'd strip the suffix and clean an unrelated app's volumes
+        // by mistake. That's a narrow migration-window-only edge
+        // case; the documented mitigation is "delete the orphan
+        // netns before upgrading".
+        let app_name = strip_slot_suffix(container_id);
+
         // Abort the inotify-tailing tasks first; the log files are
         // kept around for post-mortem (CLAUDE.md L333) so the kernel
         // wouldn't otherwise close the watches and the tasks would
@@ -481,14 +514,14 @@ impl RuntimeOps for Runtime {
             .log_tails
             .lock()
             .expect("log_tails mutex poisoned")
-            .remove(name);
+            .remove(app_name);
         if let Some(handles) = aborted {
             for h in handles {
                 h.abort();
             }
         }
 
-        let container_root = self.containers_dir.join(name);
+        let container_root = self.containers_dir.join(container_id);
         if container_root.exists() {
             match Container::load(container_root.clone()) {
                 Ok(mut container) => {
@@ -496,17 +529,17 @@ impl RuntimeOps for Runtime {
                         let _ = container.kill(Signal::from(NixSignal::SIGKILL), true);
                     }
                     if let Err(e) = container.delete(true) {
-                        warn!(app = %name, error = ?e, "libcontainer delete failed; removing state dir manually");
+                        warn!(container = %container_id, error = ?e, "libcontainer delete failed; removing state dir manually");
                         let _ = fs::remove_dir_all(&container_root);
                     }
                 }
                 Err(e) => {
-                    warn!(app = %name, error = ?e, "libcontainer load failed; removing state dir manually");
+                    warn!(container = %container_id, error = ?e, "libcontainer load failed; removing state dir manually");
                     let _ = fs::remove_dir_all(&container_root);
                 }
             }
         }
-        let bundle_dir = self.bundles_dir.join(name);
+        let bundle_dir = self.bundles_dir.join(container_id);
         if bundle_dir.exists() {
             fs::remove_dir_all(&bundle_dir).map_err(|e| RuntimeError::io(&bundle_dir, e))?;
         }
@@ -515,7 +548,7 @@ impl RuntimeOps for Runtime {
         // operator-initiated remove (or an orphan whose TOML has
         // disappeared) should wipe them. The log dir is intentionally
         // left alone — operators may want post-mortem access.
-        remove_volume_dirs(&self.volumes_dir, name)?;
+        remove_volume_dirs(&self.volumes_dir, app_name)?;
         Ok(())
     }
 
@@ -607,6 +640,16 @@ impl Runtime {
 struct ContainerLogFiles {
     stdout: OwnedFd,
     stderr: OwnedFd,
+}
+
+/// Strip a trailing `-a` / `-b` slot suffix from `container_id` to
+/// recover the app name. Pre-PR1 container IDs (no suffix) pass
+/// through unchanged.
+fn strip_slot_suffix(container_id: &str) -> &str {
+    container_id
+        .strip_suffix("-a")
+        .or_else(|| container_id.strip_suffix("-b"))
+        .unwrap_or(container_id)
 }
 
 /// Open `path` for appending, creating it if missing, and return the
@@ -764,11 +807,11 @@ name = "hello"
             .await
             .expect("pull_image");
         let running = rt
-            .start_app(&app, &image_id, None)
+            .start_app("hello-a", &app, &image_id, None)
             .await
             .expect("start_app");
         assert!(running.pid > 1);
-        rt.stop_app("hello").await.expect("stop_app");
+        rt.stop_app("hello-a").await.expect("stop_app");
     }
 
     #[test]

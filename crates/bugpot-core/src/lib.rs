@@ -16,9 +16,16 @@
 //! Note: `pub(crate)` is used for cross-module items inside this crate;
 //! the `clippy::redundant_pub_crate` warning conflicts with the workspace's
 //! `unreachable_pub` rule, so the former is allowed crate-wide (same
-//! convention as `bugpot-runtime`).
-
-#![allow(clippy::redundant_pub_crate)]
+//! convention as `bugpot-runtime`). `clippy::similar_names` is allowed
+//! crate-wide because the two principal handle-derived identifiers —
+//! `container_id` (libcontainer / nft key) and `container_ip`
+//! (`Ipv4Addr` inside `AppState`) — necessarily live within the same
+//! function in every lifecycle method; using opaque short names like
+//! `cid` / `cip` would obscure the call site for marginal lint
+//! satisfaction. Disambiguation: `container_id` is the slot-suffixed
+//! string key into libcontainer / nft; `container_ip` is the
+//! `Ipv4Addr` inside `AppState::Running` / `AppState::Frozen`.
+#![allow(clippy::redundant_pub_crate, clippy::similar_names)]
 
 #[cfg(test)]
 use std::collections::HashMap;
@@ -217,12 +224,12 @@ mod tests {
 
         async fn start_app(
             &self,
-            spec: &AppSpec,
+            container_id: &str,
+            _spec: &AppSpec,
             _image_id: &ImageId,
             _netns_path: Option<&Path>,
         ) -> std::result::Result<RunningApp, RuntimeError> {
-            let name = spec.name().to_owned();
-            self.record(format!("start_app({name})"));
+            self.record(format!("start_app({container_id})"));
             self.start_results
                 .lock()
                 .unwrap()
@@ -727,11 +734,11 @@ mod tests {
 
         let egress_calls = controller.egress.calls();
         assert!(
-            egress_calls.contains(&"allocate_endpoint(alpha)".to_owned()),
+            egress_calls.contains(&"allocate_endpoint(alpha-a)".to_owned()),
             "expected allocate; got {egress_calls:?}"
         );
         assert!(
-            egress_calls.contains(&"release_endpoint(alpha)".to_owned()),
+            egress_calls.contains(&"release_endpoint(alpha-a)".to_owned()),
             "expected release after pull failure; got {egress_calls:?}"
         );
         assert!(
@@ -758,8 +765,8 @@ mod tests {
             tmp.path().to_owned(),
         );
         // alpha is alive with a recovered IP; beta is gone.
-        controller.runtime.set_running("alpha", true);
-        let mut claims = claims_with(&[("alpha", Ipv4Addr::new(10, 0, 0, 42))]);
+        controller.runtime.set_running("alpha-a", true);
+        let mut claims = claims_with(&[("alpha-a", Ipv4Addr::new(10, 0, 0, 42))]);
 
         controller.reattach_running(&mut claims).await;
 
@@ -793,8 +800,8 @@ mod tests {
         // must never trigger the cold-start path.
         let eg_calls = controller.egress.calls();
         assert!(
-            eg_calls.iter().any(|c| c == "reattach_endpoint(alpha)"),
-            "expected reattach_endpoint(alpha); got {eg_calls:?}"
+            eg_calls.iter().any(|c| c == "reattach_endpoint(alpha-a)"),
+            "expected reattach_endpoint(alpha-a); got {eg_calls:?}"
         );
         assert!(
             !eg_calls.iter().any(|c| c.starts_with("allocate_endpoint")),
@@ -818,13 +825,15 @@ mod tests {
     async fn cleanup_orphans_reaps_unreclaimed_endpoints() {
         let tmp = tempfile::tempdir().unwrap();
         // `alpha` is the only known app; `beta` (registered in egress
-        // discovery) has no TOML and must be reaped.
+        // discovery) has no TOML and must be reaped. Beta's
+        // discovered netns has the new slot-suffixed shape because
+        // it came from a previous bugpot at this same code level.
         let controller =
             make_controller(vec![stored_with_name("alpha", "v1")], tmp.path().to_owned());
-        controller.runtime.set_running("alpha", true);
+        controller.runtime.set_running("alpha-a", true);
         let mut claims = claims_with(&[
-            ("alpha", Ipv4Addr::new(10, 0, 0, 5)),
-            ("beta", Ipv4Addr::new(10, 0, 0, 9)),
+            ("alpha-a", Ipv4Addr::new(10, 0, 0, 5)),
+            ("beta-a", Ipv4Addr::new(10, 0, 0, 9)),
         ]);
 
         controller.reattach_running(&mut claims).await;
@@ -836,18 +845,18 @@ mod tests {
         assert!(
             !rt_calls
                 .iter()
-                .any(|c| c == "cleanup_orphan_container(alpha)"),
+                .any(|c| c == "cleanup_orphan_container(alpha-a)"),
             "reattached alpha must not be cleaned as orphan; rt_calls={rt_calls:?}"
         );
         // beta was orphaned.
         let beta_runtime_idx = rt_calls
             .iter()
-            .position(|c| c == "cleanup_orphan_container(beta)")
-            .expect("expected cleanup_orphan_container(beta)");
+            .position(|c| c == "cleanup_orphan_container(beta-a)")
+            .expect("expected cleanup_orphan_container(beta-a)");
         let beta_egress_idx = eg_calls
             .iter()
-            .position(|c| c == "cleanup_orphan_endpoint(beta,10.0.0.9)")
-            .expect("expected cleanup_orphan_endpoint(beta,10.0.0.9)");
+            .position(|c| c == "cleanup_orphan_endpoint(beta-a,10.0.0.9)")
+            .expect("expected cleanup_orphan_endpoint(beta-a,10.0.0.9)");
         // Ordering: cleaning the runtime side first means the container
         // is dead by the time we tear down its netns; if we reversed
         // the order the container would lose eth0 while still trying
@@ -863,13 +872,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let controller =
             make_controller(vec![stored_with_name("alpha", "v1")], tmp.path().to_owned());
-        controller.runtime.set_running("alpha", true);
-        let mut claims = claims_with(&[("alpha", Ipv4Addr::new(10, 0, 0, 7))]);
+        controller.runtime.set_running("alpha-a", true);
+        let mut claims = claims_with(&[("alpha-a", Ipv4Addr::new(10, 0, 0, 7))]);
 
         controller.reattach_running(&mut claims).await;
         // A second pass with a freshly-discovered claims map should
         // still short-circuit at the controller's once-guard.
-        let mut second = claims_with(&[("alpha", Ipv4Addr::new(10, 0, 0, 7))]);
+        let mut second = claims_with(&[("alpha-a", Ipv4Addr::new(10, 0, 0, 7))]);
         controller.reattach_running(&mut second).await;
 
         let eg_reattach_calls = controller
@@ -907,7 +916,7 @@ mod tests {
             };
         }
         // Simulate the kernel: container is *not* actually running.
-        controller.runtime.set_running("alpha", false);
+        controller.runtime.set_running("alpha-a", false);
 
         controller.sweep().await;
 
@@ -918,12 +927,12 @@ mod tests {
         );
         let rt_calls = controller.runtime.calls();
         assert!(
-            rt_calls.contains(&"stop_app(alpha)".to_owned()),
+            rt_calls.contains(&"stop_app(alpha-a)".to_owned()),
             "expected stop_app; got {rt_calls:?}"
         );
         let eg_calls = controller.egress.calls();
         assert!(
-            eg_calls.contains(&"release_endpoint(alpha)".to_owned()),
+            eg_calls.contains(&"release_endpoint(alpha-a)".to_owned()),
             "expected release_endpoint; got {eg_calls:?}"
         );
     }
@@ -955,7 +964,7 @@ mod tests {
         let controller = make_controller(vec![stored], tmp.path().to_owned());
         let handle = controller.find_handle("alpha").await.unwrap();
         force_running(&handle).await;
-        controller.runtime.set_running("alpha", true);
+        controller.runtime.set_running("alpha-a", true);
 
         // Push last_access into the past so the reaper triggers.
         {
@@ -973,12 +982,12 @@ mod tests {
         );
         let rt_calls = controller.runtime.calls();
         assert!(
-            rt_calls.contains(&"freeze_app(alpha)".to_owned()),
+            rt_calls.contains(&"freeze_app(alpha-a)".to_owned()),
             "expected freeze_app; got {rt_calls:?}"
         );
         // Must NOT have stopped — freeze leaves the container resident.
         assert!(
-            !rt_calls.iter().any(|c| c == "stop_app(alpha)"),
+            !rt_calls.iter().any(|c| c == "stop_app(alpha-a)"),
             "stop_app must not be called on freeze path; got {rt_calls:?}"
         );
     }
@@ -1004,7 +1013,7 @@ mod tests {
         );
         let rt_calls = controller.runtime.calls();
         assert!(
-            !rt_calls.iter().any(|c| c == "freeze_app(alpha)"),
+            !rt_calls.iter().any(|c| c == "freeze_app(alpha-a)"),
             "freeze_app must not be called when upgrades active; got {rt_calls:?}"
         );
     }
@@ -1026,13 +1035,13 @@ mod tests {
                 container_ip: frozen_ip,
             };
         }
-        controller.runtime.set_paused("alpha", true);
+        controller.runtime.set_paused("alpha-a", true);
 
         let ip = controller.ensure_running(&handle).await.unwrap();
         assert_eq!(ip, frozen_ip, "unfreeze must preserve container_ip");
         let rt_calls = controller.runtime.calls();
         assert!(
-            rt_calls.contains(&"unfreeze_app(alpha)".to_owned()),
+            rt_calls.contains(&"unfreeze_app(alpha-a)".to_owned()),
             "expected unfreeze_app; got {rt_calls:?}"
         );
         assert!(
@@ -1113,7 +1122,7 @@ mod tests {
         assert!(
             rt_calls
                 .iter()
-                .any(|c| c == "cleanup_orphan_container(alpha)"),
+                .any(|c| c == "cleanup_orphan_container(alpha-a)"),
             "remove_app must trigger cleanup_orphan_container; got {rt_calls:?}"
         );
     }
