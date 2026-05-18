@@ -47,12 +47,25 @@ pub(crate) fn load_persisted_state(
         }
         let body =
             std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        let mut spec: AppSpec =
+        let spec: AppSpec =
             toml::from_str(&body).with_context(|| format!("parse {}", path.display()))?;
-        spec.source_path.clone_from(&path);
         spec.validate()
             .with_context(|| format!("validate {}", path.display()))?;
-        let name = spec.name().to_owned();
+        // Defensive: the file's name (set by `persist_spec`) should
+        // always match the spec body's `name`. A mismatch means
+        // someone edited the file out-of-band — refuse to load it
+        // rather than registering an app under a name that disagrees
+        // with its on-disk home.
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        if stem != spec.name {
+            anyhow::bail!(
+                "spec file {} declares name = {:?}, expected {:?}",
+                path.display(),
+                spec.name,
+                stem
+            );
+        }
+        let name = spec.name.clone();
         let rollouts = read_rollouts_file(rollouts_dir, &name)?;
         out.push((spec, rollouts));
     }

@@ -7,7 +7,7 @@
 //!
 //! then drives requests through the router and asserts behaviour.
 
-use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{
     Router,
@@ -67,7 +67,7 @@ fn fake_app(name: &str, port: u16) -> AppSpec {
     AppSpec {
         repo: "ghcr.io/test/app".to_owned(),
         port,
-        name: Some(name.to_owned()),
+        name: name.to_owned(),
         subdomain: Some(name.to_owned()),
         egress: EgressSpec::default(),
         env: HashMap::default(),
@@ -75,7 +75,6 @@ fn fake_app(name: &str, port: u16) -> AppSpec {
         readiness: Readiness::default(),
         resources: Resources::default(),
         volumes: Vec::new(),
-        source_path: PathBuf::from(format!("/apps/{name}.toml")),
     }
 }
 

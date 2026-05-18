@@ -31,8 +31,13 @@ pub struct AppSpec {
     /// separator) in this value.
     pub repo: String,
     pub port: u16,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
+    /// App identifier — required. The admin API rejects bodies that
+    /// omit it; `<apps_dir>/<name>.toml` on disk is bugpot-written
+    /// and always carries an explicit `name` field.
+    pub name: String,
+    /// DNS label the router matches on. Defaults to `name` when
+    /// omitted; keeping it `Option` lets the common
+    /// "subdomain == name" case stay implicit in deploy TOMLs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subdomain: Option<String>,
     #[serde(default, skip_serializing_if = "EgressSpec::is_empty")]
@@ -51,8 +56,6 @@ pub struct AppSpec {
     /// eviction, and rollouts; cleared only on `DELETE /apps/<name>`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volumes: Vec<VolumeSpec>,
-    #[serde(skip)]
-    pub source_path: PathBuf,
 }
 
 /// One persistent bind mount into a container.
@@ -242,27 +245,22 @@ impl AppIdentity {
 impl AppSpec {
     #[must_use]
     pub fn name(&self) -> &str {
-        self.name.as_deref().unwrap_or_else(|| {
-            self.source_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unknown")
-        })
+        &self.name
     }
 
     #[must_use]
     pub fn subdomain(&self) -> &str {
-        self.subdomain.as_deref().unwrap_or_else(|| self.name())
+        self.subdomain.as_deref().unwrap_or(&self.name)
     }
 
-    /// Resolve the spec's mutable `name` / `subdomain` fields into an
-    /// owned, immutable [`AppIdentity`]. Returns the resolved identity
-    /// only after `validate()` would succeed, so callers can rely on
-    /// the strings being valid DNS labels.
+    /// Resolve the spec's `name` / `subdomain` fields into an owned,
+    /// immutable [`AppIdentity`]. Returns the resolved identity only
+    /// after `validate()` would succeed, so callers can rely on the
+    /// strings being valid DNS labels.
     pub fn identity(&self) -> Result<AppIdentity, InvalidSpec> {
         self.validate()?;
         Ok(AppIdentity {
-            name: self.name().to_owned(),
+            name: self.name.clone(),
             subdomain: self.subdomain().to_owned(),
         })
     }
@@ -276,19 +274,7 @@ impl AppSpec {
     /// Called by [`load_apps`] when reading from disk and by the admin
     /// API's `deploy_app` path; either rejects before any side effect.
     pub fn validate(&self) -> Result<(), InvalidSpec> {
-        // First: refuse a spec whose `name` resolves only via the
-        // `"unknown"` fallback in [`Self::name`]. That sentinel can
-        // collide with other unnamed specs in `AppController.apps` —
-        // here we reject early instead of silently letting two apps
-        // share a key.
-        if self.name.is_none() && self.source_path.file_stem().is_none() {
-            return Err(InvalidSpec {
-                field: "name",
-                value: String::new(),
-                reason: "name is required when the spec has no inferrable source path",
-            });
-        }
-        validate_dns_label("name", self.name())?;
+        validate_dns_label("name", &self.name)?;
         // `subdomain()` defaults to `name`, so this also catches the
         // common case. When explicitly set it gets the same check.
         validate_dns_label("subdomain", self.subdomain())?;
@@ -682,20 +668,19 @@ mod tests {
     }
 
     #[test]
-    fn appspec_validate_rejects_unresolvable_name() {
-        // No `name` field, no `source_path` → would fall back to the
-        // `"unknown"` sentinel. Must be caught at validate-time so two
-        // such specs can't collide in `AppController.apps`.
+    fn appspec_deserialize_rejects_missing_name() {
+        // `name` is a required field; serde fails the deserialize
+        // before validation can run. The error message identifies the
+        // missing key.
         let body = r#"
             repo = "x"
             port = 8080
         "#;
-        let spec: AppSpec = toml::from_str(body).unwrap();
-        // `source_path` defaults to `PathBuf::new()`, which has no file_stem.
-        let err = spec
-            .validate()
-            .expect_err("unresolvable name must be rejected");
-        assert_eq!(err.field, "name");
+        let err = toml::from_str::<AppSpec>(body).expect_err("missing name must be rejected");
+        assert!(
+            err.to_string().contains("name"),
+            "expected error to mention `name`, got: {err}"
+        );
     }
 
     #[test]
@@ -753,13 +738,17 @@ mod tests {
 
     #[test]
     fn parses_minimum_toml() {
+        // `name` is required; the rest of the identity (subdomain) and
+        // every section ([egress]/[env]/...) is optional.
         let body = r#"
             repo = "ghcr.io/org/myapp"
             port = 3000
+            name = "myapp"
         "#;
         let spec: AppSpec = toml::from_str(body).unwrap();
         assert_eq!(spec.repo, "ghcr.io/org/myapp");
         assert_eq!(spec.port, 3000);
+        assert_eq!(spec.name, "myapp");
         assert!(spec.egress.allow.is_empty());
     }
 
@@ -894,16 +883,18 @@ mod tests {
     }
 
     #[test]
-    fn name_defaults_to_filename_stem() {
-        let mut spec: AppSpec = toml::from_str(
+    fn subdomain_defaults_to_name() {
+        let spec: AppSpec = toml::from_str(
             r#"repo = "x"
 port = 80
+name = "alpha"
 "#,
         )
         .unwrap();
-        spec.source_path = PathBuf::from("/tmp/apps/some-app.toml");
-        assert_eq!(spec.name(), "some-app");
-        assert_eq!(spec.subdomain(), "some-app");
+        // `subdomain` is the only Option-typed identity field; when
+        // omitted it falls back to `name` so the common "subdomain
+        // == app name" case stays implicit in deploy TOMLs.
+        assert_eq!(spec.subdomain(), "alpha");
     }
 
     /// Adapter crates persist specs back to disk via `toml::to_string`.
@@ -1229,9 +1220,8 @@ port = 80
             }
             let raw = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-            let mut spec: AppSpec =
+            let spec: AppSpec =
                 toml::from_str(&raw).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
-            spec.source_path = path.clone();
             spec.validate()
                 .unwrap_or_else(|e| panic!("validate {}: {e}", path.display()));
             checked += 1;

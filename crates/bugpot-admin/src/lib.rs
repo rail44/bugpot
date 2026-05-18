@@ -378,10 +378,7 @@ async fn deploy(
     State(state): State<AdminState>,
     ParsedAppSpec(spec): ParsedAppSpec,
 ) -> Result<(StatusCode, Json<AppView>), AdminError> {
-    // Capture what we know up-front so the audit entry stays useful
-    // even when validation rejects the spec before a name lands in
-    // the controller's maps.
-    let audit_name = spec.name.clone().unwrap_or_else(|| "<unnamed>".to_owned());
+    let audit_name = spec.name.clone();
     let audit_repo = spec.repo.clone();
     // `audit_err!` uses `warn!`, not `error!`: admin errors are
     // routinely user-driven (collisions, bad image refs) and
@@ -554,7 +551,7 @@ impl IntoResponse for AdminError {
 impl From<DeployError> for AdminError {
     fn from(err: DeployError) -> Self {
         let status = match &err {
-            DeployError::MissingName | DeployError::InvalidSpec(_) => StatusCode::BAD_REQUEST,
+            DeployError::InvalidSpec(_) => StatusCode::BAD_REQUEST,
             DeployError::AlreadyExists(_) | DeployError::SubdomainTaken(_) => StatusCode::CONFLICT,
             DeployError::ImageAuth(_) | DeployError::ImagePull(_) => StatusCode::BAD_GATEWAY,
             DeployError::StartFailed(_) | DeployError::Internal(_) => {
@@ -685,7 +682,6 @@ mod tests {
     #[test]
     fn deploy_error_maps_to_status() {
         let cases: Vec<(DeployError, StatusCode)> = vec![
-            (DeployError::MissingName, StatusCode::BAD_REQUEST),
             (DeployError::AlreadyExists("x".into()), StatusCode::CONFLICT),
             (
                 DeployError::SubdomainTaken("y".into()),
@@ -734,7 +730,7 @@ mod tests {
         let body = br#"{"repo":"ghcr.io/owner/x","port":8080,"name":"alpha"}"#;
         let spec = parse_app_spec(&HeaderMap::new(), body).expect("json default");
         assert_eq!(spec.repo, "ghcr.io/owner/x");
-        assert_eq!(spec.name.as_deref(), Some("alpha"));
+        assert_eq!(spec.name, "alpha");
     }
 
     #[test]
@@ -753,7 +749,7 @@ mod tests {
         "#;
         let spec = parse_app_spec(&ct("application/toml"), body).expect("application/toml");
         assert_eq!(spec.repo, "ghcr.io/owner/x");
-        assert_eq!(spec.name.as_deref(), Some("alpha"));
+        assert_eq!(spec.name, "alpha");
     }
 
     #[test]
