@@ -47,11 +47,53 @@ fi
 STATE_DIR=$(mktemp -d)
 LOG=$(mktemp)
 CURL_LOG=$(mktemp)
+# Make logs world-readable so the invoking user can `cat` them after
+# the script exits (the script runs as root via sudo, but operators
+# debug from their own shell).
+chmod 644 "$LOG" "$CURL_LOG"
 
 PID=""
 CURL_PID=""
 
-fail() { printf "FAIL: %s\n" "$*" >&2; exit 1; }
+dump_diagnostics() {
+    echo
+    echo "=== diagnostics (state at failure) ==="
+    echo "--- ip -brief addr show bugpot0 ---"
+    ip -brief addr show bugpot0 2>&1 | head -5
+    echo "--- ip netns list ---"
+    ip netns list 2>&1
+    echo "--- ip -brief link (veth + bugpot*) ---"
+    ip -brief link | awk '/veth|bugpot/'
+    echo "--- ip neigh show (172.20.x) ---"
+    ip neigh show | grep 172.20.0 || echo "(none)"
+    echo "--- bridge fdb show br bugpot0 ---"
+    bridge fdb show br bugpot0 2>/dev/null | head -20 || echo "(bridge cmd missing or no entries)"
+    echo "--- ip route show 172.20.0.0/24 ---"
+    ip route show 172.20.0.0/24
+    echo "--- nft list chain inet bugpot forward ---"
+    nft list chain inet bugpot forward 2>&1 | head -20
+    echo "--- per-netns IP + listener ---"
+    for ns in $(ip netns list 2>/dev/null | awk '/^bugpot-/{print $1}'); do
+        echo "  [$ns]"
+        ip netns exec "$ns" ip -4 -brief addr show eth0 2>&1 | sed 's/^/    addr: /'
+        ip netns exec "$ns" ss -tlnp 2>&1 | sed 's/^/    /' | head -5
+    done
+    echo "--- direct host → container_ip probe ---"
+    for ip4 in $(ip neigh show | awk '/172.20.0/{print $1}' | sort -u); do
+        printf "  %s : " "$ip4"
+        curl -sS -o /dev/null -m 2 -w "%{http_code} t=%{time_total}s\n" "http://$ip4:8080/" || true
+    done
+    echo "--- bugpotd tail (last 30 lines) ---"
+    tail -30 "$LOG"
+    echo "--- curl_log tail (last 20 lines) ---"
+    tail -20 "$CURL_LOG"
+}
+
+fail() {
+    printf "FAIL: %s\n" "$*" >&2
+    dump_diagnostics
+    exit 1
+}
 ok()   { printf "ok:   %s\n" "$*"; }
 note() { printf "\n=== %s ===\n" "$*"; }
 
