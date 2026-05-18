@@ -105,20 +105,23 @@ pub(crate) fn parse_router_config() -> Result<bugpot_router::RouterConfig> {
 }
 
 pub(crate) fn parse_env_bool(key: &str, default: bool) -> Result<bool> {
-    match std::env::var(key) {
-        Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => Ok(true),
-            "0" | "false" | "no" | "off" | "" => Ok(false),
-            other => anyhow::bail!("{key}: expected boolean, got '{other}'"),
-        },
-        Err(_) => Ok(default),
-    }
+    parse_env(key, default, |s| match s.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" | "" => Ok(false),
+        other => anyhow::bail!("{key}: expected boolean, got '{other}'"),
+    })
 }
 
 pub(crate) fn parse_env_bytes(key: &str, default: u64) -> Result<u64> {
-    std::env::var(key).map_or(Ok(default), |raw| {
-        raw.trim()
-            .parse::<u64>()
-            .with_context(|| format!("parse {key}"))
+    parse_env(key, default, |s| {
+        s.parse::<u64>().with_context(|| format!("parse {key}"))
     })
+}
+
+/// Read `key` from the environment and pass its trimmed value through
+/// `parse`. Returns `default` when the variable is unset. Centralises
+/// the "trim + var-or-default" envelope that every `parse_env_*`
+/// helper used to repeat.
+fn parse_env<T>(key: &str, default: T, parse: impl FnOnce(&str) -> Result<T>) -> Result<T> {
+    std::env::var(key).map_or(Ok(default), |raw| parse(raw.trim()))
 }

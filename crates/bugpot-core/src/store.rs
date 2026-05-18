@@ -68,13 +68,8 @@ impl AppStore {
     pub(crate) async fn persist_spec(&self, handle: &AppHandle) -> Result<()> {
         let name = handle.name();
         let spec = handle.spec.read().await.clone();
-        let body =
-            toml::to_string_pretty(&spec).with_context(|| format!("serialize spec for {name}"))?;
-        let path = self.spec_path(name);
-        tokio::fs::write(&path, body)
+        self.persist_toml(&self.spec_path(name), &spec, "spec", name)
             .await
-            .with_context(|| format!("write {}", path.display()))?;
-        Ok(())
     }
 
     /// Persist the handle's full rollout history.
@@ -82,10 +77,24 @@ impl AppStore {
         let name = handle.name();
         let rollouts: Vec<Rollout> = handle.inner.lock().await.rollouts.iter().cloned().collect();
         let file = RolloutsFile { rollouts };
-        let body = toml::to_string_pretty(&file)
-            .with_context(|| format!("serialize rollouts for {name}"))?;
-        let path = self.rollouts_path(name);
-        tokio::fs::write(&path, body)
+        self.persist_toml(&self.rollouts_path(name), &file, "rollouts", name)
+            .await
+    }
+
+    /// Serialise `value` as pretty-printed TOML and write it to `path`.
+    /// Shared by `persist_spec` and `persist_rollouts`; `what` and
+    /// `name` flow into the error envelopes so a failure tells the
+    /// operator which app's which file failed.
+    async fn persist_toml<T: serde::Serialize + Sync>(
+        &self,
+        path: &Path,
+        value: &T,
+        what: &str,
+        name: &str,
+    ) -> Result<()> {
+        let body = toml::to_string_pretty(value)
+            .with_context(|| format!("serialize {what} for {name}"))?;
+        tokio::fs::write(path, body)
             .await
             .with_context(|| format!("write {}", path.display()))?;
         Ok(())
