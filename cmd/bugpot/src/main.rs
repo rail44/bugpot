@@ -389,18 +389,57 @@ async fn cmd_rollouts_push(
 
 // ---- HTTP helpers ---------------------------------------------------------
 
-async fn http_get_json<T>(client: &Client, base: &str, path: &str, token: &str) -> Result<T>
+/// Request body shape for [`http_request`]. Each variant maps to one
+/// way `reqwest::RequestBuilder` adopts a payload.
+enum Body<'a> {
+    /// No body. Used by GET.
+    Empty,
+    /// `application/json` via `RequestBuilder::json`.
+    Json(&'a serde_json::Value),
+    /// `application/toml` with raw text. Set explicitly because
+    /// `reqwest` doesn't have a `.toml(...)` shortcut.
+    Toml(&'a str),
+}
+
+/// Send a request to the admin API and decode the response body as
+/// JSON. Centralises the bearer-auth attachment, the URL composition,
+/// and the `with_context` envelope so the four thin wrappers below
+/// stay short.
+///
+/// `check_status` is delegated to for both the 2xx body decode and
+/// the non-2xx error mapping (see its impl for the textual format).
+async fn http_request<T>(
+    client: &Client,
+    method: reqwest::Method,
+    base: &str,
+    path: &str,
+    token: &str,
+    body: Body<'_>,
+) -> Result<T>
 where
     T: for<'de> Deserialize<'de>,
 {
     let url = format!("{base}{path}");
-    let resp = client
-        .get(&url)
-        .bearer_auth(token)
+    let mut req = client.request(method.clone(), &url).bearer_auth(token);
+    req = match body {
+        Body::Empty => req,
+        Body::Json(v) => req.json(v),
+        Body::Toml(s) => req
+            .header("content-type", "application/toml")
+            .body(s.to_owned()),
+    };
+    let resp = req
         .send()
         .await
-        .with_context(|| format!("GET {url}"))?;
+        .with_context(|| format!("{method} {url}"))?;
     check_status(&url, resp.status(), resp).await
+}
+
+async fn http_get_json<T>(client: &Client, base: &str, path: &str, token: &str) -> Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    http_request(client, reqwest::Method::GET, base, path, token, Body::Empty).await
 }
 
 async fn http_post_json<T>(
@@ -413,15 +452,15 @@ async fn http_post_json<T>(
 where
     T: for<'de> Deserialize<'de>,
 {
-    let url = format!("{base}{path}");
-    let resp = client
-        .post(&url)
-        .bearer_auth(token)
-        .json(body)
-        .send()
-        .await
-        .with_context(|| format!("POST {url}"))?;
-    check_status(&url, resp.status(), resp).await
+    http_request(
+        client,
+        reqwest::Method::POST,
+        base,
+        path,
+        token,
+        Body::Json(body),
+    )
+    .await
 }
 
 async fn http_post_toml<T>(
@@ -434,16 +473,15 @@ async fn http_post_toml<T>(
 where
     T: for<'de> Deserialize<'de>,
 {
-    let url = format!("{base}{path}");
-    let resp = client
-        .post(&url)
-        .bearer_auth(token)
-        .header("content-type", "application/toml")
-        .body(body.to_owned())
-        .send()
-        .await
-        .with_context(|| format!("POST {url}"))?;
-    check_status(&url, resp.status(), resp).await
+    http_request(
+        client,
+        reqwest::Method::POST,
+        base,
+        path,
+        token,
+        Body::Toml(body),
+    )
+    .await
 }
 
 async fn http_patch_toml<T>(
@@ -456,16 +494,15 @@ async fn http_patch_toml<T>(
 where
     T: for<'de> Deserialize<'de>,
 {
-    let url = format!("{base}{path}");
-    let resp = client
-        .patch(&url)
-        .bearer_auth(token)
-        .header("content-type", "application/toml")
-        .body(body.to_owned())
-        .send()
-        .await
-        .with_context(|| format!("PATCH {url}"))?;
-    check_status(&url, resp.status(), resp).await
+    http_request(
+        client,
+        reqwest::Method::PATCH,
+        base,
+        path,
+        token,
+        Body::Toml(body),
+    )
+    .await
 }
 
 async fn http_delete(client: &Client, base: &str, path: &str, token: &str) -> Result<()> {
