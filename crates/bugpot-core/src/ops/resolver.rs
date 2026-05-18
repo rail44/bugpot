@@ -9,7 +9,7 @@
 use std::net::SocketAddr;
 
 use bugpot_egress::EgressOps;
-use bugpot_router::{ResolveError, Upstream, UpstreamResolver, subdomain_of};
+use bugpot_router_port::{ResolveError, Upstream, UpstreamResolver, subdomain_of};
 use bugpot_runtime::RuntimeOps;
 use tracing::error;
 

@@ -24,6 +24,7 @@ tower = { version = "0.5", features = ["limit"] }
 tower-http = { version = "0.6", features = ["limit", "timeout"] }
 tracing.workspace = true
 bugpot-config.workspace = true
+bugpot-router-port.workspace = true
 
 [dev-dependencies]
 divan.workspace = true

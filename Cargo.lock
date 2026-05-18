@@ -281,7 +281,7 @@ dependencies = [
  "anyhow",
  "bugpot-config",
  "bugpot-egress",
- "bugpot-router",
+ "bugpot-router-port",
  "bugpot-runtime",
  "futures",
  "humantime",
@@ -333,6 +333,7 @@ dependencies = [
  "anyhow",
  "axum",
  "bugpot-config",
+ "bugpot-router-port",
  "divan",
  "futures",
  "http-body-util",
@@ -345,6 +346,14 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
+]
+
+[[package]]
+name = "bugpot-router-port"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

@@ -9,6 +9,7 @@ members = [
     "crates/bugpot-egress",
     "crates/bugpot-metrics",
     "crates/bugpot-router",
+    "crates/bugpot-router-port",
     "crates/bugpot-runtime",
     "experiments/youki-sandbox",
     "scripts/analysis",
@@ -54,6 +55,7 @@ bugpot-core = { path = "crates/bugpot-core" }
 bugpot-egress = { path = "crates/bugpot-egress" }
 bugpot-metrics = { path = "crates/bugpot-metrics" }
 bugpot-router = { path = "crates/bugpot-router" }
+bugpot-router-port = { path = "crates/bugpot-router-port" }
 bugpot-runtime = { path = "crates/bugpot-runtime" }
 
 [profile.release]

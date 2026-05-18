@@ -40,6 +40,13 @@ use tower_http::{
 };
 use tracing::{debug, info, warn};
 
+// Re-export the resolver port. The trait + value types live in the
+// tiny `bugpot-router-port` crate so adapter implementations
+// (`bugpot-core::AppHost`) can build against the interface alone
+// without pulling in axum / hyper / tower. Public surface from the
+// router's POV is unchanged.
+pub use bugpot_router_port::{ResolveError, Upstream, UpstreamResolver, subdomain_of};
+
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Total per-request timeout enforced at the tower layer. Caps any single
 /// request including slow body uploads and slow upstream responses.
@@ -139,92 +146,6 @@ impl Default for RouterConfig {
             forwarded_proto: "http".to_owned(),
         }
     }
-}
-
-/// What `UpstreamResolver::resolve` returns for a successfully-resolved
-/// host: the upstream address plus an optional per-app counter the
-/// router will increment when it spawns a long-lived upgrade splice.
-///
-/// Resolvers that don't care about per-app upgrade tracking can leave
-/// `active_upgrades` set to `None` (e.g. the static resolver in this
-/// crate's integration test); the in-bugpot `AppHost` impl
-/// returns the `AppHandle`'s counter so the controller's idle reaper
-/// can defer freezing while an upgrade is mid-flight.
-#[derive(Debug, Clone)]
-pub struct Upstream {
-    pub addr: SocketAddr,
-    pub active_upgrades: Option<Arc<AtomicUsize>>,
-}
-
-impl Upstream {
-    #[must_use]
-    pub const fn new(addr: SocketAddr) -> Self {
-        Self {
-            addr,
-            active_upgrades: None,
-        }
-    }
-
-    #[must_use]
-    pub const fn with_active_upgrades(addr: SocketAddr, counter: Arc<AtomicUsize>) -> Self {
-        Self {
-            addr,
-            active_upgrades: Some(counter),
-        }
-    }
-}
-
-/// Why a host couldn't be resolved to a live upstream. Distinguishes
-/// the two operator-visible failure modes so the router can return
-/// different HTTP status codes:
-///
-/// - [`ResolveError::NoSuchApp`] → `404 Not Found`. The subdomain
-///   never matched a registered app; the request is for something
-///   that doesn't exist.
-/// - [`ResolveError::Unhealthy`] → `502 Bad Gateway`. The app **is**
-///   registered, but bringing it up to serve this request failed
-///   (image pull, readiness probe, etc.). The error chain is logged
-///   server-side; clients see only the status code.
-///
-/// Without this split a deployed-but-failing app and an unregistered
-/// subdomain look identical to operators, which is exactly the
-/// "Linkding is broken vs I never deployed it" gotcha.
-#[derive(Debug, thiserror::Error)]
-pub enum ResolveError {
-    #[error("no app registered for this host")]
-    NoSuchApp,
-    #[error("upstream is registered but failed to come up: {0}")]
-    Unhealthy(#[source] anyhow::Error),
-}
-
-/// Pluggable upstream resolver.
-///
-/// The router calls this on every request to find out where to forward.
-/// Implementations may take meaningful time (e.g. waiting for a cold-start
-/// container to come up) but should respect cancellation if the caller
-/// drops the future.
-/// Native AFIT — `serve` is generic over the concrete resolver type
-/// (controller in production, a test fixture in `tests/proxy.rs`),
-/// so no `dyn` and no `#[async_trait]` allocation per request.
-pub trait UpstreamResolver: Send + Sync + std::fmt::Debug {
-    fn resolve(&self, host: &str) -> impl Future<Output = Result<Upstream, ResolveError>> + Send;
-}
-
-/// Convenience extractor used by `UpstreamResolver` implementations.
-///
-/// `host` is the literal `Host` header value, optionally with a
-/// trailing `:port`. Returns the first DNS label of the hostname, or
-/// `None` for IPv6 literals (`[::1]:8080`) — bugpot routes by
-/// subdomain, so an IPv6 literal can't ever match an app.
-#[must_use]
-pub fn subdomain_of(host: &str) -> Option<&str> {
-    // IPv6 literal in URL form: `[::1]` or `[::1]:8080`. Reject early
-    // so the `:port` splitter below doesn't trip on the address
-    // separator.
-    if host.starts_with('[') {
-        return None;
-    }
-    host.split(':').next()?.split('.').next()
 }
 
 /// Shared state passed to every handler invocation.
@@ -785,25 +706,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn subdomain_of_extracts_first_label() {
-        assert_eq!(subdomain_of("alpha.bugpot.example"), Some("alpha"));
-        // The `:port` suffix is stripped before label extraction so
-        // routing works regardless of how the client wrote the Host.
-        assert_eq!(subdomain_of("beta.bugpot.example:443"), Some("beta"));
-        // Single label with no dot is its own subdomain (matches the
-        // `*.localhost` dev-loopback case).
-        assert_eq!(subdomain_of("alpha:8080"), Some("alpha"));
-    }
-
-    #[test]
-    fn subdomain_of_empty_returns_empty_label() {
-        // No special-casing for empty Host — it falls out as an empty
-        // first label, which the resolver compares against registered
-        // subdomains and (correctly) fails to match anything.
-        assert_eq!(subdomain_of(""), Some(""));
-    }
-
-    #[test]
     fn detects_upgrade_request() {
         let mut h = HeaderMap::new();
         h.insert(UPGRADE, HeaderValue::from_static("websocket"));
@@ -846,19 +748,6 @@ mod tests {
         assert_eq!(rewritten.port_u16(), Some(8123));
         assert_eq!(rewritten.path(), "/foo/bar");
         assert_eq!(rewritten.query(), Some("x=1"));
-    }
-
-    #[test]
-    fn subdomain_of_rejects_ipv6_literal() {
-        // IPv6 literals in Host headers wrap the address in `[...]`.
-        // They never match a bugpot subdomain — and the naive
-        // `split(':').next()` would have returned `"[" ...` which is
-        // not a valid label.
-        assert_eq!(subdomain_of("[::1]"), None);
-        assert_eq!(subdomain_of("[::1]:8080"), None);
-        assert_eq!(subdomain_of("[2001:db8::1]:443"), None);
-        // Regression: regular host:port still works.
-        assert_eq!(subdomain_of("alpha.bugpot.example:443"), Some("alpha"));
     }
 
     #[test]
