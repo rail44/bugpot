@@ -16,12 +16,12 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
-use bugpot_admin::{AdminAuth, AdminBackend};
+use bugpot_admin::AdminAuth;
 use bugpot_controller::AppController;
-use bugpot_egress::{Egress, EgressOps};
+use bugpot_egress::Egress;
 use bugpot_metrics::PrometheusHandle;
 use bugpot_router::UpstreamResolver;
-use bugpot_runtime::{Runtime, RuntimeOps};
+use bugpot_runtime::Runtime;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
@@ -187,9 +187,7 @@ fn gc_image_cache(runtime: &Runtime) {
     }
 }
 
-fn spawn_sweep<R: RuntimeOps, E: EgressOps>(
-    controller: &Arc<AppController<R, E>>,
-) -> JoinHandle<()> {
+fn spawn_sweep(controller: &Arc<AppController<Runtime, Egress>>) -> JoinHandle<()> {
     let c = Arc::clone(controller);
     tokio::spawn(c.sweep_loop(SWEEP_INTERVAL))
 }
@@ -202,8 +200,8 @@ fn spawn_sweep<R: RuntimeOps, E: EgressOps>(
 /// `BUGPOT_FREEZE_ENABLED` (default `true`) is the kill switch:
 /// flipping it off restores pre-freeze scale-to-zero behavior
 /// (idle apps stop, no RAM-resident pool).
-fn spawn_memory_pressure<R: RuntimeOps, E: EgressOps>(
-    controller: &Arc<AppController<R, E>>,
+fn spawn_memory_pressure(
+    controller: &Arc<AppController<Runtime, Egress>>,
 ) -> Result<Option<JoinHandle<()>>> {
     if !parse_env_bool("BUGPOT_FREEZE_ENABLED", true)? {
         info!("BUGPOT_FREEZE_ENABLED=false; memory-pressure handler disabled");
@@ -229,9 +227,9 @@ fn spawn_memory_pressure<R: RuntimeOps, E: EgressOps>(
     ))))
 }
 
-fn spawn_router<R: RuntimeOps, E: EgressOps>(
+fn spawn_router(
     listen: SocketAddr,
-    controller: &Arc<AppController<R, E>>,
+    controller: &Arc<AppController<Runtime, Egress>>,
 ) -> Result<JoinHandle<()>> {
     let resolver: Arc<dyn UpstreamResolver> = controller.clone();
     let router_cfg = parse_router_config()?;
@@ -259,19 +257,16 @@ fn spawn_metrics(handle: PrometheusHandle) -> Result<Option<JoinHandle<()>>> {
     })))
 }
 
-fn spawn_admin<R: RuntimeOps, E: EgressOps>(
+fn spawn_admin(
     admin_listen: SocketAddr,
-    controller: &Arc<AppController<R, E>>,
+    controller: &Arc<AppController<Runtime, Egress>>,
 ) -> Result<JoinHandle<()>> {
     let token = read_admin_token()?;
     let admin_auth = Arc::new(AdminAuth::from_token(token));
     info!("admin API bearer token loaded");
     let deploy_secret = Arc::new(read_deploy_secret()?);
     info!("deploy-key secret loaded");
-    // Coerce to `dyn AdminBackend` here so the admin crate stays
-    // generic-free; the trait is blanket-implemented for every
-    // `AppController<R: RuntimeOps, E: EgressOps>`.
-    let admin_controller: Arc<dyn AdminBackend> = controller.clone();
+    let admin_controller = Arc::clone(controller);
     Ok(tokio::spawn(async move {
         if let Err(e) =
             bugpot_admin::serve(admin_listen, admin_controller, admin_auth, deploy_secret).await
