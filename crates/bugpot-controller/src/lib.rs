@@ -1261,9 +1261,7 @@ mod tests {
 
     use bugpot_config::{AppSpec, EgressSpec, Readiness, Resources, Scaling};
     use bugpot_egress::{EgressOps, Endpoint};
-    use bugpot_runtime::{
-        Auth, ContainerOps, ImageId, ImageOps, LogOps, ResourceUsage, RunningApp,
-    };
+    use bugpot_runtime::{Auth, ImageId, ResourceUsage, RunningApp, RuntimeOps};
 
     #[derive(Debug, Default)]
     struct MockRuntime {
@@ -1292,7 +1290,7 @@ mod tests {
         }
     }
 
-    impl ImageOps for MockRuntime {
+    impl RuntimeOps for MockRuntime {
         async fn pull_image(
             &self,
             image_ref: &str,
@@ -1305,9 +1303,7 @@ mod tests {
                 .pop_front()
                 .unwrap_or_else(|| Err(RuntimeError::Other("mock: no pull response queued".into())))
         }
-    }
 
-    impl ContainerOps for MockRuntime {
         async fn start_app(
             &self,
             spec: &AppSpec,
@@ -1363,9 +1359,7 @@ mod tests {
             self.record(format!("cleanup_orphan_container({name})"));
             Ok(())
         }
-    }
 
-    impl LogOps for MockRuntime {
         fn ensure_log_tails(&self, name: &str) {
             self.record(format!("ensure_log_tails({name})"));
         }

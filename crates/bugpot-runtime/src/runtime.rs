@@ -46,31 +46,33 @@ pub struct ResourceUsage {
 
 // ---- Trait surface ----------------------------------------------------------
 //
-// The runtime exposes its capabilities as three narrow sub-traits and one
-// `RuntimeOps` umbrella that requires all three. Splitting them lets a future
-// caller that only needs e.g. log management depend on `LogOps` alone, and it
-// keeps test mocks documenting the surface they intend to cover. `Runtime`
-// implements all three; the blanket impl below promotes anything that does
-// the same to `RuntimeOps` for free.
-//
-// Async methods use native AFIT (Rust 1.75+), so each call avoids the
-// `Pin<Box<dyn Future>>` allocation `#[async_trait]` would introduce. The
-// explicit `+ Send` bound is required because callers `tokio::spawn` work
-// that holds these futures across awaits. Static dispatch
-// (`AppController<R: RuntimeOps>`) only — no `dyn`.
+// The controller binds `<R: RuntimeOps>` and every caller (production
+// + mocks) uses the full surface. Async methods use native AFIT
+// (Rust 1.75+), so each call avoids the `Pin<Box<dyn Future>>`
+// allocation `#[async_trait]` would introduce. The explicit `+ Send`
+// bound is required because callers `tokio::spawn` work that holds
+// these futures across awaits. Static dispatch only — no `dyn`.
 
-/// OCI image pulls into the bugpot image cache.
-pub trait ImageOps: Send + Sync + std::fmt::Debug + 'static {
+/// Everything the controller needs from the container runtime.
+///
+/// Covers image pulls, per-container lifecycle / observation, and
+/// log-tail spawning. Internal grouping is documented by section
+/// comments below rather than at the type level — no narrow caller
+/// (an image-only consumer, a log-only consumer) exists, so
+/// segregating the surface buys nothing for the cost of three
+/// separate impl blocks per implementor.
+pub trait RuntimeOps: Send + Sync + std::fmt::Debug + 'static {
+    // ----- image pulls -------------------------------------------------------
+
+    /// Pull an OCI image into the bugpot image cache.
     fn pull_image(
         &self,
         image_ref: &str,
         auth: Auth,
     ) -> impl Future<Output = Result<ImageId>> + Send;
-}
 
-/// Per-container lifecycle and observation: start / stop / freeze /
-/// resume / status query / cgroup-stats sample / orphan reclaim.
-pub trait ContainerOps: Send + Sync + std::fmt::Debug + 'static {
+    // ----- container lifecycle + observation ---------------------------------
+
     fn start_app<'a>(
         &'a self,
         spec: &'a AppSpec,
@@ -100,23 +102,14 @@ pub trait ContainerOps: Send + Sync + std::fmt::Debug + 'static {
     ///
     /// Idempotent: returns Ok when nothing exists for `name`.
     fn cleanup_orphan_container(&self, name: &str) -> impl Future<Output = Result<()>> + Send;
-}
 
-/// Per-container stdout/stderr forwarding from the on-disk log files
-/// through bugpot's tracing pipeline.
-pub trait LogOps: Send + Sync + std::fmt::Debug + 'static {
+    // ----- log forwarding ----------------------------------------------------
+
     /// (Re)spawn log-tail tasks for `name`. Used by the controller after
     /// a successful reattach so the new bugpot's tracing pipeline picks
     /// up the surviving container's stdout/stderr from EOF.
     fn ensure_log_tails(&self, name: &str);
 }
-
-/// Umbrella trait: the controller wants the full surface and bounds
-/// its generic parameter on `RuntimeOps`. Any type that implements
-/// all three sub-traits gets `RuntimeOps` automatically.
-pub trait RuntimeOps: ImageOps + ContainerOps + LogOps {}
-
-impl<T: ImageOps + ContainerOps + LogOps> RuntimeOps for T {}
 
 /// Container lifecycle runtime.
 /// Container lifecycle handle.
@@ -189,16 +182,14 @@ impl Runtime {
     }
 }
 
-impl ImageOps for Runtime {
+impl RuntimeOps for Runtime {
     /// Pull `image_ref` from its registry and extract its layers into
     /// `<state>/images/<digest>/rootfs`.
     async fn pull_image(&self, image_ref: &str, auth: Auth) -> Result<ImageId> {
         let image = self.puller.pull(image_ref, auth).await?;
         Ok(image.id)
     }
-}
 
-impl ContainerOps for Runtime {
     /// Prepare a bundle and start a container for `spec`.
     ///
     /// The image identified by `image_id` must already be on disk —
@@ -499,9 +490,7 @@ impl ContainerOps for Runtime {
         remove_volume_dirs(&self.volumes_dir, name)?;
         Ok(())
     }
-}
 
-impl LogOps for Runtime {
     fn ensure_log_tails(&self, name: &str) {
         spawn_log_tails(&self.log_dir_for(name), name);
     }
