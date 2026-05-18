@@ -217,3 +217,19 @@ similar:
 # eyeball the actual bodies.
 similar-strict:
     similarity-rs --skip-test --exclude target --exclude experiments --exclude '**/benches/**' --threshold 0.92 --print crates/ cmd/
+
+# --- Supply-chain checks ---
+#
+# Tooling: `cargo install cargo-audit cargo-deny`.
+# Accepted advisories + license policy live in `deny.toml`.
+
+# Fast pre-push security scan (advisories only). cargo-audit doesn't
+# read deny.toml, so the same ignores are spelled out here.
+audit:
+    cargo audit --ignore RUSTSEC-2024-0437 --ignore RUSTSEC-2024-0436
+
+# Full supply-chain check (advisories + licenses + bans + sources)
+# driven by `deny.toml`. Slower than `just audit` but the canonical
+# CI gate.
+deny:
+    cargo deny check
