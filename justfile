@@ -218,6 +218,25 @@ similar:
 similar-strict:
     similarity-rs --skip-test --exclude target --exclude experiments --exclude '**/benches/**' --threshold 0.92 --print crates/ cmd/
 
+# --- Test coverage ---
+#
+# Tooling: `cargo install cargo-llvm-cov` (one-time).
+# Skips `experiments/youki-sandbox` (scratch playground) and the
+# `bugpot-analyzer` dev tool. Numbers reflect `cargo test` only —
+# smoke scripts (`smoke-app`, `smoke-freeze`, `smoke-volume`, …)
+# add real coverage to files that look 0% here (libcontainer
+# integration, Prometheus listener, log-tail tasks).
+
+# Text summary of region/function/line coverage per file.
+coverage:
+    cargo llvm-cov --workspace --exclude youki-sandbox --exclude bugpot-analyzer --summary-only
+
+# Full HTML report at target/llvm-cov/html/index.html. Useful for
+# drilling into specific files / branches.
+coverage-html:
+    cargo llvm-cov --workspace --exclude youki-sandbox --exclude bugpot-analyzer --html
+    @echo "open target/llvm-cov/html/index.html"
+
 # --- Supply-chain checks ---
 #
 # Tooling: `cargo install cargo-audit cargo-deny`.

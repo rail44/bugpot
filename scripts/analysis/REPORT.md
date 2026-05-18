@@ -28,6 +28,11 @@ Re-run any of the commands below to get fresh data.
    high-similarity pairs left after those are intentional
    (symmetric trait methods, state-machine queries, mock helpers).
    See `cargo install similarity-rs`.
+6. **Test coverage** — `just coverage` (text summary) /
+   `just coverage-html` (drill-down). Tooling:
+   `cargo install cargo-llvm-cov`. See "Axis 6" below for the
+   baseline and the smoke-vs-unit caveat that shapes how the
+   numbers should be read.
 
 ## Axis 1 — top 10 hotspots
 
@@ -135,6 +140,53 @@ Every workspace crate and every `bugpot-core` module passes the
 mixing projection with metrics emission — that has been resolved by
 moving `emit_resource_metrics` next to its only caller in
 `ops/loops.rs`.)
+
+## Axis 6 — Test coverage baseline
+
+Initial `just coverage` pass (2026-05-18):
+
+```
+TOTAL  regions: 66.21%   functions: 60.80%   lines: 64.72%
+```
+
+This is **`cargo test` only**; smoke scripts (`smoke-app`,
+`smoke-freeze`, `smoke-volume`, `smoke-readiness`, `smoke-multi`)
+exercise code paths the unit-test suite can't because they require
+root, real netns, or real registries. So the headline number
+undersells the tested-ness of the host-mutation crates.
+
+The five files that show 0% are all in this "smoke-tested, not
+unit-tested" bucket — they're root-required by design per CLAUDE.md
+L391 (`#[ignore]` reason-string convention):
+
+| file | 0% reason | smoke covered by |
+|---|---|---|
+| `bugpot-metrics/lib.rs` | Prometheus HTTP listener | (any run) |
+| `bugpot-runtime/auth.rs` | Auth → RegistryAuth conversion | smoke-app (pull path) |
+| `bugpot-runtime/logs.rs` | `spawn_log_tails` (inotify) | smoke-app |
+| `bugpot-runtime/volumes.rs` | host-dir + chown | smoke-volume |
+| `bugpot-egress/lib.rs` (27%) | bridge/netns/nft host mutation | smoke-infra, smoke-app |
+
+The actually-low-coverage-and-purely-Rust files worth eyeballing
+(in case they have testable logic the suite is missing):
+
+- `bugpot-core/src/store.rs` — 59% lines / 65% functions. Pure
+  TOML/IO. The lifecycle paths around `persist_spec` /
+  `persist_rollouts` (now sharing `persist_toml`) have some
+  coverage but error branches are sparse.
+- `bugpot-runtime/src/cgroup_stats.rs` — 58% lines. The parsers
+  (`read_memory_bytes` / `read_cpu_usec`) have unit tests; the
+  `cgroup_path_for_pid` reader path is smoke-covered only.
+- `bugpot-runtime/src/error.rs` — 71% lines. Error variant
+  constructors; the residual gap is the formatting / source-chain
+  edges.
+- `bugpot-egress/src/dns.rs` — 69% lines / 48% functions. DNS
+  resolver, partially unit-tested; gaps are likely in the
+  upstream-fallback paths.
+
+Treat this as a baseline to compare future runs against, not a
+target to chase. The 64.72% line figure is fine for a workspace
+this layered.
 
 ## Refactor candidates, ranked
 
