@@ -147,30 +147,25 @@ struct DeployKeyResponse {
 
 // ---- Config ---------------------------------------------------------------
 
-struct AdminConfig {
+/// Resolved API client config — base URL plus the bearer token for
+/// whichever auth scope the command needs (`admin` or `deploy`).
+///
+/// One struct instead of two-distinguished-by-name: there is no
+/// compile-time invariant the previous split could express (any
+/// `AdminConfig` was structurally interchangeable with a
+/// `DeployConfig`), and both paths read the same `BUGPOT_ADMIN_URL`.
+/// The auth-scope distinction lives in the env-var name passed to
+/// `read_token`; the resulting `ApiConfig` is just data.
+struct ApiConfig {
     base_url: String,
     token: String,
 }
 
-impl AdminConfig {
-    fn from_env() -> Result<Self> {
+impl ApiConfig {
+    fn from_env(token_kind: &str) -> Result<Self> {
         let base_url =
             std::env::var("BUGPOT_ADMIN_URL").unwrap_or_else(|_| DEFAULT_ADMIN_URL.to_string());
-        let token = read_token("admin")?;
-        Ok(Self { base_url, token })
-    }
-}
-
-struct DeployConfig {
-    base_url: String,
-    token: String,
-}
-
-impl DeployConfig {
-    fn from_env() -> Result<Self> {
-        let base_url =
-            std::env::var("BUGPOT_ADMIN_URL").unwrap_or_else(|_| DEFAULT_ADMIN_URL.to_string());
-        let token = read_token("deploy")?;
+        let token = read_token(token_kind)?;
         Ok(Self { base_url, token })
     }
 }
@@ -234,7 +229,7 @@ async fn main() -> Result<()> {
 // ---- Apps subcommands -----------------------------------------------------
 
 async fn run_apps(client: &Client, op: AppsCmd, json: bool) -> Result<()> {
-    let cfg = AdminConfig::from_env()?;
+    let cfg = ApiConfig::from_env("admin")?;
     match op {
         AppsCmd::List => {
             let v: Vec<AppView> = http_get_json(client, &cfg.base_url, "/apps", &cfg.token).await?;
@@ -318,7 +313,7 @@ async fn run_apps(client: &Client, op: AppsCmd, json: bool) -> Result<()> {
 // ---- Rollouts subcommands -------------------------------------------------
 
 async fn run_rollouts(client: &Client, op: RolloutsCmd, json: bool) -> Result<()> {
-    let cfg = DeployConfig::from_env()?;
+    let cfg = ApiConfig::from_env("deploy")?;
     match op {
         RolloutsCmd::List { app } => {
             let v: Vec<Rollout> = http_get_json(

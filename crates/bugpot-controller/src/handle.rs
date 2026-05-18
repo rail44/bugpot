@@ -247,14 +247,16 @@ impl AppState {
 }
 
 /// Both registration maps under a single lock so insert / remove are
-/// atomic across the (name, subdomain) pair. Name is the primary key
-/// (used by `get_app` / `remove_app` / `cleanup`); subdomain is a
-/// reverse index used by `UpstreamResolver::resolve` to route HTTP
-/// requests in O(1).
+/// atomic across the (name, subdomain) pair. Name is the primary
+/// key (used by `find_handle` / `remove_app` / `cleanup`);
+/// subdomain is a reverse index used by `UpstreamResolver::resolve`
+/// to route HTTP requests. Both maps hold `Arc<AppHandle>` directly
+/// so resolve resolves in one hash, not two (subdomain → handle, no
+/// intermediate `name: String` hop).
 #[derive(Debug, Default)]
 pub(crate) struct AppMaps {
     pub(crate) by_name: HashMap<String, Arc<AppHandle>>,
-    pub(crate) by_subdomain: HashMap<String, String>,
+    pub(crate) by_subdomain: HashMap<String, Arc<AppHandle>>,
 }
 
 /// Construct a handle from a validated spec. Returns `Err` if

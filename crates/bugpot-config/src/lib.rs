@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// One image-rollout event for an app.
 ///
@@ -14,11 +15,13 @@ pub struct Rollout {
     /// Image tag (e.g. `v1.2.3`, a git SHA, or `latest`). Combined with
     /// the app's `repo` to form the full reference bugpot pulls.
     pub tag: String,
-    /// RFC 3339 timestamp produced by bugpot at rollout creation time.
-    /// Stored as a string (rather than a typed `DateTime`) so the TOML
-    /// is round-trippable without pulling in a heavyweight time-format
-    /// dependency on the config side.
-    pub created_at: String,
+    /// Time bugpot stamped the rollout. Serialised as an RFC 3339
+    /// string via `humantime_serde` — the wire shape (admin JSON,
+    /// on-disk TOML) is unchanged from when the field was a plain
+    /// `String`, but a malformed timestamp now fails to deserialise
+    /// instead of silently round-tripping garbage.
+    #[serde(with = "humantime_serde")]
+    pub created_at: SystemTime,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
