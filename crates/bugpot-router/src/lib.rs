@@ -1,5 +1,4 @@
 use anyhow::Result;
-use async_trait::async_trait;
 use axum::{
     Router,
     body::Body,
@@ -12,7 +11,6 @@ use axum::{
     response::Response,
     routing::any,
 };
-use bugpot_config::AppSpec;
 use http_body_util::Limited;
 use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
@@ -142,50 +140,15 @@ impl RouterConfig {
     }
 }
 
-/// One registered app paired with the concrete upstream to forward to.
-///
-/// Used by `AppRouter`, the simple static resolver that backs the
-/// integration tests and host-network setups. The production path
-/// goes through `UpstreamResolver` so the controller can cold-start
-/// containers on demand. The struct is *not* a deployment — the
-/// actual deploy lifecycle lives in `bugpot-controller` — it's just
-/// the (spec, upstream) routing entry.
-///
-/// Tests can use [`RouteEntry::localhost`] to point at
-/// `127.0.0.1:<spec.port>`.
-#[derive(Debug, Clone)]
-pub struct RouteEntry {
-    pub spec: AppSpec,
-    pub upstream: SocketAddr,
-}
-
-impl RouteEntry {
-    #[must_use]
-    pub const fn new(spec: AppSpec, upstream: SocketAddr) -> Self {
-        Self { spec, upstream }
-    }
-
-    /// Convenience for tests and host-network deployments: point the upstream
-    /// at `127.0.0.1:<spec.port>`.
-    #[must_use]
-    pub fn localhost(spec: AppSpec) -> Self {
-        let port = spec.port;
-        Self {
-            spec,
-            upstream: SocketAddr::from(([127, 0, 0, 1], port)),
-        }
-    }
-}
-
 /// What `UpstreamResolver::resolve` returns for a successfully-resolved
 /// host: the upstream address plus an optional per-app counter the
 /// router will increment when it spawns a long-lived upgrade splice.
 ///
 /// Resolvers that don't care about per-app upgrade tracking can leave
-/// `active_upgrades` set to `None` (e.g. the static `AppRouter` used in
-/// router-only tests); the in-bugpot `AppController` impl returns the
-/// `AppHandle`'s counter so the controller's idle reaper can defer
-/// freezing while an upgrade is mid-flight.
+/// `active_upgrades` set to `None` (e.g. the static resolver in this
+/// crate's integration test); the in-bugpot `AppController` impl
+/// returns the `AppHandle`'s counter so the controller's idle reaper
+/// can defer freezing while an upgrade is mid-flight.
 #[derive(Debug, Clone)]
 pub struct Upstream {
     pub addr: SocketAddr,
@@ -239,13 +202,14 @@ pub enum ResolveError {
 /// Implementations may take meaningful time (e.g. waiting for a cold-start
 /// container to come up) but should respect cancellation if the caller
 /// drops the future.
-#[async_trait]
+/// Native AFIT — `serve` is generic over the concrete resolver type
+/// (controller in production, a test fixture in `tests/proxy.rs`),
+/// so no `dyn` and no `#[async_trait]` allocation per request.
 pub trait UpstreamResolver: Send + Sync + std::fmt::Debug {
-    async fn resolve(&self, host: &str) -> Result<Upstream, ResolveError>;
+    fn resolve(&self, host: &str) -> impl Future<Output = Result<Upstream, ResolveError>> + Send;
 }
 
-/// Convenience extractor used by both [`AppRouter`] and any custom
-/// resolver implementation.
+/// Convenience extractor used by `UpstreamResolver` implementations.
 ///
 /// `host` is the literal `Host` header value, optionally with a
 /// trailing `:port`. Returns the first DNS label of the hostname, or
@@ -262,40 +226,9 @@ pub fn subdomain_of(host: &str) -> Option<&str> {
     host.split(':').next()?.split('.').next()
 }
 
-#[derive(Debug)]
-pub struct AppRouter {
-    routes: Vec<RouteEntry>,
-}
-
-impl AppRouter {
-    #[must_use]
-    pub const fn new(routes: Vec<RouteEntry>) -> Self {
-        Self { routes }
-    }
-
-    /// Resolve a host header (e.g. `myapp.bugpot.example` or `myapp.bugpot.example:443`)
-    /// to a registered route by matching the first DNS label against the
-    /// app's subdomain.
-    #[must_use]
-    pub fn resolve(&self, host: &str) -> Option<&RouteEntry> {
-        let subdomain = subdomain_of(host)?;
-        self.routes.iter().find(|d| d.spec.subdomain() == subdomain)
-    }
-}
-
-#[async_trait]
-impl UpstreamResolver for AppRouter {
-    async fn resolve(&self, host: &str) -> Result<Upstream, ResolveError> {
-        self.resolve(host)
-            .map(|d| Upstream::new(d.upstream))
-            .ok_or(ResolveError::NoSuchApp)
-    }
-}
-
 /// Shared state passed to every handler invocation.
-#[derive(Clone)]
-struct ProxyState {
-    resolver: Arc<dyn UpstreamResolver>,
+struct ProxyState<R: UpstreamResolver + 'static> {
+    resolver: Arc<R>,
     client: ProxyClient,
     config: Arc<RouterConfig>,
     /// Caps the number of simultaneously-spliced Upgrade connections.
@@ -305,7 +238,20 @@ struct ProxyState {
     upgrade_slots: Arc<Semaphore>,
 }
 
-impl std::fmt::Debug for ProxyState {
+// Derive-style `Clone` would require `R: Clone`, which we don't need
+// (the `Arc<R>` is what gets cloned). Hand-write the impl.
+impl<R: UpstreamResolver + 'static> Clone for ProxyState<R> {
+    fn clone(&self) -> Self {
+        Self {
+            resolver: Arc::clone(&self.resolver),
+            client: self.client.clone(),
+            config: Arc::clone(&self.config),
+            upgrade_slots: Arc::clone(&self.upgrade_slots),
+        }
+    }
+}
+
+impl<R: UpstreamResolver + 'static> std::fmt::Debug for ProxyState<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProxyState")
             .field("resolver", &self.resolver)
@@ -330,9 +276,9 @@ fn build_client() -> ProxyClient {
 /// (rather than `axum::serve`) because we need
 /// `http1.header_read_timeout` for slowloris protection, and axum 0.8
 /// doesn't expose that knob through its `Serve` wrapper.
-pub async fn serve(
+pub async fn serve<R: UpstreamResolver + 'static>(
     addr: SocketAddr,
-    resolver: Arc<dyn UpstreamResolver>,
+    resolver: Arc<R>,
     config: RouterConfig,
 ) -> Result<()> {
     let state = ProxyState {
@@ -342,7 +288,7 @@ pub async fn serve(
         upgrade_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_UPGRADES)),
     };
     let app = Router::new()
-        .fallback(any(handler))
+        .fallback(any(handler::<R>))
         .with_state(state)
         // Tower layers — applied to every request the service sees,
         // including upgrades. The body limit only counts bytes that
@@ -404,7 +350,10 @@ pub async fn serve(
     }
 }
 
-async fn handler(State(state): State<ProxyState>, req: Request) -> Response {
+async fn handler<R: UpstreamResolver + 'static>(
+    State(state): State<ProxyState<R>>,
+    req: Request,
+) -> Response {
     let host = req
         .headers()
         .get(HOST)
@@ -457,8 +406,8 @@ async fn handler(State(state): State<ProxyState>, req: Request) -> Response {
 /// Forward a request to the resolved upstream socket.
 ///
 /// Handles HTTP and HTTP/1.1 Upgrade (e.g. WebSocket) transparently.
-async fn forward(
-    state: &ProxyState,
+async fn forward<R: UpstreamResolver + 'static>(
+    state: &ProxyState<R>,
     mut req: Request,
     upstream: Upstream,
     original_host: &str,
@@ -544,8 +493,8 @@ async fn forward(
 /// router increments when a successful upgrade enters splice and
 /// decrements when the splice task exits. The controller reads this
 /// counter to defer freezing while an upgrade is mid-flight.
-async fn forward_upgrade(
-    state: &ProxyState,
+async fn forward_upgrade<R: UpstreamResolver + 'static>(
+    state: &ProxyState<R>,
     mut req: Request,
     active_upgrades: Option<Arc<AtomicUsize>>,
 ) -> Response {
@@ -825,44 +774,24 @@ fn error_response(status: StatusCode, body: String) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
-    fn fake_app(name: &str) -> AppSpec {
-        AppSpec {
-            repo: format!("ghcr.io/test/{name}"),
-            port: 3000,
-            name: None,
-            subdomain: None,
-            egress: bugpot_config::EgressSpec::default(),
-            env: std::collections::HashMap::default(),
-            scaling: bugpot_config::Scaling::default(),
-            readiness: bugpot_config::Readiness::default(),
-            resources: bugpot_config::Resources::default(),
-            volumes: Vec::new(),
-            source_path: PathBuf::from(format!("/apps/{name}.toml")),
-        }
+    #[test]
+    fn subdomain_of_extracts_first_label() {
+        assert_eq!(subdomain_of("alpha.bugpot.example"), Some("alpha"));
+        // The `:port` suffix is stripped before label extraction so
+        // routing works regardless of how the client wrote the Host.
+        assert_eq!(subdomain_of("beta.bugpot.example:443"), Some("beta"));
+        // Single label with no dot is its own subdomain (matches the
+        // `*.localhost` dev-loopback case).
+        assert_eq!(subdomain_of("alpha:8080"), Some("alpha"));
     }
 
     #[test]
-    fn resolves_by_subdomain() {
-        let router = AppRouter::new(vec![
-            RouteEntry::localhost(fake_app("alpha")),
-            RouteEntry::localhost(fake_app("beta")),
-        ]);
-        assert_eq!(
-            router
-                .resolve("alpha.bugpot.example")
-                .map(|d| d.spec.name()),
-            Some("alpha")
-        );
-        assert_eq!(
-            router
-                .resolve("beta.bugpot.example:443")
-                .map(|d| d.spec.name()),
-            Some("beta")
-        );
-        assert!(router.resolve("gamma.bugpot.example").is_none());
-        assert!(router.resolve("").is_none());
+    fn subdomain_of_empty_returns_empty_label() {
+        // No special-casing for empty Host — it falls out as an empty
+        // first label, which the resolver compares against registered
+        // subdomains and (correctly) fails to match anything.
+        assert_eq!(subdomain_of(""), Some(""));
     }
 
     #[test]

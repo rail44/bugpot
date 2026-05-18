@@ -18,7 +18,7 @@ use axum::{
     routing::any,
 };
 use bugpot_config::{AppSpec, EgressSpec, Readiness, Resources, Scaling};
-use bugpot_router::{AppRouter, RouteEntry, RouterConfig, serve};
+use bugpot_router::{ResolveError, RouterConfig, Upstream, UpstreamResolver, serve, subdomain_of};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use tokio::{net::TcpListener, time::timeout};
@@ -79,11 +79,45 @@ fn fake_app(name: &str, port: u16) -> AppSpec {
     }
 }
 
+/// Static (name → 127.0.0.1:port) route table used as the test's
+/// `UpstreamResolver`. The production resolver is `AppController`,
+/// which cold-starts containers on demand; tests just need a fixed
+/// host → upstream mapping to exercise the proxy layer in isolation.
+#[derive(Debug)]
+struct StaticResolver {
+    routes: Vec<(String, SocketAddr)>,
+}
+
+impl StaticResolver {
+    fn from_apps(apps: Vec<AppSpec>) -> Self {
+        let routes = apps
+            .into_iter()
+            .map(|spec| {
+                let upstream = SocketAddr::from(([127, 0, 0, 1], spec.port));
+                (spec.subdomain().to_owned(), upstream)
+            })
+            .collect();
+        Self { routes }
+    }
+}
+
+impl UpstreamResolver for StaticResolver {
+    async fn resolve(&self, host: &str) -> Result<Upstream, ResolveError> {
+        let Some(subdomain) = subdomain_of(host) else {
+            return Err(ResolveError::NoSuchApp);
+        };
+        self.routes
+            .iter()
+            .find(|(name, _)| name == subdomain)
+            .map(|(_, addr)| Upstream::new(*addr))
+            .ok_or(ResolveError::NoSuchApp)
+    }
+}
+
 /// Bind the router on an ephemeral port and return its address. The supplied
 /// apps are deployed against `127.0.0.1:<app.port>` (the test backend).
 async fn start_router(apps: Vec<AppSpec>) -> SocketAddr {
-    let routes = apps.into_iter().map(RouteEntry::localhost).collect();
-    let app_router = Arc::new(AppRouter::new(routes));
+    let app_router = Arc::new(StaticResolver::from_apps(apps));
     // Reserve a port, then immediately release the listener so `serve` can
     // re-bind. There's a small TOCTOU window but it's acceptable for tests.
     let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();

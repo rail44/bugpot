@@ -271,7 +271,6 @@ name = "bugpot-controller"
 version = "0.0.1"
 dependencies = [
  "anyhow",
- "async-trait",
  "bugpot-config",
  "bugpot-egress",
  "bugpot-router",
@@ -324,7 +323,6 @@ name = "bugpot-router"
 version = "0.0.1"
 dependencies = [
  "anyhow",
- "async-trait",
  "axum",
  "bugpot-config",
  "divan",
