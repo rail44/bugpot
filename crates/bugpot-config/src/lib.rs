@@ -189,28 +189,41 @@ pub struct Resources {
 }
 
 impl Resources {
-    /// Hard memory ceiling applied when an app spec omits `[resources]
-    /// memory`. Sized for the "many small apps on a cheap VM" scenario
-    /// — without a default an unbounded app can OOM-kill the host.
+    /// Soft memory target applied when an app spec omits `[resources]
+    /// memory`. Sets cgroup v2's `memory.high` — the kernel throttles
+    /// the container via direct reclaim past this value, but doesn't
+    /// hard-kill it. Sized for the "many small apps on a cheap VM"
+    /// scenario; an app that legitimately needs more bursts upward.
     pub const DEFAULT_MEMORY: &'static str = "128MB";
-    /// Default CPU share when `[resources] cpu` is omitted: half a core.
-    /// Two apps can comfortably share one vCPU at this default.
-    pub const DEFAULT_CPU: &'static str = "0.5";
+    /// Default CPU weight when `[resources] cpu` is omitted: a full
+    /// CPU's worth of shares (= 1024 shares = cgroup v2 `cpu.weight`
+    /// 100, the kernel default). Apps share contested CPU in
+    /// proportion to their weights; an app at the default that has
+    /// the host to itself uses everything available.
+    pub const DEFAULT_CPU: &'static str = "1.0";
 
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.memory.is_none() && self.cpu.is_none()
     }
 
-    /// Memory limit string actually applied at start time.
+    /// Memory soft target string actually applied at start time.
     /// Falls back to [`Self::DEFAULT_MEMORY`] when not specified.
+    /// Surfaced through `memory.reservation` in the OCI spec, which
+    /// libcontainer maps to cgroup v2's `memory.high` (soft throttle
+    /// via direct reclaim, not a hard kill).
     #[must_use]
     pub fn effective_memory(&self) -> &str {
         self.memory.as_deref().unwrap_or(Self::DEFAULT_MEMORY)
     }
 
-    /// CPU share string actually applied at start time. Falls back to
-    /// [`Self::DEFAULT_CPU`] when not specified.
+    /// CPU weight string actually applied at start time. Falls back
+    /// to [`Self::DEFAULT_CPU`] when not specified. Surfaced through
+    /// `cpu.shares` in the OCI spec, which libcontainer maps to
+    /// cgroup v2's `cpu.weight` — a **relative weight** between
+    /// apps, not a hard cap. An app at `"2.0"` gets twice the share
+    /// of one at `"1.0"` *only while both are saturating the same
+    /// core*; otherwise each takes whatever's idle.
     #[must_use]
     pub fn effective_cpu(&self) -> &str {
         self.cpu.as_deref().unwrap_or(Self::DEFAULT_CPU)
