@@ -123,6 +123,7 @@ under `scripts/` are still the canonical end-to-end tests:
 - `scripts/smoke-freeze.sh` — freezer-based scale-to-zero: idle → `frozen` (not `stopped`), resume in sub-ms
 - `scripts/smoke-readiness.sh` — `[readiness] path` HTTP probe: cold-start blocks until 2xx
 - `scripts/smoke-volume.sh` — `[[volumes]]` bind-mounts survive freeze / rollout / eviction
+- `scripts/smoke-bluegreen.sh` — blue-green rollouts: zero-gap switch, slot alternation, PATCH rides the same path, auto-rollback on bad tag
 
 These scripts DO tear down `bugpot0` + the `nft` table on exit because
 they're explicit single-shot tests. The dev-server intentionally does not.
