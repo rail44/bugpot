@@ -1,0 +1,78 @@
+# cargo-deny configuration for the bugpot workspace.
+#
+# Two checks bugpot cares about:
+#   - advisories: known security issues in our dep tree (subsumes
+#     cargo-audit).
+#   - licenses: every dep's license is on a permissive-allow list,
+#     compatible with bugpot's own MIT.
+#   - bans + sources: light rails to keep the dep graph honest.
+#
+# Run via `just deny` (full check) or `just audit` (advisories only,
+# for fast pre-push verification).
+
+[graph]
+# Linux-only crate. Restrict to the host arches bugpot actually ships
+# binaries for so cargo-deny doesn't pull cross-platform branches we
+# never compile against.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+
+[advisories]
+yanked = "deny"
+# Both `ignore` entries below are deps pulled in transitively by
+# `libcontainer` (the youki container runtime). Patching them needs
+# an upstream libcontainer release; revisit on every bump of the
+# `libcontainer` workspace pin.
+ignore = [
+    # protobuf v3.2.0 — recursion-bomb DoS via untrusted text proto
+    # input. libcontainer uses protobuf internally for the gRPC
+    # state-passing protocol; bugpot never feeds it untrusted text
+    # proto, so the attack surface doesn't reach us. Re-check when
+    # libcontainer 0.7+ ships.
+    { id = "RUSTSEC-2024-0437", reason = "protobuf via libcontainer; no untrusted input path" },
+    # paste 1.0.15 — proc-macro crate, no longer maintained. Pulled
+    # by `netlink-packet-core` (also via libcontainer). Functional;
+    # no successor exists. Tracked upstream.
+    { id = "RUSTSEC-2024-0436", reason = "paste via netlink-packet-core; unmaintained but functional" },
+]
+
+[licenses]
+# Permissive-license-only policy. bugpot itself is MIT; every dep we
+# accept must be compatible with redistribution under that license
+# without copyleft contamination.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "Unlicense",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.93
+
+[bans]
+# `multiple-versions = "allow"` because a Rust dep graph this size
+# inevitably collects un-collapsed duplicates (different crates
+# pinning different majors of `getrandom`, `rand`, `hashbrown`,
+# `darling`, etc.). cargo-deny treats `warn` as a non-zero exit, and
+# none of these duplicates are bugs — they're just cargo's reality.
+# Re-evaluate when a single pair becomes a security concern.
+multiple-versions = "allow"
+# Hard ban on `version = "*"` in any Cargo.toml — those make the
+# lockfile non-reproducible across cargo update. Workspace internal
+# `bugpot-*.workspace = true` deps resolve via path and don't carry
+# version constraints, so allow them explicitly.
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
