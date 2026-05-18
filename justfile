@@ -166,22 +166,31 @@ metrics-grep prefix:
 
 # --- Code analysis (native; no VM needed) ---
 #
-# Tooling: `cargo install tokei cargo-modules cargo-depgraph`.
-# Snapshot of the current findings lives at scripts/analysis/REPORT.md.
+# scripts/analysis/ holds a small workspace crate (`bugpot-analyzer`)
+# that parses every workspace .rs via `syn` so the test/prod split
+# tracks `#[cfg(test)]` precisely, per-fn body spans are brace-matched,
+# and cyclomatic is computed by walking branching AST nodes.
+#
+# Cargo subcommands used below: `cargo install cargo-modules cargo-depgraph`.
+# Snapshot of current findings: scripts/analysis/REPORT.md.
 
-# Top 20 files by churn (git-log) × production LOC (lines outside the
-# inline `mod tests` block). Workspace .rs only; excludes experiments/.
+# Top 20 files by churn (git log --follow) × production LOC, plus the
+# max cyclomatic among each file's production fns.
 hotspots:
-    @scripts/analysis/hotspots.py
+    @cargo run -q --release -p bugpot-analyzer
 
-# Full hotspot ranking (every workspace .rs file, not just top 20).
+# Full hotspot ranking (every workspace .rs file).
 hotspots-all:
-    @scripts/analysis/hotspots.py --all
+    @cargo run -q --release -p bugpot-analyzer -- --all
 
-# Hotspot ranking with inline `mod tests` LOC counted toward the score.
-# Useful for spotting fragile test bloat alongside production hotspots.
-hotspots-with-tests:
-    @scripts/analysis/hotspots.py --include-tests
+# Hotspot ranking plus per-file "largest production fns" listing
+# for the top 5 files.
+hotspots-fns:
+    @cargo run -q --release -p bugpot-analyzer -- --fns
+
+# CSV output for piping into spreadsheets or scripts.
+hotspots-csv:
+    @cargo run -q --release -p bugpot-analyzer -- --csv
 
 # Module structure of a workspace crate.
 # Example: `just modules bugpot-core`.

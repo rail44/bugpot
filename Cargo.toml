@@ -11,6 +11,7 @@ members = [
     "crates/bugpot-router",
     "crates/bugpot-runtime",
     "experiments/youki-sandbox",
+    "scripts/analysis",
 ]
 
 [workspace.package]
