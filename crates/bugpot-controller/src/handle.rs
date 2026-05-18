@@ -24,8 +24,19 @@ use tokio::sync::{Mutex, Notify, RwLock};
 /// the image GC on cheap-VM hosts.
 pub(crate) const MAX_ROLLOUT_HISTORY: usize = 2;
 
+/// The live registered-app object. Holds all the state the
+/// controller's lifecycle methods mutate plus the immutable
+/// identity used to key the registry maps.
+///
+/// `pub` so callers outside the crate (e.g. `bugpot-admin`'s auth
+/// middleware) can hold an `Arc<AppHandle>` returned by
+/// [`AppController::find_handle`](crate::AppController::find_handle)
+/// and pass it back into operation methods, removing the
+/// "look-the-app-up-twice" footgun the name-keyed API encouraged.
+/// Internal fields stay `pub(crate)` — only the named accessor
+/// methods below are part of the cross-crate surface.
 #[derive(Debug)]
-pub(crate) struct AppHandle {
+pub struct AppHandle {
     /// Immutable identity (name + subdomain). Set once at construction
     /// from the validating `AppSpec::identity`, never updated — a
     /// future PUT-style update path will compare against this and
@@ -48,6 +59,27 @@ pub(crate) struct AppHandle {
     /// the user-space process can't process frames.
     pub(crate) active_upgrades: Arc<AtomicUsize>,
     pub(crate) inner: Mutex<HandleInner>,
+}
+
+impl AppHandle {
+    /// The app's stable registration name — primary key in the
+    /// registry. Borrowed from the immutable identity; no lock.
+    pub fn name(&self) -> &str {
+        &self.identity.name
+    }
+
+    /// The DNS label the router matches on. Borrowed from the
+    /// immutable identity; no lock.
+    pub fn subdomain(&self) -> &str {
+        &self.identity.subdomain
+    }
+
+    /// The `repo` field of the current spec. Reads under the spec
+    /// `RwLock`. Used by `bugpot-admin`'s deploy-token middleware
+    /// to verify the per-app HMAC against the live repo.
+    pub async fn repo(&self) -> String {
+        self.spec.read().await.repo.clone()
+    }
 }
 
 #[derive(Debug)]

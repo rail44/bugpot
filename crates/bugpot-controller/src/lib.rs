@@ -51,9 +51,9 @@ mod mempressure;
 use mempressure::read_mem_available;
 
 mod handle;
+pub use handle::AppHandle;
 use handle::{
-    AppHandle, AppMaps, AppState, MAX_ROLLOUT_HISTORY, StartClaim, make_handle,
-    make_handle_with_rollouts,
+    AppMaps, AppState, MAX_ROLLOUT_HISTORY, StartClaim, make_handle, make_handle_with_rollouts,
 };
 
 mod view;
@@ -190,7 +190,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
             warn!("reattach_running called more than once; ignoring subsequent calls");
             return;
         }
-        for handle in self.snapshot_handles().await {
+        for handle in self.list_handles().await {
             let name = &handle.identity.name;
             // Either Running or Paused (= frozen across the daemon
             // restart) counts as a live container worth reattaching to.
@@ -289,7 +289,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
     pub async fn deploy_always_on(&self) -> Result<()> {
         // Resolve idle_timeout up-front so a bad value fails fast before
         // any container is started.
-        let handles = self.snapshot_handles().await;
+        let handles = self.list_handles().await;
         let mut always_on = Vec::new();
         for handle in handles {
             let timeout = handle
@@ -417,7 +417,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
     /// to actual pressure.
     async fn evict_lru_frozen(&self) -> bool {
         let mut candidate: Option<(Arc<AppHandle>, Instant)> = None;
-        for handle in self.snapshot_handles().await {
+        for handle in self.list_handles().await {
             let inner = handle.inner.lock().await;
             if inner.state.is_frozen() {
                 match &candidate {
@@ -449,7 +449,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         // lock + spec + runtime entry), so run all apps concurrently.
         // A slow `stop()` on one app no longer blocks metric emission
         // or idle-timeout enforcement for the others in the same tick.
-        let handles = self.snapshot_handles().await;
+        let handles = self.list_handles().await;
         let tasks = handles.into_iter().map(|h| self.sweep_one(h));
         futures::future::join_all(tasks).await;
     }
@@ -508,7 +508,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
 
     /// Stop every app that's currently running. Used on shutdown.
     pub async fn teardown(&self) {
-        for handle in self.snapshot_handles().await {
+        for handle in self.list_handles().await {
             let should_stop = {
                 let inner = handle.inner.lock().await;
                 // Frozen is deliberately excluded: on daemon shutdown
@@ -599,19 +599,12 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
     ///     effect. The current rollout history is preserved.
     pub async fn update_app(
         &self,
-        name: &str,
+        handle: &Arc<AppHandle>,
         new_spec: AppSpec,
     ) -> std::result::Result<AppView, UpdateError> {
         new_spec.validate()?;
 
-        let handle = self
-            .apps
-            .read()
-            .await
-            .by_name
-            .get(name)
-            .cloned()
-            .ok_or_else(|| UpdateError::NotFound(name.to_owned()))?;
+        let name = handle.name();
 
         // Identity guards: PATCH cannot change `name` / `subdomain`.
         // The body's `name` field is allowed to either match or be
@@ -641,7 +634,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
             _ => false,
         };
         if logically_equal {
-            return Ok(view_of(&handle).await);
+            return Ok(view_of(handle).await);
         }
 
         let was_running = handle.inner.lock().await.state.is_running();
@@ -660,15 +653,15 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
             handle.inner.lock().await.image_digest = None;
         }
 
-        if let Err(e) = self.persist_spec(&handle).await {
+        if let Err(e) = self.persist_spec(handle).await {
             return Err(UpdateError::Internal(e));
         }
 
         if was_running {
-            self.restart_after_spec_change(&handle).await?;
+            self.restart_after_spec_change(handle).await?;
         }
 
-        Ok(view_of(&handle).await)
+        Ok(view_of(handle).await)
     }
 
     /// Stop + start cycle for an app whose spec was just rewritten.
@@ -706,32 +699,25 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
     ///      and let the caller retry.
     pub async fn set_rollout(
         &self,
-        name: &str,
+        handle: &Arc<AppHandle>,
         tag: String,
     ) -> std::result::Result<Rollout, RolloutError> {
         if tag.trim().is_empty() {
             return Err(RolloutError::EmptyTag);
         }
-        let handle = self
-            .apps
-            .read()
-            .await
-            .by_name
-            .get(name)
-            .cloned()
-            .ok_or_else(|| RolloutError::NotFound(name.to_owned()))?;
+        let name = handle.name().to_owned();
 
         // Conflict check: refuse mid-transition. Done before pull so
         // we don't waste a registry round-trip on a doomed call.
         {
             let inner = handle.inner.lock().await;
             if inner.state.is_busy() {
-                return Err(RolloutError::Conflict(name.to_owned()));
+                return Err(RolloutError::Conflict(name));
             }
         }
 
         // 1. Pull.
-        let resolved_digest = self.pull_for_rollout(&handle, &tag).await?;
+        let resolved_digest = self.pull_for_rollout(handle, &tag).await?;
 
         // 2. Append to history and update the digest cache so the
         // next `do_start` uses *this* rollout's digest, not the
@@ -740,21 +726,21 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
             tag,
             created_at: humantime::format_rfc3339_seconds(SystemTime::now()).to_string(),
         };
-        record_rollout(&handle, rollout.clone(), resolved_digest).await;
+        record_rollout(handle, rollout.clone(), resolved_digest).await;
 
         // 3. Persist the rollout to its own state file. Spec doesn't
         // change here, so no spec rewrite needed.
-        if let Err(e) = self.persist_rollouts(&handle).await {
+        if let Err(e) = self.persist_rollouts(handle).await {
             warn!(app = %name, error = ?e, "failed to persist rollouts");
         }
 
         // 4 + 5: bring the container to the new image. If it was
         // running, stop first so the start uses the new digest cache.
         let was_running = handle.inner.lock().await.state.is_running();
-        if was_running && let Err(e) = self.stop(&handle).await {
+        if was_running && let Err(e) = self.stop(handle).await {
             warn!(app = %name, error = ?e, "stop before rollout-restart failed");
         }
-        if let Err(e) = self.ensure_running(&handle).await {
+        if let Err(e) = self.ensure_running(handle).await {
             return Err(RolloutError::StartFailed(e));
         }
 
@@ -780,11 +766,10 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
     }
 
     /// Return a snapshot of the rollout history (front = oldest,
-    /// back = current) for `name`, or `None` if the app does not
-    /// exist.
-    pub async fn list_rollouts(&self, name: &str) -> Option<Vec<Rollout>> {
-        let handle = self.apps.read().await.by_name.get(name).cloned()?;
-        Some(handle.inner.lock().await.rollouts.iter().cloned().collect())
+    /// back = current). Caller is responsible for proving the
+    /// handle is registered — pass the value from `find_handle`.
+    pub async fn list_rollouts(&self, handle: &Arc<AppHandle>) -> Vec<Rollout> {
+        handle.inner.lock().await.rollouts.iter().cloned().collect()
     }
 
     fn spec_path(&self, name: &str) -> PathBuf {
@@ -827,30 +812,28 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         Ok(())
     }
 
-    /// Unregister an app by name. Stops the container (if running) and
-    /// deletes its TOML file.
-    pub async fn remove_app(&self, name: &str) -> std::result::Result<(), RemoveError> {
-        if !self.apps.read().await.by_name.contains_key(name) {
-            return Err(RemoveError::NotFound(name.to_owned()));
-        }
-        self.remove_by_name(name)
-            .await
-            .map_err(RemoveError::Internal)
+    /// Unregister an app. Stops the container (if running), drops
+    /// the registry entries, and deletes the on-disk spec + rollouts
+    /// files. Caller proves the handle is registered (by passing the
+    /// value from `find_handle`); concurrent removes of the same
+    /// app collapse harmlessly to a single registry mutation.
+    pub async fn remove_app(
+        &self,
+        handle: &Arc<AppHandle>,
+    ) -> std::result::Result<(), RemoveError> {
+        self.do_remove(handle).await.map_err(RemoveError::Internal)
     }
 
-    async fn remove_by_name(&self, name: &str) -> Result<()> {
-        let handle = {
+    async fn do_remove(&self, handle: &Arc<AppHandle>) -> Result<()> {
+        let name = handle.name();
+        {
             let mut maps = self.apps.write().await;
-            let handle = maps
-                .by_name
-                .remove(name)
-                .ok_or_else(|| anyhow!("app '{name}' not found"))?;
-            maps.by_subdomain.remove(&handle.identity.subdomain);
-            handle
-        };
+            maps.by_name.remove(name);
+            maps.by_subdomain.remove(handle.subdomain());
+        }
         gauge!("bugpot_apps_active").decrement(1.0);
-        if let Err(e) = self.stop(&handle).await {
-            warn!(app = %handle.identity.name, error = ?e, "stop failed during remove");
+        if let Err(e) = self.stop(handle).await {
+            warn!(app = %name, error = ?e, "stop failed during remove");
         }
         // `stop()` only kills the container — it leaves the bundle dir
         // and the per-app volume tree on disk. `cleanup_orphan_container`
@@ -859,24 +842,20 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         // here too. Otherwise persistent-volume apps leak data on
         // DELETE — the volume dir survives until the operator runs a
         // restart-with-missing-TOML cycle.
-        if let Err(e) = self
-            .runtime
-            .cleanup_orphan_container(&handle.identity.name)
-            .await
-        {
+        if let Err(e) = self.runtime.cleanup_orphan_container(name).await {
             warn!(
-                app = %handle.identity.name,
+                app = %name,
                 error = ?e,
                 "cleanup_orphan_container failed during remove; bundle / volume dir may leak",
             );
         }
-        let spec_path = self.spec_path(&handle.identity.name);
+        let spec_path = self.spec_path(name);
         if spec_path.exists()
             && let Err(e) = tokio::fs::remove_file(&spec_path).await
         {
             warn!(path = %spec_path.display(), error = %e, "remove spec toml failed");
         }
-        let rollouts_path = self.rollouts_path(&handle.identity.name);
+        let rollouts_path = self.rollouts_path(name);
         if rollouts_path.exists()
             && let Err(e) = tokio::fs::remove_file(&rollouts_path).await
         {
@@ -887,18 +866,28 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
 
     pub async fn list_apps(&self) -> Vec<AppView> {
         let mut views = Vec::new();
-        for handle in self.snapshot_handles().await {
+        for handle in self.list_handles().await {
             views.push(view_of(&handle).await);
         }
         views
     }
 
     pub async fn get_app(&self, name: &str) -> Option<AppView> {
-        let handle = self.apps.read().await.by_name.get(name).cloned()?;
+        let handle = self.find_handle(name).await?;
         Some(view_of(&handle).await)
     }
 
-    async fn snapshot_handles(&self) -> Vec<Arc<AppHandle>> {
+    /// The single read-side lookup: `name → Arc<AppHandle>`. All other
+    /// callers (admin auth middleware, operation methods, view
+    /// builders) compose on top of this so the registry's read
+    /// access path lives in exactly one place.
+    pub async fn find_handle(&self, name: &str) -> Option<Arc<AppHandle>> {
+        self.apps.read().await.by_name.get(name).cloned()
+    }
+
+    /// Snapshot of every registered handle. Ordering is undefined —
+    /// callers that need a stable presentation order sort downstream.
+    pub async fn list_handles(&self) -> Vec<Arc<AppHandle>> {
         self.apps.read().await.by_name.values().cloned().collect()
     }
 
@@ -1621,8 +1610,9 @@ mod tests {
             .runtime
             .push_pull(Err(RuntimeError::Other("registry unreachable".into())));
 
+        let handle = controller.find_handle("alpha").await.expect("handle present");
         let err = controller
-            .set_rollout("alpha", "v1".to_owned())
+            .set_rollout(&handle, "v1".to_owned())
             .await
             .expect_err("expected pull failure");
         assert!(matches!(err, RolloutError::ImagePull(_)), "got {err:?}");
@@ -1652,8 +1642,9 @@ mod tests {
             .env
             .insert("LOG_LEVEL".to_owned(), "debug".to_owned());
 
+        let handle = controller.find_handle("alpha").await.expect("handle present");
         let view = controller
-            .update_app("alpha", updated)
+            .update_app(&handle, updated)
             .await
             .expect("update succeeds");
         assert_eq!(view.port, 9999);
@@ -1685,8 +1676,9 @@ mod tests {
 
         let mut renamed = spec_with_name("alpha");
         renamed.name = Some("beta".to_owned());
+        let handle = controller.find_handle("alpha").await.expect("handle present");
         let err = controller
-            .update_app("alpha", renamed)
+            .update_app(&handle, renamed)
             .await
             .expect_err("expected NameImmutable");
         assert!(matches!(err, UpdateError::NameImmutable), "got {err:?}");
@@ -1705,8 +1697,9 @@ mod tests {
 
         let mut moved = spec_with_name("alpha");
         moved.subdomain = Some("alpha-renamed".to_owned());
+        let handle = controller.find_handle("alpha").await.expect("handle present");
         let err = controller
-            .update_app("alpha", moved)
+            .update_app(&handle, moved)
             .await
             .expect_err("expected SubdomainImmutable");
         assert!(
@@ -1730,8 +1723,9 @@ mod tests {
         let runtime_calls_before = controller.runtime.calls().len();
 
         // Re-PATCH with the same content.
+        let handle = controller.find_handle("alpha").await.expect("handle present");
         controller
-            .update_app("alpha", spec_with_name("alpha"))
+            .update_app(&handle, spec_with_name("alpha"))
             .await
             .expect("noop succeeds");
 
@@ -1743,16 +1737,15 @@ mod tests {
         );
     }
 
-    /// PATCH on a missing app returns `NotFound`.
+    /// `find_handle` returns `None` for an unregistered app. The
+    /// admin layer maps this to a 404 before any operation runs —
+    /// `update_app` itself no longer carries a `NotFound` variant
+    /// because by construction its handle argument is registered.
     #[tokio::test]
-    async fn update_app_returns_not_found_for_missing() {
+    async fn find_handle_returns_none_for_missing() {
         let tmp = tempfile::tempdir().unwrap();
         let controller = make_controller(vec![], tmp.path().to_owned());
-        let err = controller
-            .update_app("ghost", spec_with_name("ghost"))
-            .await
-            .expect_err("expected NotFound");
-        assert!(matches!(err, UpdateError::NotFound(_)), "got {err:?}");
+        assert!(controller.find_handle("ghost").await.is_none());
     }
 
     /// `repo` change clears the per-handle `image_digest` cache so
@@ -1767,10 +1760,7 @@ mod tests {
             .await
             .expect("register");
 
-        let handle = {
-            let maps = controller.apps.read().await;
-            maps.by_name.get("alpha").cloned().unwrap()
-        };
+        let handle = controller.find_handle("alpha").await.expect("handle present");
         // Seed the cache as if a prior start populated it.
         handle.inner.lock().await.image_digest =
             Some(bugpot_runtime::ImageId::new("sha256:oldcacheddigest"));
@@ -1778,7 +1768,7 @@ mod tests {
         let mut new_spec = spec_with_name("alpha");
         new_spec.repo = "registry.example/other-img".to_owned();
         controller
-            .update_app("alpha", new_spec)
+            .update_app(&handle, new_spec)
             .await
             .expect("repo change PATCH succeeds");
 
@@ -2211,7 +2201,8 @@ mod tests {
         let controller =
             make_controller(vec![stored_with_name("alpha", "v1")], tmp.path().to_owned());
 
-        controller.remove_app("alpha").await.expect("remove_app");
+        let handle = controller.find_handle("alpha").await.expect("handle present");
+        controller.remove_app(&handle).await.expect("remove_app");
 
         let rt_calls = controller.runtime.calls();
         assert!(

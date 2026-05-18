@@ -40,8 +40,6 @@ pub enum DeployError {
 
 #[derive(Debug, Error)]
 pub enum RemoveError {
-    #[error("app '{0}' not found")]
-    NotFound(String),
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -50,8 +48,6 @@ pub enum RemoveError {
 /// touch app config). Adapter crates map these to HTTP status codes.
 #[derive(Debug, Error)]
 pub enum RolloutError {
-    #[error("app '{0}' not found")]
-    NotFound(String),
     #[error("rollout tag must not be empty")]
     EmptyTag,
     #[error("registry authentication failed: {0:#}")]
@@ -76,8 +72,6 @@ pub enum RolloutError {
 /// Adapter crates map these to HTTP status codes.
 #[derive(Debug, Error)]
 pub enum UpdateError {
-    #[error("app '{0}' not found")]
-    NotFound(String),
     #[error("invalid spec: {0}")]
     InvalidSpec(#[from] bugpot_config::InvalidSpec),
     /// The caller attempted to change `name` (identity). Rename =

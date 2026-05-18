@@ -65,7 +65,7 @@ use axum::{
 };
 use bugpot_config::{AppSpec, Rollout};
 use bugpot_controller::{
-    AppController, AppView, DeployError, RemoveError, RolloutError, UpdateError,
+    AppController, AppHandle, AppView, DeployError, RemoveError, RolloutError, UpdateError,
 };
 use bugpot_egress::EgressOps;
 use bugpot_runtime::RuntimeOps;
@@ -191,15 +191,20 @@ where
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or(StatusCode::UNAUTHORIZED)?;
-    let view = state
+    let handle = state
         .controller
-        .get_app(&name)
+        .find_handle(&name)
         .await
         .ok_or(StatusCode::UNAUTHORIZED)?;
-    if !state.deploy_secret.verify(presented, &name, &view.repo) {
+    let repo = handle.repo().await;
+    if !state.deploy_secret.verify(presented, handle.name(), &repo) {
         return Err(StatusCode::UNAUTHORIZED);
     }
-    let req = Request::from_parts(parts, body);
+    // Forward the handle so the downstream rollout handlers can use
+    // it directly — `find_handle` is the only registry lookup on this
+    // path, regardless of which handler runs next.
+    let mut req = Request::from_parts(parts, body);
+    req.extensions_mut().insert(handle);
     Ok(next.run(req).await)
 }
 
@@ -395,7 +400,12 @@ where
 {
     let spec = parse_app_spec(&headers, &body)?;
     let audit_repo = spec.repo.clone();
-    match state.controller.update_app(&name, spec).await {
+    let handle = state
+        .controller
+        .find_handle(&name)
+        .await
+        .ok_or_else(|| app_not_found(&name))?;
+    match state.controller.update_app(&handle, spec).await {
         Ok(view) => {
             info!(
                 target: "bugpot::audit",
@@ -430,15 +440,16 @@ struct RolloutBody {
 async fn roll_out<R, E>(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<AdminState<R, E>>,
-    Path(name): Path<String>,
+    axum::extract::Extension(handle): axum::extract::Extension<Arc<AppHandle>>,
     Json(body): Json<RolloutBody>,
 ) -> Result<(StatusCode, Json<Rollout>), AdminError>
 where
     R: RuntimeOps,
     E: EgressOps,
 {
+    let name = handle.name().to_owned();
     let audit_tag = body.tag.clone();
-    match state.controller.set_rollout(&name, body.tag).await {
+    match state.controller.set_rollout(&handle, body.tag).await {
         Ok(rollout) => {
             info!(
                 target: "bugpot::audit",
@@ -467,21 +478,13 @@ where
 
 async fn list_rollouts<R, E>(
     State(state): State<AdminState<R, E>>,
-    Path(name): Path<String>,
-) -> Result<Json<Vec<Rollout>>, AdminError>
+    axum::extract::Extension(handle): axum::extract::Extension<Arc<AppHandle>>,
+) -> Json<Vec<Rollout>>
 where
     R: RuntimeOps,
     E: EgressOps,
 {
-    state
-        .controller
-        .list_rollouts(&name)
-        .await
-        .map(Json)
-        .ok_or_else(|| AdminError {
-            status: StatusCode::NOT_FOUND,
-            message: format!("app '{name}' not found"),
-        })
+    Json(state.controller.list_rollouts(&handle).await)
 }
 
 #[derive(Debug, Serialize)]
@@ -500,7 +503,7 @@ where
     R: RuntimeOps,
     E: EgressOps,
 {
-    let Some(view) = state.controller.get_app(&name).await else {
+    let Some(handle) = state.controller.find_handle(&name).await else {
         warn!(
             target: "bugpot::audit",
             action = "issue_deploy_key",
@@ -509,12 +512,10 @@ where
             status = "error",
             error = "not found",
         );
-        return Err(AdminError {
-            status: StatusCode::NOT_FOUND,
-            message: format!("app '{name}' not found"),
-        });
+        return Err(app_not_found(&name));
     };
-    let token = state.deploy_secret.derive(&name, &view.repo);
+    let repo = handle.repo().await;
+    let token = state.deploy_secret.derive(&name, &repo);
     info!(
         target: "bugpot::audit",
         action = "issue_deploy_key",
@@ -534,7 +535,12 @@ where
     R: RuntimeOps,
     E: EgressOps,
 {
-    match state.controller.remove_app(&name).await {
+    let handle = state
+        .controller
+        .find_handle(&name)
+        .await
+        .ok_or_else(|| app_not_found(&name))?;
+    match state.controller.remove_app(&handle).await {
         Ok(()) => {
             info!(
                 target: "bugpot::audit",
@@ -580,10 +586,17 @@ where
         .get_app(&name)
         .await
         .map(Json)
-        .ok_or_else(|| AdminError {
-            status: StatusCode::NOT_FOUND,
-            message: format!("app '{name}' not found"),
-        })
+        .ok_or_else(|| app_not_found(&name))
+}
+
+/// Canonical 404 for "no such app". Centralises the message string
+/// so the four name-keyed admin paths (`update`, `remove`, `get_one`,
+/// `issue_deploy_key`) all produce identical bodies.
+fn app_not_found(name: &str) -> AdminError {
+    AdminError {
+        status: StatusCode::NOT_FOUND,
+        message: format!("app '{name}' not found"),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -632,7 +645,6 @@ impl From<DeployError> for AdminError {
 impl From<RemoveError> for AdminError {
     fn from(err: RemoveError) -> Self {
         let status = match &err {
-            RemoveError::NotFound(_) => StatusCode::NOT_FOUND,
             RemoveError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self {
@@ -645,7 +657,6 @@ impl From<RemoveError> for AdminError {
 impl From<UpdateError> for AdminError {
     fn from(err: UpdateError) -> Self {
         let status = match &err {
-            UpdateError::NotFound(_) => StatusCode::NOT_FOUND,
             UpdateError::InvalidSpec(_)
             | UpdateError::NameImmutable
             | UpdateError::SubdomainImmutable => StatusCode::BAD_REQUEST,
@@ -664,7 +675,6 @@ impl From<UpdateError> for AdminError {
 impl From<RolloutError> for AdminError {
     fn from(err: RolloutError) -> Self {
         let status = match &err {
-            RolloutError::NotFound(_) => StatusCode::NOT_FOUND,
             RolloutError::EmptyTag => StatusCode::BAD_REQUEST,
             RolloutError::Conflict(_) => StatusCode::CONFLICT,
             RolloutError::ImageAuth(_) | RolloutError::ImagePull(_) => StatusCode::BAD_GATEWAY,
@@ -780,8 +790,6 @@ mod tests {
 
     #[test]
     fn remove_error_maps_to_status() {
-        let nf: AdminError = RemoveError::NotFound("a".into()).into();
-        assert_eq!(nf.status, StatusCode::NOT_FOUND);
         let internal: AdminError = RemoveError::Internal(anyhow!("io")).into();
         assert_eq!(internal.status, StatusCode::INTERNAL_SERVER_ERROR);
     }
