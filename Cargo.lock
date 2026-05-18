@@ -253,6 +253,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bugpot-analyzer"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "proc-macro2",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "bugpot-config"
 version = "0.0.1"
 dependencies = [

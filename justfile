@@ -163,3 +163,41 @@ metrics:
 # histograms only.
 metrics-grep prefix:
     @limactl shell bugpot -- curl -sS http://127.0.0.1:9090/metrics | grep -E '^{{prefix}}'
+
+# --- Code analysis (native; no VM needed) ---
+#
+# scripts/analysis/ holds a small workspace crate (`bugpot-analyzer`)
+# that parses every workspace .rs via `syn` so the test/prod split
+# tracks `#[cfg(test)]` precisely, per-fn body spans are brace-matched,
+# and cyclomatic is computed by walking branching AST nodes.
+#
+# Cargo subcommands used below: `cargo install cargo-modules cargo-depgraph`.
+# Snapshot of current findings: scripts/analysis/REPORT.md.
+
+# Top 20 files by churn (git log --follow) × production LOC, plus the
+# max cyclomatic among each file's production fns.
+hotspots:
+    @cargo run -q --release -p bugpot-analyzer
+
+# Full hotspot ranking (every workspace .rs file).
+hotspots-all:
+    @cargo run -q --release -p bugpot-analyzer -- --all
+
+# Hotspot ranking plus per-file "largest production fns" listing
+# for the top 5 files.
+hotspots-fns:
+    @cargo run -q --release -p bugpot-analyzer -- --fns
+
+# CSV output for piping into spreadsheets or scripts.
+hotspots-csv:
+    @cargo run -q --release -p bugpot-analyzer -- --csv
+
+# Module structure of a workspace crate.
+# Example: `just modules bugpot-core`.
+modules pkg:
+    cargo modules structure -p {{pkg}} --no-fns
+
+# Workspace crate dependency graph as graphviz dot text. Pipe to
+# `dot -Tsvg -o crates.svg` if graphviz is installed.
+depgraph:
+    cargo depgraph --workspace-only
