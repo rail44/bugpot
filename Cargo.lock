@@ -266,6 +266,7 @@ name = "bugpot-config"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "divan",
  "fs-mistrust",
  "humantime",
  "humantime-serde",

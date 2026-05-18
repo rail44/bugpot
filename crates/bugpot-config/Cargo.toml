@@ -20,7 +20,12 @@ toml.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+divan.workspace = true
 tempfile = "3"
+
+[[bench]]
+name = "spec"
+harness = false
 
 [lints]
 workspace = true
