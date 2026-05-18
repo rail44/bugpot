@@ -449,7 +449,17 @@ impl HickoryUpstream {
         anyhow::ensure!(!upstreams.is_empty(), "at least one upstream required");
         let mut cfg = ResolverConfig::from_parts(None, vec![], vec![]);
         for sa in upstreams {
-            cfg.add_name_server(NameServerConfig::udp_and_tcp(sa.ip()));
+            // `NameServerConfig::udp_and_tcp(ip)` discards the port —
+            // each generated `ConnectionConfig` falls back to its
+            // protocol default (53). Patch the port in so an operator
+            // who points bugpot at a non-standard resolver (e.g.
+            // `1.1.1.1:5353` for a corporate front-end) actually hits
+            // that port.
+            let mut ns = NameServerConfig::udp_and_tcp(sa.ip());
+            for conn in &mut ns.connections {
+                conn.port = sa.port();
+            }
+            cfg.add_name_server(ns);
         }
         let resolver =
             TokioResolver::builder_with_config(cfg, TokioRuntimeProvider::default()).build()?;
