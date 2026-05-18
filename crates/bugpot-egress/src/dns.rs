@@ -3,7 +3,8 @@
 //! Wire path:
 //!   container → bridge IP:53 → [`EgressDnsHandler`]:
 //!     1. resolve peer IP from `Request::src()` (UDP/TCP socket addr).
-//!     2. look up which app owns that peer IP in [`AppRegistry`].
+//!     2. look up which app owns that peer IP in the shared
+//!        [`crate::endpoints::EndpointStore`].
 //!     3. check the app's [`Allowlist`] for the queried name.
 //!     4. hit → call the (trait-injected) upstream resolver, collect A records,
 //!        register every `(src_ip, dst_ip)` into the nft allow set via
@@ -15,7 +16,6 @@
 //! Both the upstream resolver and the allow-set sink are trait-bounded so the
 //! handler is unit-testable without binding sockets or touching nftables.
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
@@ -26,9 +26,8 @@ use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
 use hickory_server::zone_handler::MessageResponseBuilder;
-use parking_lot::RwLock;
 
-use crate::allowlist::Allowlist;
+use crate::endpoints::EndpointStore;
 
 /// Inject the upstream resolver behind a trait so tests don't need real DNS.
 /// Native AFIT (no `#[async_trait]`) — used only via generics
@@ -45,40 +44,6 @@ pub trait AllowSet: Send + Sync + 'static {
         src: Ipv4Addr,
         dst: Ipv4Addr,
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
-}
-
-/// Shared registry of `src_ip → (name, allowlist)`. Mutated by `Egress`
-/// when allocating / releasing endpoints, read by the DNS handler on every
-/// query.
-#[derive(Debug, Default)]
-pub struct AppRegistry {
-    entries: RwLock<HashMap<Ipv4Addr, AppEntry>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct AppEntry {
-    pub name: String,
-    pub allowlist: Allowlist,
-}
-
-impl AppRegistry {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn insert(&self, src_ip: Ipv4Addr, entry: AppEntry) {
-        self.entries.write().insert(src_ip, entry);
-    }
-
-    pub fn remove(&self, src_ip: Ipv4Addr) -> Option<AppEntry> {
-        self.entries.write().remove(&src_ip)
-    }
-
-    #[must_use]
-    pub fn lookup(&self, src_ip: Ipv4Addr) -> Option<AppEntry> {
-        self.entries.read().get(&src_ip).cloned()
-    }
 }
 
 /// Pure decision function.
@@ -99,21 +64,25 @@ pub enum Decision {
 }
 
 #[must_use]
-pub fn decide(registry: &AppRegistry, src: Ipv4Addr, query_name: &str) -> Decision {
-    let Some(entry) = registry.lookup(src) else {
+pub fn decide(endpoints: &EndpointStore, src: Ipv4Addr, query_name: &str) -> Decision {
+    let Some(app) = endpoints.lookup_by_ip(src) else {
         return Decision::UnknownSource;
     };
-    if entry.allowlist.matches_domain(query_name) {
-        Decision::Allowed { name: entry.name }
+    if app.allowlist.matches_domain(query_name) {
+        Decision::Allowed {
+            name: app.name.clone(),
+        }
     } else {
-        Decision::Denied { name: entry.name }
+        Decision::Denied {
+            name: app.name.clone(),
+        }
     }
 }
 
 /// The actual `hickory_server` handler.
 #[derive(Debug)]
 pub struct EgressDnsHandler<U, A> {
-    registry: Arc<AppRegistry>,
+    endpoints: Arc<EndpointStore>,
     upstream: Arc<U>,
     allow_set: Arc<A>,
     ttl: u32,
@@ -121,13 +90,13 @@ pub struct EgressDnsHandler<U, A> {
 
 impl<U, A> EgressDnsHandler<U, A> {
     pub const fn new(
-        registry: Arc<AppRegistry>,
+        endpoints: Arc<EndpointStore>,
         upstream: Arc<U>,
         allow_set: Arc<A>,
         ttl: u32,
     ) -> Self {
         Self {
-            registry,
+            endpoints,
             upstream,
             allow_set,
             ttl,
@@ -167,7 +136,7 @@ impl<U: Upstream, A: AllowSet> RequestHandler for EgressDnsHandler<U, A> {
             return reply_code(request, &mut response_handle, ResponseCode::NXDomain).await;
         }
 
-        match decide(&self.registry, src, &qname_stripped) {
+        match decide(&self.endpoints, src, &qname_stripped) {
             Decision::UnknownSource => {
                 tracing::warn!(%src, %qname, "dns query from unknown source");
                 reply_code(request, &mut response_handle, ResponseCode::Refused).await
@@ -262,6 +231,11 @@ async fn reply_a<R: ResponseHandler>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::allowlist::Allowlist;
+    use crate::endpoints::AllocatedApp;
+    use crate::netns::EndpointLayout;
+    use ipnet::Ipv4Net;
+    use std::collections::HashMap;
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -290,33 +264,33 @@ mod tests {
         }
     }
 
-    fn registry_with(app: &str, src: Ipv4Addr, allow: &[&str]) -> Arc<AppRegistry> {
-        let r = AppRegistry::new();
-        r.insert(
-            src,
-            AppEntry {
-                name: app.to_string(),
-                allowlist: Allowlist::parse(allow.iter().copied()).unwrap(),
-            },
-        );
-        Arc::new(r)
+    fn endpoints_with(app: &str, src: Ipv4Addr, allow: &[&str]) -> Arc<EndpointStore> {
+        let store = EndpointStore::new();
+        let subnet: Ipv4Net = "172.20.0.0/24".parse().unwrap();
+        store.insert(AllocatedApp {
+            name: app.to_owned(),
+            container_ip: src,
+            plan: EndpointLayout::new(app, src, subnet),
+            allowlist: Allowlist::parse(allow.iter().copied()).unwrap(),
+        });
+        Arc::new(store)
     }
 
     #[test]
     fn decide_allow_deny_unknown() {
         let src: Ipv4Addr = "172.20.0.10".parse().unwrap();
-        let reg = registry_with("app1", src, &["api.openai.com"]);
+        let store = endpoints_with("app1", src, &["api.openai.com"]);
 
         assert!(matches!(
-            decide(&reg, src, "api.openai.com"),
+            decide(&store, src, "api.openai.com"),
             Decision::Allowed { .. }
         ));
         assert!(matches!(
-            decide(&reg, src, "evil.example.com"),
+            decide(&store, src, "evil.example.com"),
             Decision::Denied { .. }
         ));
         assert_eq!(
-            decide(&reg, "172.20.0.99".parse().unwrap(), "api.openai.com"),
+            decide(&store, "172.20.0.99".parse().unwrap(), "api.openai.com"),
             Decision::UnknownSource
         );
     }
@@ -324,18 +298,18 @@ mod tests {
     #[test]
     fn insert_and_remove() {
         let src: Ipv4Addr = "172.20.0.10".parse().unwrap();
-        let reg = AppRegistry::new();
-        reg.insert(
-            src,
-            AppEntry {
-                name: "a".into(),
-                allowlist: Allowlist::parse(["a.com"]).unwrap(),
-            },
-        );
-        let e = reg.lookup(src).unwrap();
-        assert!(e.allowlist.matches_domain("a.com"));
-        assert!(reg.remove(src).is_some());
-        assert!(reg.lookup(src).is_none());
+        let subnet: Ipv4Net = "172.20.0.0/24".parse().unwrap();
+        let store = EndpointStore::new();
+        store.insert(AllocatedApp {
+            name: "a".to_owned(),
+            container_ip: src,
+            plan: EndpointLayout::new("a", src, subnet),
+            allowlist: Allowlist::parse(["a.com"]).unwrap(),
+        });
+        let app = store.lookup_by_ip(src).unwrap();
+        assert!(app.allowlist.matches_domain("a.com"));
+        assert!(store.remove_by_name("a").is_some());
+        assert!(store.lookup_by_ip(src).is_none());
     }
 
     // End-to-end handler test — Mock everything around the handler so the
@@ -345,7 +319,7 @@ mod tests {
     #[tokio::test]
     async fn upstream_invoked_only_on_allowed() {
         let src: Ipv4Addr = "172.20.0.10".parse().unwrap();
-        let reg = registry_with("app1", src, &["api.openai.com"]);
+        let store = endpoints_with("app1", src, &["api.openai.com"]);
         let up = Arc::new(MockUpstream {
             answers: std::iter::once((
                 "api.openai.com".to_string(),
@@ -366,7 +340,7 @@ mod tests {
         );
 
         // Deny path must never call upstream.
-        match decide(&reg, src, "evil.example.com") {
+        match decide(&store, src, "evil.example.com") {
             Decision::Denied { .. } => {}
             _ => panic!("expected deny"),
         }
