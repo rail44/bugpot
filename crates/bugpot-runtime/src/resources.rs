@@ -48,14 +48,29 @@ pub(crate) fn parse_memory(raw: &str) -> Result<u64> {
     Ok(bytes)
 }
 
-/// Parse a CPU string like `"0.5"`, `"2"`, `"100m"` into `(quota_us, period_us)`.
+/// Parse a CPU string like `"0.5"`, `"2"`, `"100m"` into a cgroup
+/// `cpu.shares` value (the OCI spec's portable name; libcontainer
+/// maps it to cgroup v2's `cpu.weight` automatically).
 ///
-/// Returns the cgroup `cpu.quota` and `cpu.period` in microseconds.
+/// `1.0` → 1024 shares (the cgroup default, equivalent to weight 100).
+/// `0.5` → 512 (half priority). `2.0` → 2048 (double priority). `100m`
+/// is shorthand for `0.1`. Shares are a **relative weight** between
+/// apps, not a hard cap — an app with shares 512 takes half the CPU
+/// of an app with 1024 only while both are saturating the same core;
+/// otherwise it gets whatever's idle. This is the "instance-wide
+/// bugpot, fair-share contention" model that replaced the prior
+/// `cpu.max` hardcap behaviour.
 ///
-/// We use a fixed period of `100_000` microseconds (the cgroup default) and
-/// scale quota accordingly. `100m` (milli-cpus) == 0.1 CPU.
-pub(crate) fn parse_cpu(raw: &str) -> Result<(i64, u64)> {
-    const PERIOD_US: u64 = 100_000;
+/// Floor at 2 (cgroup v2's minimum); ceiling at 262144 (the largest
+/// shares value that maps to a valid cgroup v2 weight ≤ 10000).
+pub(crate) fn parse_cpu(raw: &str) -> Result<u64> {
+    /// cgroup v1 cpu.shares for "1.0 CPU's worth". libcontainer
+    /// rescales to cgroup v2 cpu.weight per the OCI conversion
+    /// formula; 1024 maps to weight 100, which is the cgroup v2
+    /// default.
+    const SHARES_PER_CPU: f64 = 1024.0;
+    const MIN_SHARES: u64 = 2;
+    const MAX_SHARES: u64 = 262_144;
 
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -96,9 +111,9 @@ pub(crate) fn parse_cpu(raw: &str) -> Result<(i64, u64)> {
         });
     }
 
-    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-    let quota = (cpus * PERIOD_US as f64).round() as i64;
-    Ok((quota, PERIOD_US))
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let raw_shares = (cpus * SHARES_PER_CPU).round() as u64;
+    Ok(raw_shares.clamp(MIN_SHARES, MAX_SHARES))
 }
 
 fn split_number_unit(s: &str) -> (&str, &str) {
@@ -167,22 +182,33 @@ mod tests {
     }
 
     #[test]
-    fn cpu_full_cores() {
-        let (quota, period) = parse_cpu("2").unwrap();
-        assert_eq!(period, 100_000);
-        assert_eq!(quota, 200_000);
+    fn cpu_default_neutral_priority() {
+        // "1.0" = 1024 shares = cgroup v2 weight 100 (the default).
+        // Apps without an explicit cpu setting end up here.
+        assert_eq!(parse_cpu("1.0").unwrap(), 1024);
+        assert_eq!(parse_cpu("1").unwrap(), 1024);
     }
 
     #[test]
-    fn cpu_fractional() {
-        let (quota, _) = parse_cpu("0.5").unwrap();
-        assert_eq!(quota, 50_000);
+    fn cpu_double_priority() {
+        assert_eq!(parse_cpu("2").unwrap(), 2048);
     }
 
     #[test]
-    fn cpu_millis() {
-        let (quota, _) = parse_cpu("100m").unwrap();
-        assert_eq!(quota, 10_000);
+    fn cpu_half_priority() {
+        assert_eq!(parse_cpu("0.5").unwrap(), 512);
+    }
+
+    #[test]
+    fn cpu_millis_are_milli_cpus() {
+        // 100m = 0.1 CPU's worth = 102.4 shares, rounded to 102.
+        assert_eq!(parse_cpu("100m").unwrap(), 102);
+    }
+
+    #[test]
+    fn cpu_clamps_below_kernel_floor() {
+        // 0.001 = 1.024 raw shares; cgroup v2 weight floor is 2.
+        assert_eq!(parse_cpu("0.001").unwrap(), 2);
     }
 
     #[test]

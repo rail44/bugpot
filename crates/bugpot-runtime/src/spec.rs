@@ -298,20 +298,31 @@ fn build_namespaces(netns_path: Option<&Path>) -> Result<Vec<LinuxNamespace>> {
 }
 
 fn build_resources(spec: &AppSpec) -> Result<oci_spec::runtime::LinuxResources> {
-    // Always apply both limits. Defaults come from
-    // `Resources::effective_*` so an app omitting `[resources]` is
-    // still capped — important on small VMs where one unbounded app
-    // can take the host out.
-    let bytes = resources::parse_memory(spec.resources.effective_memory())?;
+    // Soft limits, not hard caps. The premise is "the whole instance
+    // is bugpot's" — leaving capacity stranded on idle apps is the
+    // wrong trade. So memory is set via `reservation` (cgroup v2
+    // `memory.high`, soft throttle via direct reclaim) and CPU via
+    // `shares` (cgroup v2 `cpu.weight`, fair-share contention). Idle
+    // apps yield their slice to busier ones automatically.
+    //
+    // Worst-case backstops are at the host level rather than per-app:
+    //   - Memory: when `MemAvailable` falls below
+    //     `BUGPOT_FREEZE_MEM_LO`, the controller's pressure handler
+    //     evicts oldest-frozen apps to `Stopped`. A leaky running app
+    //     can eventually OOM-kill the host; that's the explicit
+    //     trade for higher steady-state utilisation.
+    //   - CPU: `cpu.weight` cannot OOM anything; the kernel just
+    //     interleaves more aggressively under contention.
+    //
+    // Defaults from `Resources::effective_*`: 128 MB soft target,
+    // 1.0-CPU-worth of shares (= weight 100, the cgroup default).
+    let mem_bytes = resources::parse_memory(spec.resources.effective_memory())?;
     let mem_cfg = LinuxMemoryBuilder::default()
-        .limit(i64::try_from(bytes).unwrap_or(i64::MAX))
+        .reservation(i64::try_from(mem_bytes).unwrap_or(i64::MAX))
         .build()?;
 
-    let (quota, period) = resources::parse_cpu(spec.resources.effective_cpu())?;
-    let cpu_cfg = LinuxCpuBuilder::default()
-        .quota(quota)
-        .period(period)
-        .build()?;
+    let shares = resources::parse_cpu(spec.resources.effective_cpu())?;
+    let cpu_cfg = LinuxCpuBuilder::default().shares(shares).build()?;
 
     Ok(LinuxResourcesBuilder::default()
         .memory(mem_cfg)
@@ -470,14 +481,18 @@ cpu = "0.5"
         // Cwd
         assert_eq!(process.cwd(), &PathBuf::from("/app"));
 
-        // Resources: memory 256MiB = 268435456 bytes; cpu 0.5 -> 50000/100000
+        // Resources: memory 256MiB → reservation (cgroup v2
+        // memory.high); cpu 0.5 → shares 512 (cgroup v2 weight 50,
+        // half priority).
         let linux = spec.linux().as_ref().unwrap();
         let res = linux.resources().as_ref().unwrap();
         let mem = res.memory().as_ref().unwrap();
-        assert_eq!(mem.limit().unwrap(), 256 * 1024 * 1024);
+        assert_eq!(mem.reservation().unwrap(), 256 * 1024 * 1024);
+        assert!(mem.limit().is_none(), "hard memory cap is not set per-app");
         let cpu = res.cpu().as_ref().unwrap();
-        assert_eq!(cpu.quota().unwrap(), 50_000);
-        assert_eq!(cpu.period().unwrap(), 100_000);
+        assert_eq!(cpu.shares().unwrap(), 512);
+        assert!(cpu.quota().is_none(), "cpu hardcap not set in shares mode");
+        assert!(cpu.period().is_none(), "cpu period not set in shares mode");
 
         // Namespaces: net namespace path absent because netns_path = None
         let network = linux
