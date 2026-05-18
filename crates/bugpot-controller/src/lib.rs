@@ -535,12 +535,12 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
     /// rollouts. Operators (or `set_rollout` from the admin API)
     /// supply the first rollout in a separate step, which is what
     /// actually pulls and starts.
-    pub async fn deploy_app(&self, mut spec: AppSpec) -> std::result::Result<AppView, DeployError> {
-        let name = spec.name.clone().ok_or(DeployError::MissingName)?;
+    pub async fn deploy_app(&self, spec: AppSpec) -> std::result::Result<AppView, DeployError> {
         // Strict validation BEFORE we touch the filesystem — `name`
         // lands in `<state>/apps/<name>.toml` and `bugpot-<name>` netns
         // names, and the admin API accepts arbitrary JSON.
         spec.validate()?;
+        let name = spec.name.clone();
         let subdomain = spec.subdomain().to_owned();
 
         // Fast-fail on obvious collisions before persisting.
@@ -560,7 +560,6 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         tokio::fs::write(&toml_path, toml_body)
             .await
             .with_context(|| format!("write {}", toml_path.display()))?;
-        spec.source_path.clone_from(&toml_path);
 
         let handle = make_handle(spec.clone(), None)?;
 
@@ -610,11 +609,9 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         let name = handle.name();
 
         // Identity guards: PATCH cannot change `name` / `subdomain`.
-        // The body's `name` field is allowed to either match or be
-        // absent (some clients omit identity from the body).
-        if let Some(ref body_name) = new_spec.name
-            && body_name != name
-        {
+        // The body must carry a `name` field (required by `AppSpec`)
+        // and it must equal the URL path's app name.
+        if new_spec.name != name {
             return Err(UpdateError::NameImmutable);
         }
         if new_spec.subdomain() != handle.identity.subdomain {
@@ -1493,7 +1490,7 @@ mod tests {
         AppSpec {
             repo: "registry.example/img".to_owned(),
             port: 8080,
-            name: Some(name.to_owned()),
+            name: name.to_owned(),
             subdomain: None,
             egress: EgressSpec::default(),
             env: HashMap::default(),
@@ -1501,7 +1498,6 @@ mod tests {
             readiness: Readiness::default(),
             resources: Resources::default(),
             volumes: Vec::new(),
-            source_path: PathBuf::new(),
         }
     }
 
@@ -1677,7 +1673,7 @@ mod tests {
             .expect("register");
 
         let mut renamed = spec_with_name("alpha");
-        renamed.name = Some("beta".to_owned());
+        renamed.name = "beta".to_owned();
         let handle = controller
             .find_handle("alpha")
             .await

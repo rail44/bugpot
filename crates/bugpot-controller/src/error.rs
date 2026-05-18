@@ -15,8 +15,6 @@ use bugpot_runtime::RuntimeError;
 
 #[derive(Debug, Error)]
 pub enum DeployError {
-    #[error("spec.name is required for deploy")]
-    MissingName,
     #[error("invalid spec: {0}")]
     InvalidSpec(#[from] bugpot_config::InvalidSpec),
     #[error("app '{0}' already exists")]
