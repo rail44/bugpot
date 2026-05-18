@@ -163,3 +163,32 @@ metrics:
 # histograms only.
 metrics-grep prefix:
     @limactl shell bugpot -- curl -sS http://127.0.0.1:9090/metrics | grep -E '^{{prefix}}'
+
+# --- Code analysis (native; no VM needed) ---
+#
+# Tooling: `cargo install tokei cargo-modules cargo-depgraph`.
+# Snapshot of the current findings lives at scripts/analysis/REPORT.md.
+
+# Top 20 files by churn (git-log) × production LOC (lines outside the
+# inline `mod tests` block). Workspace .rs only; excludes experiments/.
+hotspots:
+    @scripts/analysis/hotspots.py
+
+# Full hotspot ranking (every workspace .rs file, not just top 20).
+hotspots-all:
+    @scripts/analysis/hotspots.py --all
+
+# Hotspot ranking with inline `mod tests` LOC counted toward the score.
+# Useful for spotting fragile test bloat alongside production hotspots.
+hotspots-with-tests:
+    @scripts/analysis/hotspots.py --include-tests
+
+# Module structure of a workspace crate.
+# Example: `just modules bugpot-core`.
+modules pkg:
+    cargo modules structure -p {{pkg}} --no-fns
+
+# Workspace crate dependency graph as graphviz dot text. Pipe to
+# `dot -Tsvg -o crates.svg` if graphviz is installed.
+depgraph:
+    cargo depgraph --workspace-only
