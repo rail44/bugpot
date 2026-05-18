@@ -10,7 +10,7 @@
 //!
 //! The set of registered apps is held in a `RwLock<HashMap<..>>` so adapter
 //! crates (HTTP admin, future webhook / poller / CLI frontends) can mutate
-//! it at runtime via [`AppController::deploy_app`] / [`AppController::remove_app`].
+//! it at runtime via [`AppHost::deploy_app`] / [`AppHost::remove_app`].
 //! Per-app `Mutex`-protected state machines coalesce concurrent starts.
 //!
 //! Note: `pub(crate)` is used for cross-module items inside this crate;
@@ -77,7 +77,7 @@ const READINESS_TIMEOUT_DEFAULT: Duration = Duration::from_secs(10);
 /// apps whose container died unexpectedly or that have been idle too
 /// long.
 #[derive(Debug)]
-pub struct AppController<R: RuntimeOps, E: EgressOps> {
+pub struct AppHost<R: RuntimeOps, E: EgressOps> {
     runtime: Arc<R>,
     egress: Arc<E>,
     /// Directory where bugpotd persists its own view of the world:
@@ -96,7 +96,7 @@ pub struct AppController<R: RuntimeOps, E: EgressOps> {
     reattach_done: AtomicBool,
 }
 
-impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
+impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
     /// Create a controller, materialising the daemon-owned state
     /// directories and rehydrating any apps + rollouts persisted by
     /// a previous run.
@@ -1243,7 +1243,7 @@ fn digest_pinned_ref(image: &str, digest: Option<&bugpot_runtime::ImageId>) -> S
     }
 }
 
-impl<R: RuntimeOps, E: EgressOps> UpstreamResolver for AppController<R, E> {
+impl<R: RuntimeOps, E: EgressOps> UpstreamResolver for AppHost<R, E> {
     async fn resolve(&self, host: &str) -> Result<Upstream, ResolveError> {
         let subdomain = subdomain_of(host).ok_or(ResolveError::NoSuchApp)?;
         let handle = self
@@ -1530,8 +1530,8 @@ mod tests {
     fn make_controller(
         stored: Vec<(AppSpec, Option<Rollout>)>,
         state_dir: PathBuf,
-    ) -> Arc<AppController<MockRuntime, MockEgress>> {
-        // Seed the state dir so AppController::new's load path picks
+    ) -> Arc<AppHost<MockRuntime, MockEgress>> {
+        // Seed the state dir so AppHost::new's load path picks
         // these specs + rollouts back up on construction — keeps the
         // test entry symmetric with production (everything goes
         // through the disk-rehydrate code path).
@@ -1556,7 +1556,7 @@ mod tests {
             }
         }
         Arc::new(
-            AppController::new(
+            AppHost::new(
                 Arc::new(MockRuntime::default()),
                 Arc::new(MockEgress::default()),
                 state_dir,

@@ -17,7 +17,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use bugpot_admin::AdminAuth;
-use bugpot_controller::AppController;
+use bugpot_core::AppHost;
 use bugpot_egress::Egress;
 use bugpot_metrics::PrometheusHandle;
 use bugpot_runtime::Runtime;
@@ -61,7 +61,7 @@ const RUNTIME_MONITOR_INTERVAL: Duration = Duration::from_secs(10);
 /// and tears the controller down — there is no other safe way to
 /// shut down.
 pub(crate) struct Bootstrap {
-    controller: Arc<AppController<Runtime, Egress>>,
+    controller: Arc<AppHost<Runtime, Egress>>,
     listen: SocketAddr,
     admin_listen: SocketAddr,
     tasks: Vec<JoinHandle<()>>,
@@ -97,9 +97,8 @@ impl Bootstrap {
 
         gc_image_cache(&runtime);
 
-        let controller = Arc::new(
-            AppController::new(runtime, egress, state_dir, auth).context("init controller")?,
-        );
+        let controller =
+            Arc::new(AppHost::new(runtime, egress, state_dir, auth).context("init controller")?);
         controller.reattach_running(&mut startup_claims).await;
         controller.cleanup_orphans(startup_claims).await;
 
@@ -186,7 +185,7 @@ fn gc_image_cache(runtime: &Runtime) {
     }
 }
 
-fn spawn_sweep(controller: &Arc<AppController<Runtime, Egress>>) -> JoinHandle<()> {
+fn spawn_sweep(controller: &Arc<AppHost<Runtime, Egress>>) -> JoinHandle<()> {
     let c = Arc::clone(controller);
     tokio::spawn(c.sweep_loop(SWEEP_INTERVAL))
 }
@@ -200,7 +199,7 @@ fn spawn_sweep(controller: &Arc<AppController<Runtime, Egress>>) -> JoinHandle<(
 /// flipping it off restores pre-freeze scale-to-zero behavior
 /// (idle apps stop, no RAM-resident pool).
 fn spawn_memory_pressure(
-    controller: &Arc<AppController<Runtime, Egress>>,
+    controller: &Arc<AppHost<Runtime, Egress>>,
 ) -> Result<Option<JoinHandle<()>>> {
     if !parse_env_bool("BUGPOT_FREEZE_ENABLED", true)? {
         info!("BUGPOT_FREEZE_ENABLED=false; memory-pressure handler disabled");
@@ -228,7 +227,7 @@ fn spawn_memory_pressure(
 
 fn spawn_router(
     listen: SocketAddr,
-    controller: &Arc<AppController<Runtime, Egress>>,
+    controller: &Arc<AppHost<Runtime, Egress>>,
 ) -> Result<JoinHandle<()>> {
     let resolver = Arc::clone(controller);
     let router_cfg = parse_router_config()?;
@@ -258,7 +257,7 @@ fn spawn_metrics(handle: PrometheusHandle) -> Result<Option<JoinHandle<()>>> {
 
 fn spawn_admin(
     admin_listen: SocketAddr,
-    controller: &Arc<AppController<Runtime, Egress>>,
+    controller: &Arc<AppHost<Runtime, Egress>>,
 ) -> Result<JoinHandle<()>> {
     let token = read_admin_token()?;
     let admin_auth = Arc::new(AdminAuth::from_token(token));

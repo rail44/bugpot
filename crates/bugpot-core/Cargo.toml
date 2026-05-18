@@ -1,5 +1,5 @@
 [package]
-name = "bugpot-controller"
+name = "bugpot-core"
 version = "0.0.1"
 edition.workspace = true
 license.workspace = true

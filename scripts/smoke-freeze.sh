@@ -84,7 +84,7 @@ launch_bugpot() {
     BUGPOT_ADMIN_LISTEN="$ADMIN_LISTEN" \
     BUGPOT_ADMIN_TOKEN="$ADMIN_TOKEN" \
     BUGPOT_DEPLOY_SECRET="smoke-only-deploy-secret" \
-    RUST_LOG="bugpot=info,bugpot_controller=debug,bugpot_router=info,bugpot_runtime=info,bugpot_egress=info" \
+    RUST_LOG="bugpot=info,bugpot_core=debug,bugpot_router=info,bugpot_runtime=info,bugpot_egress=info" \
         "$BIN" >>"$LOG" 2>&1 &
     PID=$!
 }

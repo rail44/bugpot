@@ -12,7 +12,7 @@
 //! Operators never touch either directory — the admin API is the
 //! single entry point for spec mutations. These functions only
 //! handle the "load at startup" half; the write half lives on
-//! `AppController` (in `lib.rs`) so it can hold the right locks.
+//! `AppHost` (in `lib.rs`) so it can hold the right locks.
 
 use std::collections::VecDeque;
 use std::path::Path;

@@ -147,7 +147,7 @@ impl Default for RouterConfig {
 ///
 /// Resolvers that don't care about per-app upgrade tracking can leave
 /// `active_upgrades` set to `None` (e.g. the static resolver in this
-/// crate's integration test); the in-bugpot `AppController` impl
+/// crate's integration test); the in-bugpot `AppHost` impl
 /// returns the `AppHandle`'s counter so the controller's idle reaper
 /// can defer freezing while an upgrade is mid-flight.
 #[derive(Debug, Clone)]
