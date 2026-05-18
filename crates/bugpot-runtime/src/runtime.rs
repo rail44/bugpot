@@ -1,7 +1,7 @@
 //! Public `Runtime` API: container lifecycle on top of `oci-client` and
 //! `libcontainer`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::future::Future;
 use std::os::fd::OwnedFd;
@@ -121,7 +121,7 @@ pub trait RuntimeOps: Send + Sync + std::fmt::Debug + 'static {
 /// from there. Bug audit follow-up: keeping a parallel in-memory mirror
 /// invited subtle drift on crash / cleanup paths.
 #[derive(Debug)]
-#[allow(clippy::struct_field_names)] // every field IS a directory; the `_dir` suffix is the point.
+#[allow(clippy::struct_field_names)] // every state dir uses the `_dir` suffix; the puller / log_tails fields aren't dirs.
 pub struct Runtime {
     state_dir: PathBuf,
     images_dir: PathBuf,
@@ -133,6 +133,16 @@ pub struct Runtime {
     /// per-digest inflight map is what makes concurrent pulls of the
     /// same image coalesce on a single registry round-trip + extract.
     puller: Puller,
+    /// Per-app handles to the two `forward_log_file` tasks that tail
+    /// `<state>/logs/<app>/{stdout,stderr}.log` via inotify.
+    /// `ensure_log_tails` inserts on first spawn (idempotent;
+    /// re-entry is a no-op so reattach + start-time spawns can't
+    /// double up). `cleanup_orphan_container` removes + aborts on
+    /// app removal — without that the inotify watches outlive the
+    /// container because the log files themselves are kept around
+    /// for post-mortem (CLAUDE.md L333). `std::sync::Mutex` (not
+    /// tokio) because every interaction is short and synchronous.
+    log_tails: std::sync::Mutex<HashMap<String, [tokio::task::JoinHandle<()>; 2]>>,
 }
 
 impl Runtime {
@@ -164,6 +174,7 @@ impl Runtime {
             logs_dir,
             volumes_dir,
             puller,
+            log_tails: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -234,11 +245,7 @@ impl Runtime {
         fs::create_dir_all(&dir).map_err(|e| RuntimeError::io(&dir, e))?;
         let stdout = open_append(&dir.join("stdout.log"))?;
         let stderr = open_append(&dir.join("stderr.log"))?;
-        Ok(ContainerLogFiles {
-            dir,
-            stdout,
-            stderr,
-        })
+        Ok(ContainerLogFiles { stdout, stderr })
     }
 
     /// Build the container via libcontainer, transition it to running,
@@ -296,8 +303,11 @@ impl Runtime {
         // each new line via tracing so `just logs` still works. Seek
         // to EOF so a fresh start doesn't replay historical lines; on
         // reattach, the controller calls `ensure_log_tails` for the
-        // same effect.
-        spawn_log_tails(&logs.dir, name);
+        // same effect. Routed through `ensure_log_tails` (not the
+        // free fn) so the spawned `JoinHandle`s land in the per-app
+        // map and `cleanup_orphan_container` can abort them when the
+        // app is removed.
+        <Self as RuntimeOps>::ensure_log_tails(self, name);
 
         let raw_pid = container
             .pid()
@@ -458,6 +468,26 @@ impl RuntimeOps for Runtime {
 
     #[allow(clippy::unused_async)]
     async fn cleanup_orphan_container(&self, name: &str) -> Result<()> {
+        // Abort the inotify-tailing tasks first; the log files are
+        // kept around for post-mortem (CLAUDE.md L333) so the kernel
+        // wouldn't otherwise close the watches and the tasks would
+        // sit on them forever. No-op when the app was registered but
+        // never started.
+        //
+        // The `.remove()` is hoisted out of the `if let` scrutinee so
+        // the `MutexGuard` drops before we iterate — keeps the lock
+        // window to a single hash-map operation.
+        let aborted = self
+            .log_tails
+            .lock()
+            .expect("log_tails mutex poisoned")
+            .remove(name);
+        if let Some(handles) = aborted {
+            for h in handles {
+                h.abort();
+            }
+        }
+
         let container_root = self.containers_dir.join(name);
         if container_root.exists() {
             match Container::load(container_root.clone()) {
@@ -490,7 +520,12 @@ impl RuntimeOps for Runtime {
     }
 
     fn ensure_log_tails(&self, name: &str) {
-        spawn_log_tails(&self.log_dir_for(name), name);
+        let mut map = self.log_tails.lock().expect("log_tails mutex poisoned");
+        if map.contains_key(name) {
+            return;
+        }
+        let handles = spawn_log_tails(&self.log_dir_for(name), name);
+        map.insert(name.to_owned(), handles);
     }
 }
 
@@ -563,12 +598,13 @@ impl Runtime {
     }
 }
 
-/// Owned stdout/stderr file descriptors + log dir for a single
-/// container's launch path. Passed from `open_log_files` (which opens
-/// them) to `launch_container` (which hands them to libcontainer and
-/// then uses the dir for `spawn_log_tails`).
+/// Owned stdout/stderr file descriptors for a single container's
+/// launch path. Passed from `open_log_files` (which opens them) to
+/// `launch_container` (which hands them to libcontainer). The log
+/// directory itself is rederived from the app name inside
+/// `ensure_log_tails`; bundling the path here would duplicate that
+/// derivation and let the two go out of sync.
 struct ContainerLogFiles {
-    dir: PathBuf,
     stdout: OwnedFd,
     stderr: OwnedFd,
 }
