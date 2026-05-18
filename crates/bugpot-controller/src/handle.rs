@@ -94,18 +94,26 @@ pub(crate) struct HandleInner {
     /// app is registered but not yet deployed, in which case
     /// `ensure_running` will fail.
     pub(crate) rollouts: VecDeque<Rollout>,
-    /// Resolved image digest from the first successful pull. Pinning
-    /// at the handle level means subsequent cold-starts for this app
-    /// skip the `manifest_probe` round-trip (~1s on a remote registry)
-    /// and go straight to the cache-hit path inside `Puller::pull`.
+    /// Resolved image digest from the first successful pull, paired
+    /// with the `repo` it was resolved against. Pinning at the handle
+    /// level means subsequent cold-starts for this app skip the
+    /// `manifest_probe` round-trip (~1s on a remote registry) and go
+    /// straight to the cache-hit path inside `Puller::pull`.
     ///
-    /// Lives in `HandleInner` because invalidation is part of the
-    /// lifecycle: `update_app` clears it on `repo` change, and a
-    /// successful pull writes it. Mutable tags (`:latest` etc.)
-    /// therefore behave the way Kubernetes' `imagePullPolicy:
-    /// IfNotPresent` does — an operator-side redeploy is required
-    /// to pick up an upstream retag. No TTL.
-    pub(crate) image_digest: Option<bugpot_runtime::ImageId>,
+    /// The `(repo, digest)` shape makes the cache self-validating: a
+    /// `PATCH /apps/<name>` that changes `spec.repo` doesn't have to
+    /// touch this field at all — the next pull-phase compares
+    /// `cache.repo` to `spec.repo`, treats the digest as missing when
+    /// they differ, and resolves freshly. Removes the
+    /// "update + concurrent cold-start races and persists a stale
+    /// (`new_repo`, `old_digest`) pair" window the old
+    /// `Option<ImageId>` shape allowed.
+    ///
+    /// Mutable tags (`:latest` etc.) therefore behave the way
+    /// Kubernetes' `imagePullPolicy: IfNotPresent` does — an
+    /// operator-side redeploy is required to pick up an upstream
+    /// retag. No TTL.
+    pub(crate) image_digest: Option<DigestCache>,
     /// Last-seen cgroup `cpu_usec` for the running container, used to
     /// compute deltas for the `bugpot_app_cpu_microseconds_total`
     /// counter across sweeps. Lifetime matches the handle's running
@@ -136,6 +144,18 @@ pub(crate) enum AppState {
         container_ip: Ipv4Addr,
     },
     Stopping,
+}
+
+/// Cached pull result, keyed by the `repo` it was resolved against.
+///
+/// Lookups in `do_start` / `pull_for_rollout` are valid only when
+/// `repo` still matches `spec.repo`; a `PATCH /apps/<name>` that
+/// changes `repo` doesn't need to actively clear the cache — the
+/// freshness check at read time handles it.
+#[derive(Debug, Clone)]
+pub(crate) struct DigestCache {
+    pub(crate) repo: String,
+    pub(crate) digest: bugpot_runtime::ImageId,
 }
 
 /// Outcome of inspecting [`HandleInner::state`] at the entry to a
