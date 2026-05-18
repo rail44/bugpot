@@ -70,7 +70,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use bugpot_core::BugpotAppHost;
+use bugpot_core::AppHost;
+use bugpot_egress::Egress;
+use bugpot_runtime::Runtime;
 use tower::ServiceBuilder;
 use tower::limit::RateLimitLayer;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -132,13 +134,16 @@ pub(crate) const MAX_BODY_BYTES: usize = 256 * 1024;
 const RATE_LIMIT_REQUESTS: u64 = 60;
 const RATE_LIMIT_PERIOD: Duration = Duration::from_mins(1);
 
-/// Re-name the canonical [`BugpotAppHost`] locally so the rest of this
-/// crate keeps the short, role-flavoured `Arc<Controller>` shape it
-/// used before. The actual concrete spelling
-/// (`AppHost<Runtime, Egress>`) lives one place — in `bugpot-core` —
-/// so this crate doesn't have to import `bugpot_runtime` or
-/// `bugpot_egress` at all.
-type Controller = BugpotAppHost;
+/// The fully-resolved controller type the admin layer talks to.
+///
+/// The Linux production stack only has one `Runtime` / `Egress` pair,
+/// so spelling them out here avoids the `<R, E>` noise that used to
+/// follow every handler signature — without resorting to a `dyn`
+/// abstraction that no caller swaps. The `AppHost`'s own
+/// parameterisation stays in place for controller-side tests
+/// (the mocks live in that crate); this crate just commits to the
+/// one shape it actually deploys with.
+type Controller = AppHost<Runtime, Egress>;
 
 /// Combined state passed to every handler / middleware.
 ///

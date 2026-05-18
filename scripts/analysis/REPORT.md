@@ -70,30 +70,42 @@ Workspace edges (`just depgraph`):
 
 ```
 bugpotd → admin, config, core, egress, metrics, router, runtime
-admin   → config, core
+admin   → config, core, egress, runtime
 core    → config, egress, router, runtime
 egress  → config
 router  → config
 runtime → config
 ```
 
-No cycles. `bugpot-config` is the universal leaf (fan-in 6). After
-the `BugpotAppHost` re-export, **admin's fan-out shrunk from 4 to 2**
-— it no longer imports `bugpot-runtime` or `bugpot-egress` at the
-source level. The concrete-type design (deliberate per the
-`admin/src/lib.rs` doc) is preserved; the canonical spelling
-`AppHost<Runtime, Egress>` now lives once, in `bugpot-core` as the
-public `BugpotAppHost` type alias.
+No cycles. `bugpot-config` is the universal leaf (fan-in 6).
 
-The remaining cross-layer edge worth re-examining:
+**On `bugpot-admin → bugpot-runtime, bugpot-egress`** — admin imports
+the concrete `Runtime` and `Egress` types so it can name
+`AppHost<Runtime, Egress>` (aliased locally as `Controller`). An
+earlier draft of this report listed the edge as a "leak" and the
+follow-up PR introduced a `BugpotAppHost` re-export in `bugpot-core`
+to drop those two deps from admin's `Cargo.toml`. That was an
+over-correction: the concrete spelling is a deliberate design choice
+(admin's L172–180 doc justifies it — `<R, E>` generic propagation
+through every handler signature was rejected for noise, and `dyn` for
+runtime-polymorphism we don't need was rejected as wrong-shaped
+abstraction). The re-export moved the canonical alias into a crate
+that didn't need it (`bugpot-core` doesn't reference its own
+`BugpotAppHost`), inverting responsibility. Reverted in a follow-up.
 
-- **`bugpot-core → bugpot-router`** — `ops/resolver.rs` implements
-  `UpstreamResolver`, a trait defined in router. The dependency
-  direction is correct per the ports/adapters pattern (consumer
-  defines the port, provider implements it), but core ends up
-  compiling against all of router's proxy/body code just for a trait.
-  Fix: split the trait + `Upstream` + `ResolveError` into a tiny port
-  crate (e.g. `bugpot-router-port`).
+**On `bugpot-core → bugpot-router`** — `ops/resolver.rs` implements
+`UpstreamResolver`, a trait defined in router. An earlier draft of
+this report listed this as the next graph-cleanup candidate. On
+re-examination it isn't: this *is* the correct dependency direction
+under the ports & adapters pattern — the consumer (router) defines
+the port (the trait), and the provider (core's `AppHost`) depends on
+the port-defining crate to implement it. The compile-time cost of
+core picking up router's axum/hyper/tower in its transitive deps is
+real but marginal at our scale (one production adapter + one test
+fixture). Extracting the trait into its own port crate is the right
+move when there are many external implementers or a no_std consumer
+(cf. `tracing-core` / `axum-core` / `futures-core`); we have neither.
+Left as-is.
 
 `bugpot-core` internal structure (`just modules bugpot-core`) is
 healthy: `handle` (= `AppHandle`) is the universal substrate used by
@@ -114,12 +126,13 @@ folds axis 1's churn × LOC ranking into the impact axis.
 
 | | candidate | sources | status |
 |---|---|---|---|
-| ~~A~~ | admin: file split + type erasure via `BugpotAppHost` re-export | axis 2 wide + axis 3 graph cleanup | **done** |
-| ~~F~~ | move `emit_resource_metrics` out of `view.rs` | axis 4 | **done** |
-| B | `runtime::start_app` phase extraction | axis 1 + axis 2 (163 lines / cyc 19) | next |
-| G | `cmd/bugpot::run_apps` per-subcommand split | axis 2 (cyc **25**) | next |
-| C | extract `bugpot-router-port` trait crate | axis 3 | follow-up |
-| D | `router::forward` / `forward_upgrade` dedup | axis 1 + axis 2 (79 + 81) | follow-up |
+| A2 | admin: file split into auth.rs / error.rs / handlers.rs | axis 2 wide | **done** (PR #130) |
+| ~~A1~~ | admin: `BugpotAppHost` re-export from `bugpot-core` | (axis 3 misreading) | **reverted** — concrete-type design was deliberate per L172–180 doc; re-export moved the alias to a crate that didn't need it |
+| ~~F~~ | move `emit_resource_metrics` out of `view.rs` | axis 4 | **done** (PR #130) |
+| ~~B~~ | `runtime::start_app` phase extraction | axis 1 + axis 2 (163 lines / cyc 19) | **done** (PR #131) |
+| ~~G~~ | `cmd/bugpot::run_apps` per-subcommand split | axis 2 (cyc **25**) | **done** (PR #132) |
+| ~~D~~ | `router::forward` / `forward_upgrade` dedup | axis 1 + axis 2 (79 + 81) | **done** (PR #133) |
+| ~~C~~ | extract `bugpot-router-port` trait crate | axis 3 | **dropped** — direction was already correct per port/adapter; extraction not justified at our adapter count (see axis 3 above) |
 | E | `image::pull` state-machine type | axis 2 (cyc 15 in `image.rs`) | later (high risk) |
 
 ## Tooling notes

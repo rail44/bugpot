@@ -236,6 +236,8 @@ dependencies = [
  "axum",
  "bugpot-config",
  "bugpot-core",
+ "bugpot-egress",
+ "bugpot-runtime",
  "hex",
  "hmac",
  "serde",

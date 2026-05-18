@@ -26,6 +26,8 @@ tracing.workspace = true
 zeroize = "1"
 bugpot-config.workspace = true
 bugpot-core.workspace = true
+bugpot-egress.workspace = true
+bugpot-runtime.workspace = true
 
 [lints]
 workspace = true
