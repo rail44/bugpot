@@ -374,8 +374,12 @@ impl EgressOps for Egress {
     ) -> anyhow::Result<()> {
         // Best-effort: drop any allow-set entries left over from the
         // previous bugpot run for *this* container IP. Entries also
-        // TTL out, so a failure here is non-fatal.
-        let _ = nft::flush_src(NFT_TABLE, container_ip).await;
+        // TTL out, so a failure here is non-fatal but worth logging
+        // — operators correlating a "container started with stale
+        // allow rules" report want a trail.
+        if let Err(e) = nft::flush_src(NFT_TABLE, container_ip).await {
+            tracing::warn!(app = name, %container_ip, error = %e, "flush_src failed during orphan cleanup; relying on TTL expiry");
+        }
         // Use force-detach so a missing veth (e.g. host side already
         // gone) doesn't prevent deleting the netns. The netns name +
         // host veth name derive deterministically from the app name,
@@ -403,7 +407,9 @@ impl EgressOps for Egress {
         // 60s TTL is a backstop). Only entries matching *this* src IP
         // are removed — previous behaviour flushed the whole set, which
         // briefly broke egress for every other running app.
-        let _ = nft::flush_src(NFT_TABLE, app.container_ip).await;
+        if let Err(e) = nft::flush_src(NFT_TABLE, app.container_ip).await {
+            tracing::warn!(app = name, container_ip = %app.container_ip, error = %e, "flush_src failed on release; relying on TTL expiry");
+        }
         netns::run_cmds(netns::render_detach_endpoint(&app.plan)).await?;
         Ok(())
     }
