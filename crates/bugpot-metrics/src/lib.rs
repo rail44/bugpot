@@ -21,7 +21,8 @@ use std::time::Duration;
 
 use axum::{Router, http::StatusCode, response::IntoResponse, routing::get};
 use metrics::{counter, gauge};
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use metrics_exporter_prometheus::PrometheusBuilder;
+pub use metrics_exporter_prometheus::PrometheusHandle;
 use tokio_metrics::RuntimeMonitor;
 use tracing::info;
 
