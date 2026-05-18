@@ -82,7 +82,7 @@ fn parse_egress_config() -> Result<EgressConfig> {
 /// `X-Forwarded-Proto`. Set to `https` when bugpot sits behind a
 /// TLS-terminating front; default is `http`.
 pub(crate) fn parse_router_config() -> Result<bugpot_router::RouterConfig> {
-    let mut cfg = bugpot_router::RouterConfig::defaults();
+    let mut cfg = bugpot_router::RouterConfig::default();
     if let Ok(raw) = std::env::var("BUGPOT_TRUSTED_PROXIES") {
         for token in raw.split(',') {
             let trimmed = token.trim();

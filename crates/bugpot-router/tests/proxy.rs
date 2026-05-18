@@ -123,7 +123,7 @@ async fn start_router(apps: Vec<AppSpec>) -> SocketAddr {
     let addr = probe.local_addr().unwrap();
     drop(probe);
     tokio::spawn(async move {
-        serve(addr, app_router, RouterConfig::defaults())
+        serve(addr, app_router, RouterConfig::default())
             .await
             .unwrap();
     });

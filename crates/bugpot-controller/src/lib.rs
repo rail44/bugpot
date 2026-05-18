@@ -124,10 +124,8 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
             // silently dropping the app.
             let handle = make_handle_with_rollouts(spec, rollouts)
                 .map_err(|e| anyhow!("rehydrate handle: {e}"))?;
-            maps.by_subdomain.insert(
-                handle.identity.subdomain.clone(),
-                handle.identity.name.clone(),
-            );
+            maps.by_subdomain
+                .insert(handle.identity.subdomain.clone(), Arc::clone(&handle));
             maps.by_name.insert(handle.identity.name.clone(), handle);
         }
         #[allow(clippy::cast_precision_loss)]
@@ -575,8 +573,9 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
                 discard_failed_toml(&toml_path).await;
                 return Err(DeployError::SubdomainTaken(subdomain));
             }
-            maps.by_subdomain.insert(subdomain.clone(), name.clone());
-            maps.by_name.insert(name.clone(), handle.clone());
+            maps.by_subdomain
+                .insert(subdomain.clone(), Arc::clone(&handle));
+            maps.by_name.insert(name.clone(), Arc::clone(&handle));
         }
         gauge!("bugpot_apps_active").increment(1.0);
 
@@ -724,7 +723,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
         // previous rollout's (which may have been a different tag).
         let rollout = Rollout {
             tag,
-            created_at: humantime::format_rfc3339_seconds(SystemTime::now()).to_string(),
+            created_at: SystemTime::now(),
         };
         record_rollout(handle, rollout.clone(), resolved_digest).await;
 
@@ -849,18 +848,8 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
                 "cleanup_orphan_container failed during remove; bundle / volume dir may leak",
             );
         }
-        let spec_path = self.spec_path(name);
-        if spec_path.exists()
-            && let Err(e) = tokio::fs::remove_file(&spec_path).await
-        {
-            warn!(path = %spec_path.display(), error = %e, "remove spec toml failed");
-        }
-        let rollouts_path = self.rollouts_path(name);
-        if rollouts_path.exists()
-            && let Err(e) = tokio::fs::remove_file(&rollouts_path).await
-        {
-            warn!(path = %rollouts_path.display(), error = %e, "remove rollouts toml failed");
-        }
+        try_remove_file(&self.spec_path(name)).await;
+        try_remove_file(&self.rollouts_path(name)).await;
         Ok(())
     }
 
@@ -1208,6 +1197,19 @@ async fn discard_failed_toml(path: &Path) {
     }
 }
 
+/// Best-effort `remove_file` that treats `NotFound` as success. Used
+/// by `do_remove` to clear per-app state files; the previous
+/// `path.exists()` + `remove_file` pair had a TOCTOU window (and
+/// would spuriously warn when a concurrent operator beat us to the
+/// delete).
+async fn try_remove_file(path: &Path) {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!(path = %path.display(), error = %e, "remove file failed"),
+    }
+}
+
 /// If `digest` is `Some`, return an OCI reference pinned to that
 /// digest so a subsequent pull skips the registry-side
 /// `manifest_probe`. Returns the original reference unchanged when
@@ -1224,20 +1226,14 @@ fn digest_pinned_ref(image: &str, digest: Option<&bugpot_runtime::ImageId>) -> S
 impl<R: RuntimeOps, E: EgressOps> UpstreamResolver for AppController<R, E> {
     async fn resolve(&self, host: &str) -> Result<Upstream, ResolveError> {
         let subdomain = subdomain_of(host).ok_or(ResolveError::NoSuchApp)?;
-        let handle = {
-            let maps = self.apps.read().await;
-            let name = maps
-                .by_subdomain
-                .get(subdomain)
-                .ok_or(ResolveError::NoSuchApp)?;
-            let handle = maps
-                .by_name
-                .get(name)
-                .ok_or(ResolveError::NoSuchApp)?
-                .clone();
-            drop(maps);
-            handle
-        };
+        let handle = self
+            .apps
+            .read()
+            .await
+            .by_subdomain
+            .get(subdomain)
+            .cloned()
+            .ok_or(ResolveError::NoSuchApp)?;
         let port = handle.spec.read().await.port;
         match self.ensure_running(&handle).await {
             Ok(ip) => Ok(Upstream::with_active_upgrades(
@@ -1506,7 +1502,7 @@ mod tests {
             spec_with_name(name),
             Some(Rollout {
                 tag: tag.to_owned(),
-                created_at: "1970-01-01T00:00:00Z".to_owned(),
+                created_at: SystemTime::UNIX_EPOCH,
             }),
         )
     }
@@ -2034,7 +2030,7 @@ mod tests {
             spec,
             Some(Rollout {
                 tag: "v1".into(),
-                created_at: "1970-01-01T00:00:00Z".into(),
+                created_at: SystemTime::UNIX_EPOCH,
             }),
         );
         let controller = make_controller(vec![stored], tmp.path().to_owned());

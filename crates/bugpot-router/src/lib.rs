@@ -113,7 +113,7 @@ type ProxyClient = Client<HttpConnector, Body>;
 /// Kept separate from `serve()` so callers can build it from anywhere
 /// (`cmd/bugpot::parse_router_config`, tests, etc.) and so the
 /// defaults stay in one place.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RouterConfig {
     /// IPv4/IPv6 networks whose `X-Forwarded-For` is honoured. Requests
     /// from any other peer have their incoming XFF discarded — the
@@ -129,10 +129,11 @@ pub struct RouterConfig {
     pub forwarded_proto: String,
 }
 
-impl RouterConfig {
-    /// Hard-coded sensible defaults: trust nothing, advertise `http`.
-    #[must_use]
-    pub fn defaults() -> Self {
+impl Default for RouterConfig {
+    /// Trust nothing, advertise `http`. Hand-written so the
+    /// `forwarded_proto` default is the real `"http"` rather than
+    /// the `String::default()` empty string the derive would emit.
+    fn default() -> Self {
         Self {
             trusted_proxies: Vec::new(),
             forwarded_proto: "http".to_owned(),
