@@ -51,8 +51,6 @@ pub struct AppSpec {
     pub scaling: Scaling,
     #[serde(default, skip_serializing_if = "Readiness::is_empty")]
     pub readiness: Readiness,
-    #[serde(default, skip_serializing_if = "Resources::is_empty")]
-    pub resources: Resources,
     /// Persistent volumes bind-mounted from
     /// `<state>/volumes/<app>/<name>/` into the container at the
     /// declared path. Survives `idle` freeze, memory-pressure
@@ -177,56 +175,6 @@ impl Readiness {
             return Ok(default);
         }
         humantime::parse_duration(raw).map_err(|e| format!("readiness.timeout: {e}"))
-    }
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct Resources {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cpu: Option<String>,
-}
-
-impl Resources {
-    /// Soft memory target applied when an app spec omits `[resources]
-    /// memory`. Sets cgroup v2's `memory.high` — the kernel throttles
-    /// the container via direct reclaim past this value, but doesn't
-    /// hard-kill it. Sized for the "many small apps on a cheap VM"
-    /// scenario; an app that legitimately needs more bursts upward.
-    pub const DEFAULT_MEMORY: &'static str = "128MB";
-    /// Default CPU weight when `[resources] cpu` is omitted: a full
-    /// CPU's worth of shares (= 1024 shares = cgroup v2 `cpu.weight`
-    /// 100, the kernel default). Apps share contested CPU in
-    /// proportion to their weights; an app at the default that has
-    /// the host to itself uses everything available.
-    pub const DEFAULT_CPU: &'static str = "1.0";
-
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.memory.is_none() && self.cpu.is_none()
-    }
-
-    /// Memory soft target string actually applied at start time.
-    /// Falls back to [`Self::DEFAULT_MEMORY`] when not specified.
-    /// Surfaced through `memory.reservation` in the OCI spec, which
-    /// libcontainer maps to cgroup v2's `memory.high` (soft throttle
-    /// via direct reclaim, not a hard kill).
-    #[must_use]
-    pub fn effective_memory(&self) -> &str {
-        self.memory.as_deref().unwrap_or(Self::DEFAULT_MEMORY)
-    }
-
-    /// CPU weight string actually applied at start time. Falls back
-    /// to [`Self::DEFAULT_CPU`] when not specified. Surfaced through
-    /// `cpu.shares` in the OCI spec, which libcontainer maps to
-    /// cgroup v2's `cpu.weight` — a **relative weight** between
-    /// apps, not a hard cap. An app at `"2.0"` gets twice the share
-    /// of one at `"1.0"` *only while both are saturating the same
-    /// core*; otherwise each takes whatever's idle.
-    #[must_use]
-    pub fn effective_cpu(&self) -> &str {
-        self.cpu.as_deref().unwrap_or(Self::DEFAULT_CPU)
     }
 }
 
@@ -784,10 +732,6 @@ mod tests {
 
             [scaling]
             idle_timeout = "5m"
-
-            [resources]
-            memory = "256MB"
-            cpu = "0.5"
         "#;
         let spec: AppSpec = toml::from_str(body).unwrap();
         assert_eq!(spec.name(), "myapp");
@@ -947,7 +891,6 @@ name = "alpha"
         assert!(!body.contains("[egress]"), "got: {body}");
         assert!(!body.contains("[env]"), "got: {body}");
         assert!(!body.contains("[scaling]"), "got: {body}");
-        assert!(!body.contains("[resources]"), "got: {body}");
     }
 
     #[test]

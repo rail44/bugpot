@@ -28,7 +28,6 @@ mod cgroup_stats;
 mod error;
 mod image;
 mod logs;
-mod resources;
 mod runtime;
 mod seccomp;
 mod spec;

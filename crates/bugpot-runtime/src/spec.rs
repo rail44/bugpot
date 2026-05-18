@@ -7,13 +7,12 @@ use std::path::{Path, PathBuf};
 use bugpot_config::AppSpec;
 use oci_client::config::ConfigFile as ImageConfigFile;
 use oci_spec::runtime::{
-    Capability, LinuxBuilder, LinuxCapabilitiesBuilder, LinuxCpuBuilder, LinuxMemoryBuilder,
-    LinuxNamespace, LinuxNamespaceBuilder, LinuxNamespaceType, LinuxResourcesBuilder, Mount,
-    MountBuilder, ProcessBuilder, RootBuilder, Spec, SpecBuilder, UserBuilder, get_default_mounts,
+    Capability, LinuxBuilder, LinuxCapabilitiesBuilder, LinuxNamespace, LinuxNamespaceBuilder,
+    LinuxNamespaceType, Mount, MountBuilder, ProcessBuilder, RootBuilder, Spec, SpecBuilder,
+    UserBuilder, get_default_mounts,
 };
 
 use crate::error::{Result, RuntimeError};
-use crate::resources;
 
 /// Inputs for `Spec` construction.
 ///
@@ -88,13 +87,16 @@ pub(crate) fn build_spec(inputs: &SpecInputs<'_>) -> Result<Spec> {
         .capabilities(capabilities)
         .build()?;
 
-    // ---- Linux: namespaces + resources ----
+    // ---- Linux: namespaces (no per-app resource limits) ----
+    //
+    // bugpot leans on kernel defaults: fair-share `cpu.weight` and
+    // host-wide LRU for memory. The freeze + `BUGPOT_FREEZE_MEM_LO`
+    // pressure handler is the only app-level intervention; everything
+    // else is the kernel's call.
     let namespaces = build_namespaces(netns_path)?;
-    let resources = build_resources(spec)?;
     let seccomp = crate::seccomp::runc_default()?.clone();
     let linux = LinuxBuilder::default()
         .namespaces(namespaces)
-        .resources(resources)
         .seccomp(seccomp)
         .cgroups_path(PathBuf::from(format!("/bugpot/{}", spec.name())))
         .build()?;
@@ -297,39 +299,6 @@ fn build_namespaces(netns_path: Option<&Path>) -> Result<Vec<LinuxNamespace>> {
     Ok(vec![pid, ipc, uts, mount, cgroup, net.build()?])
 }
 
-fn build_resources(spec: &AppSpec) -> Result<oci_spec::runtime::LinuxResources> {
-    // Soft limits, not hard caps. The premise is "the whole instance
-    // is bugpot's" — leaving capacity stranded on idle apps is the
-    // wrong trade. So memory is set via `reservation` (cgroup v2
-    // `memory.high`, soft throttle via direct reclaim) and CPU via
-    // `shares` (cgroup v2 `cpu.weight`, fair-share contention). Idle
-    // apps yield their slice to busier ones automatically.
-    //
-    // Worst-case backstops are at the host level rather than per-app:
-    //   - Memory: when `MemAvailable` falls below
-    //     `BUGPOT_FREEZE_MEM_LO`, the controller's pressure handler
-    //     evicts oldest-frozen apps to `Stopped`. A leaky running app
-    //     can eventually OOM-kill the host; that's the explicit
-    //     trade for higher steady-state utilisation.
-    //   - CPU: `cpu.weight` cannot OOM anything; the kernel just
-    //     interleaves more aggressively under contention.
-    //
-    // Defaults from `Resources::effective_*`: 128 MB soft target,
-    // 1.0-CPU-worth of shares (= weight 100, the cgroup default).
-    let mem_bytes = resources::parse_memory(spec.resources.effective_memory())?;
-    let mem_cfg = LinuxMemoryBuilder::default()
-        .reservation(i64::try_from(mem_bytes).unwrap_or(i64::MAX))
-        .build()?;
-
-    let shares = resources::parse_cpu(spec.resources.effective_cpu())?;
-    let cpu_cfg = LinuxCpuBuilder::default().shares(shares).build()?;
-
-    Ok(LinuxResourcesBuilder::default()
-        .memory(mem_cfg)
-        .cpu(cpu_cfg)
-        .build()?)
-}
-
 fn build_mounts(spec: &AppSpec, volume_host_paths: &[PathBuf]) -> Result<Vec<Mount>> {
     // Start from the spec defaults (proc, sys, /dev/pts, ...).
     let mut mounts = get_default_mounts();
@@ -422,10 +391,6 @@ name = "myapp"
 
 [env]
 LOG_LEVEL = "info"
-
-[resources]
-memory = "256MiB"
-cpu = "0.5"
 "#
         );
         toml::from_str(&toml).expect("parse test toml")
@@ -447,7 +412,7 @@ cpu = "0.5"
     }
 
     #[test]
-    fn spec_includes_env_port_and_resources() {
+    fn spec_includes_env_port_user_and_no_cgroup_limits() {
         let app = make_app_spec("ghcr.io/x/y", 8081);
         let image = make_image_config(vec!["/bin/run"], vec!["--serve"]);
         let rootfs = PathBuf::from("/tmp/bugpot-test-rootfs");
@@ -481,18 +446,21 @@ cpu = "0.5"
         // Cwd
         assert_eq!(process.cwd(), &PathBuf::from("/app"));
 
-        // Resources: memory 256MiB → reservation (cgroup v2
-        // memory.high); cpu 0.5 → shares 512 (cgroup v2 weight 50,
-        // half priority).
+        // No per-app cgroup limits: bugpot relies on kernel fair-share
+        // (cpu.weight default 100) + host-LRU memory pressure. The
+        // freeze + memory-pressure-eviction handler is the only
+        // app-level intervention. The OCI `LinuxResources` block
+        // itself is non-None because `LinuxBuilder::default()` always
+        // emits one (its internal devices / hugepages defaults live
+        // there too), but the `memory` and `cpu` sub-fields stay
+        // unset so libcontainer applies kernel defaults.
         let linux = spec.linux().as_ref().unwrap();
-        let res = linux.resources().as_ref().unwrap();
-        let mem = res.memory().as_ref().unwrap();
-        assert_eq!(mem.reservation().unwrap(), 256 * 1024 * 1024);
-        assert!(mem.limit().is_none(), "hard memory cap is not set per-app");
-        let cpu = res.cpu().as_ref().unwrap();
-        assert_eq!(cpu.shares().unwrap(), 512);
-        assert!(cpu.quota().is_none(), "cpu hardcap not set in shares mode");
-        assert!(cpu.period().is_none(), "cpu period not set in shares mode");
+        let resources = linux.resources().as_ref().unwrap();
+        assert!(
+            resources.memory().is_none(),
+            "no per-app memory cgroup limits"
+        );
+        assert!(resources.cpu().is_none(), "no per-app cpu cgroup limits");
 
         // Namespaces: net namespace path absent because netns_path = None
         let network = linux

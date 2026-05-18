@@ -170,7 +170,7 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::time::Instant;
 
-    use bugpot_config::{AppSpec, EgressSpec, Readiness, Resources, Scaling};
+    use bugpot_config::{AppSpec, EgressSpec, Readiness, Scaling};
     use bugpot_egress::{EgressOps, Endpoint};
     use bugpot_runtime::{Auth, ImageId, ResourceUsage, RunningApp, RuntimeOps};
 
@@ -401,7 +401,6 @@ mod tests {
             env: HashMap::default(),
             scaling: Scaling::default(),
             readiness: Readiness::default(),
-            resources: Resources::default(),
             volumes: Vec::new(),
         }
     }
