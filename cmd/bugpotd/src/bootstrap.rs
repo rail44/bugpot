@@ -20,7 +20,6 @@ use bugpot_admin::AdminAuth;
 use bugpot_controller::AppController;
 use bugpot_egress::Egress;
 use bugpot_metrics::PrometheusHandle;
-use bugpot_router::UpstreamResolver;
 use bugpot_runtime::Runtime;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
@@ -231,7 +230,7 @@ fn spawn_router(
     listen: SocketAddr,
     controller: &Arc<AppController<Runtime, Egress>>,
 ) -> Result<JoinHandle<()>> {
-    let resolver: Arc<dyn UpstreamResolver> = controller.clone();
+    let resolver = Arc::clone(controller);
     let router_cfg = parse_router_config()?;
     Ok(tokio::spawn(async move {
         if let Err(e) = bugpot_router::serve(listen, resolver, router_cfg).await {

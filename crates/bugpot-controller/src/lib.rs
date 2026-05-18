@@ -29,7 +29,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
-use async_trait::async_trait;
 use bugpot_config::{AppSpec, AuthConfig, RegistryCredential, Rollout, registry_host};
 use bugpot_egress::{EgressOps, StartupClaims};
 use bugpot_router::{ResolveError, Upstream, UpstreamResolver, subdomain_of};
@@ -1225,7 +1224,6 @@ fn digest_pinned_ref(image: &str, digest: Option<&bugpot_runtime::ImageId>) -> S
     }
 }
 
-#[async_trait]
 impl<R: RuntimeOps, E: EgressOps> UpstreamResolver for AppController<R, E> {
     async fn resolve(&self, host: &str) -> Result<Upstream, ResolveError> {
         let subdomain = subdomain_of(host).ok_or(ResolveError::NoSuchApp)?;
