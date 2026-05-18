@@ -14,7 +14,7 @@
 //! operator can run `bugpot` against a remote `bugpotd` from their
 //! laptop without the Linux-only daemon-side deps.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
@@ -231,81 +231,107 @@ async fn main() -> Result<()> {
 async fn run_apps(client: &Client, op: AppsCmd, json: bool) -> Result<()> {
     let cfg = ApiConfig::from_env("admin")?;
     match op {
-        AppsCmd::List => {
-            let v: Vec<AppView> = http_get_json(client, &cfg.base_url, "/apps", &cfg.token).await?;
-            if json {
-                print_json(&v)?;
-            } else {
-                print_apps_table(&v);
-            }
-        }
-        AppsCmd::Get { name } => {
-            let v: AppView =
-                http_get_json(client, &cfg.base_url, &format!("/apps/{name}"), &cfg.token).await?;
-            if json {
-                print_json(&v)?;
-            } else {
-                print_app_human(&v);
-            }
-        }
-        AppsCmd::Create { file } => {
-            let body = std::fs::read_to_string(&file)
-                .with_context(|| format!("read {}", file.display()))?;
-            let v: AppView = http_post_toml(client, &cfg.base_url, "/apps", &cfg.token, &body)
-                .await
-                .context("POST /apps")?;
-            if json {
-                print_json(&v)?;
-            } else {
-                eprintln!("created");
-                print_app_human(&v);
-            }
-        }
-        AppsCmd::Update { name, file } => {
-            let body = std::fs::read_to_string(&file)
-                .with_context(|| format!("read {}", file.display()))?;
-            let v: AppView = http_patch_toml(
-                client,
-                &cfg.base_url,
-                &format!("/apps/{name}"),
-                &cfg.token,
-                &body,
-            )
-            .await
-            .context("PATCH /apps")?;
-            if json {
-                print_json(&v)?;
-            } else {
-                eprintln!("updated");
-                print_app_human(&v);
-            }
-        }
-        AppsCmd::Delete { name } => {
-            http_delete(client, &cfg.base_url, &format!("/apps/{name}"), &cfg.token).await?;
-            if !json {
-                eprintln!("deleted {name}");
-            }
-        }
-        AppsCmd::DeployKey { name } => {
-            let v: DeployKeyResponse = http_post_json(
-                client,
-                &cfg.base_url,
-                &format!("/apps/{name}/deploy-keys"),
-                &cfg.token,
-                &serde_json::json!({}),
-            )
-            .await?;
-            if json {
-                // The wire format is `{"token": "bp1..."}` — pass through.
-                println!("{}", serde_json::json!({ "token": v.token }));
-            } else {
-                // Token is unrecoverable after this print — flag it loudly.
-                eprintln!(
-                    "deploy key for {name} (record this NOW — server does not retain the plaintext):"
-                );
-                println!("{}", v.token);
-            }
-        }
+        AppsCmd::List => cmd_apps_list(client, &cfg, json).await,
+        AppsCmd::Get { name } => cmd_apps_get(client, &cfg, &name, json).await,
+        AppsCmd::Create { file } => cmd_apps_create(client, &cfg, &file, json).await,
+        AppsCmd::Update { name, file } => cmd_apps_update(client, &cfg, &name, &file, json).await,
+        AppsCmd::Delete { name } => cmd_apps_delete(client, &cfg, &name, json).await,
+        AppsCmd::DeployKey { name } => cmd_apps_deploy_key(client, &cfg, &name, json).await,
+    }
+}
+
+async fn cmd_apps_list(client: &Client, cfg: &ApiConfig, json: bool) -> Result<()> {
+    let v: Vec<AppView> = http_get_json(client, &cfg.base_url, "/apps", &cfg.token).await?;
+    if json {
+        print_json(&v)
+    } else {
+        print_apps_table(&v);
+        Ok(())
+    }
+}
+
+async fn cmd_apps_get(client: &Client, cfg: &ApiConfig, name: &str, json: bool) -> Result<()> {
+    let v: AppView =
+        http_get_json(client, &cfg.base_url, &format!("/apps/{name}"), &cfg.token).await?;
+    if json {
+        print_json(&v)
+    } else {
+        print_app_human(&v);
+        Ok(())
+    }
+}
+
+async fn cmd_apps_create(client: &Client, cfg: &ApiConfig, file: &Path, json: bool) -> Result<()> {
+    let body = std::fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
+    let v: AppView = http_post_toml(client, &cfg.base_url, "/apps", &cfg.token, &body)
+        .await
+        .context("POST /apps")?;
+    if json {
+        print_json(&v)
+    } else {
+        eprintln!("created");
+        print_app_human(&v);
+        Ok(())
+    }
+}
+
+async fn cmd_apps_update(
+    client: &Client,
+    cfg: &ApiConfig,
+    name: &str,
+    file: &Path,
+    json: bool,
+) -> Result<()> {
+    let body = std::fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
+    let v: AppView = http_patch_toml(
+        client,
+        &cfg.base_url,
+        &format!("/apps/{name}"),
+        &cfg.token,
+        &body,
+    )
+    .await
+    .context("PATCH /apps")?;
+    if json {
+        print_json(&v)
+    } else {
+        eprintln!("updated");
+        print_app_human(&v);
+        Ok(())
+    }
+}
+
+async fn cmd_apps_delete(client: &Client, cfg: &ApiConfig, name: &str, json: bool) -> Result<()> {
+    http_delete(client, &cfg.base_url, &format!("/apps/{name}"), &cfg.token).await?;
+    if !json {
+        eprintln!("deleted {name}");
+    }
+    Ok(())
+}
+
+async fn cmd_apps_deploy_key(
+    client: &Client,
+    cfg: &ApiConfig,
+    name: &str,
+    json: bool,
+) -> Result<()> {
+    let v: DeployKeyResponse = http_post_json(
+        client,
+        &cfg.base_url,
+        &format!("/apps/{name}/deploy-keys"),
+        &cfg.token,
+        &serde_json::json!({}),
+    )
+    .await?;
+    if json {
+        // The wire format is `{"token": "bp1..."}` — pass through.
+        println!("{}", serde_json::json!({ "token": v.token }));
+    } else {
+        // Token is unrecoverable after this print — flag it loudly.
+        eprintln!(
+            "deploy key for {name} (record this NOW — server does not retain the plaintext):"
+        );
+        println!("{}", v.token);
     }
     Ok(())
 }
@@ -315,39 +341,50 @@ async fn run_apps(client: &Client, op: AppsCmd, json: bool) -> Result<()> {
 async fn run_rollouts(client: &Client, op: RolloutsCmd, json: bool) -> Result<()> {
     let cfg = ApiConfig::from_env("deploy")?;
     match op {
-        RolloutsCmd::List { app } => {
-            let v: Vec<Rollout> = http_get_json(
-                client,
-                &cfg.base_url,
-                &format!("/apps/{app}/rollouts"),
-                &cfg.token,
-            )
-            .await?;
-            if json {
-                print_json(&v)?;
-            } else {
-                print_rollouts_table(&v);
-            }
-        }
-        RolloutsCmd::Push { app, tag } => {
-            let body = serde_json::json!({ "tag": tag });
-            let v: Rollout = http_post_json(
-                client,
-                &cfg.base_url,
-                &format!("/apps/{app}/rollouts"),
-                &cfg.token,
-                &body,
-            )
-            .await?;
-            if json {
-                print_json(&v)?;
-            } else {
-                eprintln!("rolled out {app} → {}", v.tag);
-                eprintln!("  created_at: {}", v.created_at);
-            }
-        }
+        RolloutsCmd::List { app } => cmd_rollouts_list(client, &cfg, &app, json).await,
+        RolloutsCmd::Push { app, tag } => cmd_rollouts_push(client, &cfg, &app, &tag, json).await,
     }
-    Ok(())
+}
+
+async fn cmd_rollouts_list(client: &Client, cfg: &ApiConfig, app: &str, json: bool) -> Result<()> {
+    let v: Vec<Rollout> = http_get_json(
+        client,
+        &cfg.base_url,
+        &format!("/apps/{app}/rollouts"),
+        &cfg.token,
+    )
+    .await?;
+    if json {
+        print_json(&v)
+    } else {
+        print_rollouts_table(&v);
+        Ok(())
+    }
+}
+
+async fn cmd_rollouts_push(
+    client: &Client,
+    cfg: &ApiConfig,
+    app: &str,
+    tag: &str,
+    json: bool,
+) -> Result<()> {
+    let body = serde_json::json!({ "tag": tag });
+    let v: Rollout = http_post_json(
+        client,
+        &cfg.base_url,
+        &format!("/apps/{app}/rollouts"),
+        &cfg.token,
+        &body,
+    )
+    .await?;
+    if json {
+        print_json(&v)
+    } else {
+        eprintln!("rolled out {app} → {}", v.tag);
+        eprintln!("  created_at: {}", v.created_at);
+        Ok(())
+    }
 }
 
 // ---- HTTP helpers ---------------------------------------------------------
