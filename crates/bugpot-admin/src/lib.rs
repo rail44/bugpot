@@ -80,6 +80,42 @@ use zeroize::Zeroizing;
 pub mod deploy_key;
 pub use deploy_key::DeployKeySecret;
 
+/// Emit a `status="ok"` audit-log entry for a completed admin action.
+///
+/// Fields after `$app` are forwarded as tracing key/values, so callers
+/// add per-action context (`repo = %r`, `tag = %t`, etc.) without
+/// repeating the common envelope (`target`, `action`, `peer`, `app`,
+/// `status`).
+macro_rules! audit_ok {
+    ($action:expr, $peer:expr, $app:expr $(, $($extra:tt)*)?) => {
+        ::tracing::info!(
+            target: "bugpot::audit",
+            action = $action,
+            peer = %$peer.ip(),
+            app = %$app,
+            $($($extra)*,)?
+            status = "ok",
+        )
+    };
+}
+
+/// Emit a `status="error"` audit-log entry for a failed admin action.
+/// Same shape as [`audit_ok!`] plus a mandatory `$err` slot that
+/// becomes `error = %err`.
+macro_rules! audit_err {
+    ($action:expr, $peer:expr, $app:expr, $err:expr $(, $($extra:tt)*)?) => {
+        ::tracing::warn!(
+            target: "bugpot::audit",
+            action = $action,
+            peer = %$peer.ip(),
+            app = %$app,
+            $($($extra)*,)?
+            status = "error",
+            error = %$err,
+        )
+    };
+}
+
 /// Maximum POST body size for `POST /apps`. `AppSpec` JSON is usually
 /// well under 1 KB; the cap stops the `env` map from being weaponised
 /// into a memory-exhaustion vector.
@@ -357,31 +393,17 @@ where
     // the controller's maps.
     let audit_name = spec.name.clone().unwrap_or_else(|| "<unnamed>".to_owned());
     let audit_repo = spec.repo.clone();
+    // `audit_err!` uses `warn!`, not `error!`: admin errors are
+    // routinely user-driven (collisions, bad image refs) and
+    // shouldn't fire pager rules. The mapped HTTP status carries
+    // severity.
     match state.controller.deploy_app(spec).await {
         Ok(view) => {
-            info!(
-                target: "bugpot::audit",
-                action = "register",
-                peer = %peer.ip(),
-                app = %audit_name,
-                repo = %audit_repo,
-                status = "ok",
-            );
+            audit_ok!("register", peer, audit_name, repo = %audit_repo);
             Ok((StatusCode::CREATED, Json(view)))
         }
         Err(e) => {
-            // `warn!` (not `error!`): admin errors are routinely user-
-            // driven (collisions, bad image refs) and shouldn't fire
-            // pager rules. The mapped HTTP status carries severity.
-            warn!(
-                target: "bugpot::audit",
-                action = "register",
-                peer = %peer.ip(),
-                app = %audit_name,
-                repo = %audit_repo,
-                status = "error",
-                error = %e,
-            );
+            audit_err!("register", peer, audit_name, e, repo = %audit_repo);
             Err(e.into())
         }
     }
@@ -407,26 +429,11 @@ where
         .ok_or_else(|| app_not_found(&name))?;
     match state.controller.update_app(&handle, spec).await {
         Ok(view) => {
-            info!(
-                target: "bugpot::audit",
-                action = "update",
-                peer = %peer.ip(),
-                app = %name,
-                repo = %audit_repo,
-                status = "ok",
-            );
+            audit_ok!("update", peer, name, repo = %audit_repo);
             Ok(Json(view))
         }
         Err(e) => {
-            warn!(
-                target: "bugpot::audit",
-                action = "update",
-                peer = %peer.ip(),
-                app = %name,
-                repo = %audit_repo,
-                status = "error",
-                error = %e,
-            );
+            audit_err!("update", peer, name, e, repo = %audit_repo);
             Err(e.into())
         }
     }
@@ -451,26 +458,11 @@ where
     let audit_tag = body.tag.clone();
     match state.controller.set_rollout(&handle, body.tag).await {
         Ok(rollout) => {
-            info!(
-                target: "bugpot::audit",
-                action = "rollout",
-                peer = %peer.ip(),
-                app = %name,
-                tag = %audit_tag,
-                status = "ok",
-            );
+            audit_ok!("rollout", peer, name, tag = %audit_tag);
             Ok((StatusCode::CREATED, Json(rollout)))
         }
         Err(e) => {
-            warn!(
-                target: "bugpot::audit",
-                action = "rollout",
-                peer = %peer.ip(),
-                app = %name,
-                tag = %audit_tag,
-                status = "error",
-                error = %e,
-            );
+            audit_err!("rollout", peer, name, e, tag = %audit_tag);
             Err(e.into())
         }
     }
@@ -504,25 +496,12 @@ where
     E: EgressOps,
 {
     let Some(handle) = state.controller.find_handle(&name).await else {
-        warn!(
-            target: "bugpot::audit",
-            action = "issue_deploy_key",
-            peer = %peer.ip(),
-            app = %name,
-            status = "error",
-            error = "not found",
-        );
+        audit_err!("issue_deploy_key", peer, name, "not found");
         return Err(app_not_found(&name));
     };
     let repo = handle.repo().await;
     let token = state.deploy_secret.derive(&name, &repo);
-    info!(
-        target: "bugpot::audit",
-        action = "issue_deploy_key",
-        peer = %peer.ip(),
-        app = %name,
-        status = "ok",
-    );
+    audit_ok!("issue_deploy_key", peer, name);
     Ok((StatusCode::CREATED, Json(DeployKeyResponse { token })))
 }
 
@@ -542,24 +521,11 @@ where
         .ok_or_else(|| app_not_found(&name))?;
     match state.controller.remove_app(&handle).await {
         Ok(()) => {
-            info!(
-                target: "bugpot::audit",
-                action = "remove",
-                peer = %peer.ip(),
-                app = %name,
-                status = "ok",
-            );
+            audit_ok!("remove", peer, name);
             Ok(StatusCode::NO_CONTENT)
         }
         Err(e) => {
-            warn!(
-                target: "bugpot::audit",
-                action = "remove",
-                peer = %peer.ip(),
-                app = %name,
-                status = "error",
-                error = %e,
-            );
+            audit_err!("remove", peer, name, e);
             Err(e.into())
         }
     }
