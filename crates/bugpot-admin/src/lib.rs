@@ -64,7 +64,11 @@ use axum::{
     routing::{get, post},
 };
 use bugpot_config::{AppSpec, Rollout};
-use bugpot_controller::{AppHandle, AppView, DeployError, RemoveError, RolloutError, UpdateError};
+use bugpot_controller::{
+    AppController, AppHandle, AppView, DeployError, RemoveError, RolloutError, UpdateError,
+};
+use bugpot_egress::Egress;
+use bugpot_runtime::Runtime;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use tower::ServiceBuilder;
@@ -72,9 +76,6 @@ use tower::limit::RateLimitLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tracing::{info, warn};
 use zeroize::Zeroizing;
-
-pub mod backend;
-pub use backend::AdminBackend;
 
 pub mod deploy_key;
 pub use deploy_key::DeployKeySecret;
@@ -168,21 +169,22 @@ impl AdminAuth {
 /// Bundling these together lets one merged router cover both auth
 /// scopes (admin token + deploy token) without the State-type
 /// juggling that arises from per-route `.with_state(...)`.
-#[derive(Clone)]
+/// The fully-resolved controller type the admin layer talks to.
+///
+/// The Linux production stack only has one `Runtime` / `Egress` pair,
+/// so spelling them out here avoids the `<R, E>` noise that used to
+/// follow every handler signature — without resorting to a `dyn`
+/// abstraction that no caller swaps. The `AppController`'s own
+/// parameterisation stays in place for controller-side tests
+/// (the mocks live in that crate); this crate just commits to the
+/// one shape it actually deploys with.
+type Controller = AppController<Runtime, Egress>;
+
+#[derive(Clone, Debug)]
 pub struct AdminState {
-    pub controller: Arc<dyn AdminBackend>,
+    pub controller: Arc<Controller>,
     pub admin_auth: Arc<AdminAuth>,
     pub deploy_secret: Arc<DeployKeySecret>,
-}
-
-impl std::fmt::Debug for AdminState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AdminState")
-            .field("admin_auth", &self.admin_auth)
-            .field("deploy_secret", &"<redacted>")
-            .field("controller", &"<dyn AdminBackend>")
-            .finish()
-    }
 }
 
 async fn require_admin_token(
@@ -234,7 +236,7 @@ async fn require_deploy_token(
 /// Bind the admin API at `addr` and serve until the future is dropped.
 pub async fn serve(
     addr: SocketAddr,
-    controller: Arc<dyn AdminBackend>,
+    controller: Arc<Controller>,
     admin_auth: Arc<AdminAuth>,
     deploy_secret: Arc<DeployKeySecret>,
 ) -> anyhow::Result<()> {
