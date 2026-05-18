@@ -36,21 +36,21 @@ pub(crate) const MAX_ROLLOUT_HISTORY: usize = 2;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Slot {
     A,
-    // `B` is unconstructed today because the only path that would
-    // produce it is the blue-green rollover (a future PR). The
-    // suppression is intentional: keeping the enum binary now means
-    // every container ID / netns / bundle path is already
-    // slot-suffixed, so flipping the rollout to a real two-slot
-    // alternation is a small set of call-site edits, not a
-    // workspace-wide rename.
-    #[allow(
-        dead_code,
-        reason = "constructed only by blue-green rollover (future PR)"
-    )]
     B,
 }
 
 impl Slot {
+    /// The opposite slot — the target of a blue-green rollover.
+    /// `set_rollout` picks `current_slot.other()` for the new
+    /// container so the two slots never collide on libcontainer state,
+    /// netns name, or veth pair.
+    pub(crate) const fn other(self) -> Self {
+        match self {
+            Self::A => Self::B,
+            Self::B => Self::A,
+        }
+    }
+
     /// Stable single-char rendering for use in container IDs and
     /// netns / veth names: `'a'` or `'b'`.
     pub(crate) const fn as_char(self) -> char {
@@ -207,6 +207,20 @@ pub(crate) enum AppState {
     Frozen {
         container_ip: Ipv4Addr,
     },
+    /// Blue-green rollover in flight. The *from* container in
+    /// `HandleInner::current_slot` is still serving traffic at
+    /// `from_ip`; a new container in `current_slot.other()` is being
+    /// built, started, and readiness-probed in the background.
+    /// `set_rollout` atomically flips this to `Running { new_ip }`
+    /// (advancing `current_slot`) once readiness passes, drains
+    /// in-flight upgrades, and tears the old slot down. On readiness
+    /// failure, state restores to `Running { from_ip }` (no
+    /// `current_slot` change) so the old container keeps serving.
+    /// The resolver path is unaffected — `claim_start_slot` returns
+    /// `StartClaim::Ready(from_ip)` until the switch lands.
+    RollingOver {
+        from_ip: Ipv4Addr,
+    },
     Stopping,
 }
 
@@ -253,6 +267,33 @@ pub(crate) enum StartClaim {
 }
 
 impl HandleInner {
+    /// Container IDs of every container instance currently bound to
+    /// this handle. Empty on `Stopped`; single-element on
+    /// `Starting` / `Running` / `Frozen` / `Stopping` (just
+    /// `current_slot`); both slots on `RollingOver` (current + the
+    /// in-flight target).
+    ///
+    /// This is the **single source of truth** for "which container
+    /// IDs is bugpot responsible for right now". Teardown call sites
+    /// (`stop`, `remove_app`, shutdown sweep) consume this list
+    /// rather than doing their own slot-arithmetic — the
+    /// state→slots mapping lives here so adding a hypothetical
+    /// third state with two containers is a one-line edit, not a
+    /// workspace-wide grep.
+    pub(crate) fn live_container_ids(&self, app_name: &str) -> Vec<String> {
+        match self.state {
+            AppState::Stopped => Vec::new(),
+            AppState::Starting { .. }
+            | AppState::Running { .. }
+            | AppState::Frozen { .. }
+            | AppState::Stopping => vec![container_id(app_name, self.current_slot)],
+            AppState::RollingOver { .. } => vec![
+                container_id(app_name, self.current_slot),
+                container_id(app_name, self.current_slot.other()),
+            ],
+        }
+    }
+
     /// Bump `last_access` and decide what the caller should do based
     /// on the current state. On `Stopped` / `Frozen` this *transitions*
     /// the handle into `Starting`, atomically reserving the slot —
@@ -262,6 +303,14 @@ impl HandleInner {
         self.last_access = Instant::now();
         match &self.state {
             AppState::Running { container_ip } => StartClaim::Ready(*container_ip),
+            // Blue-green rollover in flight: the *from* container is
+            // still serving, so resolver requests get `Ready(from_ip)`
+            // and hit the old slot. The switch handler in
+            // `set_rollout` flips `state` to `Running { new_ip }`
+            // once readiness passes; no notify-waiters dance because
+            // resolver readers never block here — they just observe
+            // whichever IP is current on their next call.
+            AppState::RollingOver { from_ip } => StartClaim::Ready(*from_ip),
             AppState::Starting { notify } => StartClaim::Coalesce(notify.clone()),
             AppState::Stopping => StartClaim::WaitForStopping,
             AppState::Stopped => {
@@ -310,22 +359,30 @@ impl AppState {
         matches!(self, Self::Frozen { .. })
     }
 
-    /// Mid-transition (`Starting` or `Stopping`). Callers that need a
-    /// settled state typically return a 409-style "retry later"
-    /// rather than blocking.
+    /// Mid-transition: `Starting`, `Stopping`, or `RollingOver`.
+    /// Callers that need a settled state typically return a 409-style
+    /// "retry later" rather than blocking. `RollingOver` counts: a
+    /// second rollout request mid-flight conflicts with the first
+    /// even though traffic is still flowing.
     pub(crate) const fn is_busy(&self) -> bool {
-        matches!(self, Self::Starting { .. } | Self::Stopping)
+        matches!(
+            self,
+            Self::Starting { .. } | Self::Stopping | Self::RollingOver { .. }
+        )
     }
 
-    /// There is (or is about to be) a container associated with this
-    /// handle that bugpot is responsible for tearing down. Covers the
-    /// three variants whose teardown actually frees resources:
-    /// `Running`, `Frozen`, and `Starting` (a cold start in flight
-    /// must be interrupted).
+    /// There is (or is about to be) at least one container associated
+    /// with this handle that bugpot is responsible for tearing down.
+    /// Covers `Running`, `Frozen`, `Starting` (a cold start in flight
+    /// must be interrupted), and `RollingOver` (two containers exist;
+    /// both need tearing down).
     pub(crate) const fn needs_teardown(&self) -> bool {
         matches!(
             self,
-            Self::Running { .. } | Self::Frozen { .. } | Self::Starting { .. }
+            Self::Running { .. }
+                | Self::Frozen { .. }
+                | Self::Starting { .. }
+                | Self::RollingOver { .. }
         )
     }
 }

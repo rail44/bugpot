@@ -104,20 +104,29 @@ pub trait RuntimeOps: Send + Sync + std::fmt::Debug + 'static {
     /// daemon process).
     fn is_container_paused(&self, name: &str) -> bool;
     fn resource_usage(&self, name: &str) -> Option<ResourceUsage>;
-    /// Reap a leftover container whose `AppSpec` is no longer registered
-    /// (TOML deleted while bugpot was down). Stops and removes
-    /// libcontainer state if it exists, deletes the bundle dir, and
-    /// tears down app-level assets (log-tail tasks, volume dirs)
-    /// inferred from `container_id` by stripping the trailing
-    /// `-a` / `-b` slot suffix. The per-app log *directory* is
-    /// intentionally left on disk — operators may want to read it
-    /// post-mortem.
+    /// Reap a leftover container's bundle dir + libcontainer state.
+    /// Idempotent: no-op when nothing exists for `container_id`.
     ///
-    /// Idempotent: returns Ok when nothing exists for `container_id`.
-    fn cleanup_orphan_container(
-        &self,
-        container_id: &str,
-    ) -> impl Future<Output = Result<()>> + Send;
+    /// **Container-level only.** Does **not** touch log-tail tasks or
+    /// the volume host dir — those are app-level concerns shared
+    /// across blue-green slots, and the runtime crate intentionally
+    /// stays slot-naming-unaware. Callers that own an app removal
+    /// pair this with [`cleanup_app_assets`](Self::cleanup_app_assets);
+    /// the startup orphan sweep, which only knows a discovered
+    /// `container_id`, leaves app-level state alone (documented
+    /// volume-leak window for "app removed while bugpot was down").
+    fn cleanup_container(&self, container_id: &str) -> impl Future<Output = Result<()>> + Send;
+
+    /// Reap app-level assets owned by the runtime: the inotify
+    /// log-tail tasks and the per-app volume directory tree. The
+    /// per-app **log directory** is intentionally retained on disk
+    /// (operators may want it post-mortem).
+    ///
+    /// Called by app removal once every slot's
+    /// [`cleanup_container`](Self::cleanup_container) has run. Not
+    /// called from the startup orphan sweep, which only has a
+    /// `container_id` and no reliable way to derive the owning app.
+    fn cleanup_app_assets(&self, app_name: &str) -> impl Future<Output = Result<()>> + Send;
 
     // ----- log forwarding ----------------------------------------------------
 
@@ -490,37 +499,7 @@ impl RuntimeOps for Runtime {
     }
 
     #[allow(clippy::unused_async)]
-    async fn cleanup_orphan_container(&self, container_id: &str) -> Result<()> {
-        // App name is `container_id` with the `-a` / `-b` slot suffix
-        // stripped. Pre-PR1 orphans (no slot suffix) collapse to
-        // `container_id`. The only ambiguous case is an app whose
-        // name itself ends in `-a` / `-b` and has a pre-PR1 orphan:
-        // we'd strip the suffix and clean an unrelated app's volumes
-        // by mistake. That's a narrow migration-window-only edge
-        // case; the documented mitigation is "delete the orphan
-        // netns before upgrading".
-        let app_name = strip_slot_suffix(container_id);
-
-        // Abort the inotify-tailing tasks first; the log files are
-        // kept around for post-mortem (CLAUDE.md L333) so the kernel
-        // wouldn't otherwise close the watches and the tasks would
-        // sit on them forever. No-op when the app was registered but
-        // never started.
-        //
-        // The `.remove()` is hoisted out of the `if let` scrutinee so
-        // the `MutexGuard` drops before we iterate — keeps the lock
-        // window to a single hash-map operation.
-        let aborted = self
-            .log_tails
-            .lock()
-            .expect("log_tails mutex poisoned")
-            .remove(app_name);
-        if let Some(handles) = aborted {
-            for h in handles {
-                h.abort();
-            }
-        }
-
+    async fn cleanup_container(&self, container_id: &str) -> Result<()> {
         let container_root = self.containers_dir.join(container_id);
         if container_root.exists() {
             match Container::load(container_root.clone()) {
@@ -543,11 +522,33 @@ impl RuntimeOps for Runtime {
         if bundle_dir.exists() {
             fs::remove_dir_all(&bundle_dir).map_err(|e| RuntimeError::io(&bundle_dir, e))?;
         }
+        Ok(())
+    }
+
+    #[allow(clippy::unused_async)]
+    async fn cleanup_app_assets(&self, app_name: &str) -> Result<()> {
+        // Abort the inotify-tailing tasks. The log files are kept
+        // around for post-mortem (CLAUDE.md L333) so the kernel
+        // wouldn't otherwise close the watches and the tasks would
+        // sit on them forever. No-op when the app was registered but
+        // never started.
+        //
+        // `.remove()` is hoisted out of the `if let` scrutinee so the
+        // `MutexGuard` drops before we iterate — keeps the lock
+        // window to a single hash-map operation.
+        let aborted = self
+            .log_tails
+            .lock()
+            .expect("log_tails mutex poisoned")
+            .remove(app_name);
+        if let Some(handles) = aborted {
+            for h in handles {
+                h.abort();
+            }
+        }
         // Volume dirs are part of the "explicit remove" path: their
-        // whole purpose is surviving freezes / rollouts, so only an
-        // operator-initiated remove (or an orphan whose TOML has
-        // disappeared) should wipe them. The log dir is intentionally
-        // left alone — operators may want post-mortem access.
+        // whole purpose is surviving freezes / rollouts / slot flips,
+        // so only an operator-initiated remove wipes them.
         remove_volume_dirs(&self.volumes_dir, app_name)?;
         Ok(())
     }
@@ -640,16 +641,6 @@ impl Runtime {
 struct ContainerLogFiles {
     stdout: OwnedFd,
     stderr: OwnedFd,
-}
-
-/// Strip a trailing `-a` / `-b` slot suffix from `container_id` to
-/// recover the app name. Pre-PR1 container IDs (no suffix) pass
-/// through unchanged.
-fn strip_slot_suffix(container_id: &str) -> &str {
-    container_id
-        .strip_suffix("-a")
-        .or_else(|| container_id.strip_suffix("-b"))
-        .unwrap_or(container_id)
 }
 
 /// Open `path` for appending, creating it if missing, and return the

@@ -181,30 +181,37 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
 
     async fn do_remove(&self, handle: &Arc<AppHandle>) -> Result<()> {
         let name = handle.name();
-        let container_id = handle.current_id().await;
+        // Snapshot the live containers *before* `stop()` flips state
+        // to Stopping (after which `live_container_ids` would shrink
+        // to just the current slot and we'd lose a mid-rollover
+        // off-slot bundle to leak).
+        let live_ids = handle.inner.lock().await.live_container_ids(name);
         self.registry.remove(name, handle.subdomain()).await;
         gauge!("bugpot_apps_active").decrement(1.0);
         if let Err(e) = self.stop(handle).await {
             warn!(app = %name, error = ?e, "stop failed during remove");
         }
-        // `stop()` only kills the container — it leaves the bundle dir
-        // and the per-app volume tree on disk. `cleanup_orphan_container`
-        // is what knows how to reclaim those (it's also the entry
-        // point for the startup orphan sweep), so route through it
-        // here too. Otherwise persistent-volume apps leak data on
-        // DELETE — the volume dir survives until the operator runs a
-        // restart-with-missing-TOML cycle.
-        //
-        // We pass the *current* slot's container ID; the runtime
-        // strips the slot suffix to derive the app name for app-level
-        // assets (log tails, volume dir). The opposite slot's bundle
-        // dir, when it exists post-rollover, is cleaned synchronously
-        // by `set_rollout`'s teardown — not by this path.
-        if let Err(e) = self.runtime.cleanup_orphan_container(&container_id).await {
+        // Per-container teardown: bundle dir + libcontainer state for
+        // every slot that had live state at remove time. `stop()`
+        // already killed the processes; this reclaims their on-disk
+        // bookkeeping.
+        for cid in &live_ids {
+            if let Err(e) = self.runtime.cleanup_container(cid).await {
+                warn!(
+                    app = %name,
+                    container = %cid,
+                    error = ?e,
+                    "cleanup_container failed during remove; bundle dir may leak",
+                );
+            }
+        }
+        // App-level: log-tail tasks + the volume host dir. Once per
+        // remove, regardless of slot count.
+        if let Err(e) = self.runtime.cleanup_app_assets(name).await {
             warn!(
                 app = %name,
                 error = ?e,
-                "cleanup_orphan_container failed during remove; bundle / volume dir may leak",
+                "cleanup_app_assets failed during remove; volume dir may leak",
             );
         }
         self.store.remove(name).await;

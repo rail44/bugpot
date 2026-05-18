@@ -11,7 +11,7 @@ use metrics::counter;
 use tracing::{info, warn};
 
 use crate::AppHost;
-use crate::handle::AppState;
+use crate::handle::{AppState, Slot, container_id};
 
 impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
     /// Reattach to containers that survived a previous bugpot process.
@@ -33,76 +33,136 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
         }
         for handle in self.list_handles().await {
             let name = &handle.identity.name;
-            // Slot is initialised to A in `make_handle*`. A previous
-            // bugpot's surviving container is reattached to slot A
-            // even if it crashed mid-rollover — blue-green's "kill
-            // both and redo the rollout" recovery semantic means we
-            // don't try to reconstruct which slot was the
-            // *from* side. Pre-PR1 containers (named without a slot
-            // suffix) fall through to the orphan-cleanup pass below
-            // because their `bugpot-<name>` netns won't match the
-            // `bugpot-<name>-a` we look for here.
-            let container_id = handle.current_id().await;
-            // Either Running or Paused (= frozen across the daemon
-            // restart) counts as a live container worth reattaching to.
-            // libcontainer persists `ContainerStatus::Paused` on disk
-            // and the cgroup freezer state is kernel-side, so a frozen
-            // container survives a bugpot crash transparently.
-            let is_paused = self.runtime.is_container_paused(&container_id);
-            if !self.runtime.is_container_running(&container_id) && !is_paused {
+            // Inspect both slots' on-disk libcontainer state. A
+            // post-PR1 app has its live container under either
+            // `name-a` or `name-b` (last successful rollover wins);
+            // an app crashed mid-rollover has *both* slots present.
+            let live_a = self.is_live_slot(name, Slot::A);
+            let live_b = self.is_live_slot(name, Slot::B);
+
+            let resolved = match (live_a, live_b) {
+                (None, None) => continue,
+                (Some(state), None) => Some((Slot::A, state)),
+                (None, Some(state)) => Some((Slot::B, state)),
+                (Some(_), Some(_)) => {
+                    // Mid-rollover crash. Per the agreed recovery
+                    // semantic we kill both and let the next request
+                    // redo the rollout from Stopped; the new tag is
+                    // already persisted by the prior `set_rollout`,
+                    // so cold-start picks it up.
+                    warn!(
+                        app = %name,
+                        "both slots present at reattach — mid-rollover crash, killing both",
+                    );
+                    self.purge_both_slots(name, claims).await;
+                    None
+                }
+            };
+
+            let Some((slot, is_paused)) = resolved else {
                 continue;
-            }
-            let Some(container_ip) = claims.claim(&container_id) else {
+            };
+            let live_id = container_id(name, slot);
+            let Some(ip) = claims.claim(&live_id) else {
                 warn!(
                     app = %name,
-                    container = %container_id,
-                    "container is running but no netns IP was discovered; \
-                     leaving as Stopped — next request will cold-start"
+                    container = %live_id,
+                    "container alive but no netns IP discovered; leaving as Stopped",
                 );
                 continue;
             };
-            let allowlist = handle.spec.read().await.egress.allow.clone();
-            match self
-                .egress
-                .reattach_endpoint(&container_id, container_ip, allowlist)
-                .await
+            self.reattach_one(&handle, slot, &live_id, ip, is_paused)
+                .await;
+        }
+    }
+
+    /// Probe one slot. Returns:
+    /// - `Some(true)`: container is paused (= frozen across restart).
+    /// - `Some(false)`: container is running.
+    /// - `None`: no container in this slot.
+    ///
+    /// Encapsulates the "running or paused" disjunction so
+    /// `reattach_running` reads as a flat decision tree.
+    fn is_live_slot(&self, app_name: &str, slot: Slot) -> Option<bool> {
+        let cid = container_id(app_name, slot);
+        if self.runtime.is_container_paused(&cid) {
+            Some(true)
+        } else if self.runtime.is_container_running(&cid) {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    /// Tear down both slots' containers and their netns when reattach
+    /// detects a mid-rollover crash. Endpoints are drained from
+    /// `claims` here so the subsequent `cleanup_orphans` pass doesn't
+    /// also try to handle them (it would, harmlessly — but the log
+    /// noise of "orphan cleaned" twice per app is worth avoiding).
+    async fn purge_both_slots(&self, app_name: &str, claims: &mut StartupClaims) {
+        for slot in [Slot::A, Slot::B] {
+            let cid = container_id(app_name, slot);
+            if let Err(e) = self.runtime.cleanup_container(&cid).await {
+                warn!(app = %app_name, container = %cid, error = ?e, "purge: cleanup_container");
+            }
+            if let Some(ip) = claims.claim(&cid)
+                && let Err(e) = self.egress.cleanup_orphan_endpoint(&cid, ip).await
             {
-                Ok(ep) => {
-                    {
-                        let mut inner = handle.inner.lock().await;
-                        inner.state = if is_paused {
-                            AppState::Frozen {
-                                container_ip: ep.container_ip,
-                            }
-                        } else {
-                            AppState::Running {
-                                container_ip: ep.container_ip,
-                            }
-                        };
-                        inner.last_access = Instant::now();
-                    }
-                    // The previous bugpot's tail tasks died with it.
-                    // Spawn fresh ones so the new process's tracing
-                    // pipeline (and `just logs`) keeps showing app
-                    // output. Log files are keyed by app name (not
-                    // container ID): both slots share a destination
-                    // so post-mortem retention isn't fragmented across
-                    // rollovers. The tail opens at the start of the
-                    // file, so bytes the app wrote during the
-                    // interregnum replay through tracing once
-                    // (bounded by `MAX_LOG_BYTES`).
-                    self.runtime.ensure_log_tails(name);
-                    info!(
-                        app = %name,
-                        container = %container_id,
-                        container_ip = %ep.container_ip,
-                        kind = if is_paused { "frozen" } else { "running" },
-                        "reattached to surviving container",
-                    );
+                warn!(app = %app_name, container = %cid, error = ?e, "purge: cleanup_orphan_endpoint");
+            }
+        }
+    }
+
+    /// Wire a single surviving container back into the in-memory
+    /// state machine: egress re-registration, `state` /
+    /// `current_slot` / `last_access` restoration, log-tail spawn.
+    async fn reattach_one(
+        &self,
+        handle: &crate::handle::AppHandle,
+        slot: Slot,
+        live_id: &str,
+        container_ip: std::net::Ipv4Addr,
+        is_paused: bool,
+    ) {
+        let name = &handle.identity.name;
+        let allowlist = handle.spec.read().await.egress.allow.clone();
+        match self
+            .egress
+            .reattach_endpoint(live_id, container_ip, allowlist)
+            .await
+        {
+            Ok(ep) => {
+                {
+                    let mut inner = handle.inner.lock().await;
+                    inner.current_slot = slot;
+                    inner.state = if is_paused {
+                        AppState::Frozen {
+                            container_ip: ep.container_ip,
+                        }
+                    } else {
+                        AppState::Running {
+                            container_ip: ep.container_ip,
+                        }
+                    };
+                    inner.last_access = Instant::now();
                 }
-                Err(e) => {
-                    warn!(app = %name, error = ?e, "reattach failed; leaving as Stopped");
-                }
+                // Log tails are keyed by app name (shared across
+                // slots so post-mortem retention isn't fragmented
+                // across rollovers). Tail opens at file start, so
+                // bytes written during the interregnum replay once,
+                // bounded by `MAX_LOG_BYTES`.
+                self.runtime.ensure_log_tails(name);
+                info!(
+                    app = %name,
+                    container = %live_id,
+                    container_ip = %ep.container_ip,
+                    slot = %slot.as_char(),
+                    kind = if is_paused { "frozen" } else { "running" },
+                    "reattached to surviving container",
+                );
+            }
+            Err(e) => {
+                warn!(app = %name, error = ?e, "reattach failed; leaving as Stopped");
             }
         }
     }
@@ -121,13 +181,24 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
     /// Called once at startup after `reattach_running`. Safe to call
     /// when there are no orphans (no-op).
     pub async fn cleanup_orphans(&self, claims: StartupClaims) {
-        for (name, ip) in claims.drain() {
-            info!(app = %name, %ip, "cleaning up orphan: TOML no longer present");
-            if let Err(e) = self.runtime.cleanup_orphan_container(&name).await {
-                warn!(app = %name, error = ?e, "cleanup orphan container failed");
+        // `name` here is whatever the egress layer discovered as a
+        // netns suffix — a container ID. We have no reliable way to
+        // recover the owning app name (the TOML is gone), so we
+        // intentionally call only `cleanup_container`, not
+        // `cleanup_app_assets`. The volume dir for the gone app
+        // therefore lingers on disk; documented as a known
+        // limitation for the rare "app removed while bugpot was down"
+        // case (the operator can `rm -rf` the orphan volume dir by
+        // hand). The alternative — strip a slot suffix to *guess* the
+        // app name — used to bleed the slot convention into
+        // bugpot-runtime, which we explicitly avoid.
+        for (container_id, ip) in claims.drain() {
+            info!(container = %container_id, %ip, "cleaning up orphan: TOML no longer present");
+            if let Err(e) = self.runtime.cleanup_container(&container_id).await {
+                warn!(container = %container_id, error = ?e, "cleanup orphan container failed");
             }
-            if let Err(e) = self.egress.cleanup_orphan_endpoint(&name, ip).await {
-                warn!(app = %name, error = ?e, "cleanup orphan endpoint failed");
+            if let Err(e) = self.egress.cleanup_orphan_endpoint(&container_id, ip).await {
+                warn!(container = %container_id, error = ?e, "cleanup orphan endpoint failed");
             }
             counter!("bugpot_orphan_cleanups_total").increment(1);
         }

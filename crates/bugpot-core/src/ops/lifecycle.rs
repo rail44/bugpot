@@ -139,7 +139,11 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
 
     /// Form `repo:tag` for the cold start. Errors when the app has
     /// no rollout — there is no tag to pull.
-    async fn resolve_image_ref(&self, handle: &AppHandle, spec: &AppSpec) -> Result<String> {
+    pub(super) async fn resolve_image_ref(
+        &self,
+        handle: &AppHandle,
+        spec: &AppSpec,
+    ) -> Result<String> {
         let name = &handle.identity.name;
         let tag = handle
             .inner
@@ -156,7 +160,7 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
     /// allowlist slot from `bugpot-egress`. Keyed by the slot-suffixed
     /// `container_id` so blue-green rollovers can hold two endpoints
     /// for the same app simultaneously.
-    async fn allocate_endpoint_phase(
+    pub(super) async fn allocate_endpoint_phase(
         &self,
         container_id: &str,
         spec: &AppSpec,
@@ -173,7 +177,7 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
     /// Phase 2: pull, pinning to the cached digest if one was
     /// resolved on a previous start of this handle, then write the
     /// resolved digest back to the cache the first time.
-    async fn pull_image_phase(
+    pub(super) async fn pull_image_phase(
         &self,
         handle: &AppHandle,
         spec: &AppSpec,
@@ -219,7 +223,7 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
     }
 
     /// Phase 3: hand off to libcontainer.
-    async fn start_container_phase(
+    pub(super) async fn start_container_phase(
         &self,
         container_id: &str,
         spec: &AppSpec,
@@ -239,7 +243,7 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
     /// or the per-app `readiness.timeout` fires. Without this, the
     /// first proxied request would race ahead of the process's
     /// listener.
-    async fn readiness_phase(
+    pub(super) async fn readiness_phase(
         &self,
         name: &str,
         container_ip: Ipv4Addr,
@@ -313,33 +317,46 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
     }
 
     pub(crate) async fn stop(&self, handle: &Arc<AppHandle>) -> Result<()> {
-        {
+        // Snapshot the live container IDs in the same critical section
+        // as the state transition: by the time the teardown awaits
+        // run, state == Stopping and the handle's `live_container_ids`
+        // would return only the current slot, losing the mid-rollover
+        // off-slot. The snapshot is the authoritative input downstream.
+        let ids = {
             let mut inner = handle.inner.lock().await;
             if !inner.state.needs_teardown() {
                 return Ok(());
             }
+            let ids = inner.live_container_ids(&handle.identity.name);
             inner.state = AppState::Stopping;
-        }
-        let res = self.do_stop(handle).await;
-        let mut inner = handle.inner.lock().await;
-        inner.state = AppState::Stopped;
-        // Drop the CPU baseline so the next start of this app begins
-        // from 0 rather than the (now-stale) last sample.
-        inner.cpu_baseline = 0;
-        res
-    }
-
-    async fn do_stop(&self, handle: &AppHandle) -> Result<()> {
-        let name = &handle.identity.name;
-        let container_id = handle.current_id().await;
-        info!(app = %name, "stopping");
-        if let Err(e) = self.runtime.stop_app(&container_id).await {
-            warn!(app = %name, error = %e, "stop_app failed");
-        }
-        if let Err(e) = self.egress.release_endpoint(&container_id).await {
-            warn!(app = %name, error = %e, "release_endpoint failed");
+            ids
+        };
+        info!(app = %handle.identity.name, "stopping");
+        self.teardown_containers(&handle.identity.name, &ids).await;
+        {
+            let mut inner = handle.inner.lock().await;
+            inner.state = AppState::Stopped;
+            // Drop the CPU baseline so the next start of this app
+            // begins from 0 rather than the (now-stale) last sample.
+            inner.cpu_baseline = 0;
         }
         Ok(())
+    }
+
+    /// Tear down a snapshotted list of live containers. `name` is for
+    /// log context; per-`cid` `stop_app` + `release_endpoint` are
+    /// run sequentially and errors are logged rather than surfaced
+    /// because both layers are idempotent and a single-slot failure
+    /// must not block the others.
+    pub(super) async fn teardown_containers(&self, name: &str, ids: &[String]) {
+        for cid in ids {
+            if let Err(e) = self.runtime.stop_app(cid).await {
+                warn!(app = %name, container = %cid, error = %e, "stop_app failed");
+            }
+            if let Err(e) = self.egress.release_endpoint(cid).await {
+                warn!(app = %name, container = %cid, error = %e, "release_endpoint failed");
+            }
+        }
     }
 }
 

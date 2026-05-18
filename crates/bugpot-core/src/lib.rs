@@ -169,7 +169,7 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handle::{AppState, DigestCache};
+    use crate::handle::{AppState, DigestCache, Slot};
     use crate::ops::lifecycle::digest_pinned_ref;
     use std::collections::VecDeque;
     use std::path::{Path, PathBuf};
@@ -193,6 +193,9 @@ mod tests {
     impl MockRuntime {
         fn push_pull(&self, r: std::result::Result<ImageId, RuntimeError>) {
             self.pull_results.lock().unwrap().push_back(r);
+        }
+        fn push_start(&self, r: std::result::Result<RunningApp, RuntimeError>) {
+            self.start_results.lock().unwrap().push_back(r);
         }
         fn set_running(&self, app: &str, value: bool) {
             self.running.lock().unwrap().insert(app.to_owned(), value);
@@ -270,11 +273,19 @@ mod tests {
             None
         }
 
-        async fn cleanup_orphan_container(
+        async fn cleanup_container(
             &self,
-            name: &str,
+            container_id: &str,
         ) -> std::result::Result<(), RuntimeError> {
-            self.record(format!("cleanup_orphan_container({name})"));
+            self.record(format!("cleanup_container({container_id})"));
+            Ok(())
+        }
+
+        async fn cleanup_app_assets(
+            &self,
+            app_name: &str,
+        ) -> std::result::Result<(), RuntimeError> {
+            self.record(format!("cleanup_app_assets({app_name})"));
             Ok(())
         }
 
@@ -843,16 +854,14 @@ mod tests {
         let rt_calls = controller.runtime.calls();
         let eg_calls = controller.egress.calls();
         assert!(
-            !rt_calls
-                .iter()
-                .any(|c| c == "cleanup_orphan_container(alpha-a)"),
+            !rt_calls.iter().any(|c| c == "cleanup_container(alpha-a)"),
             "reattached alpha must not be cleaned as orphan; rt_calls={rt_calls:?}"
         );
         // beta was orphaned.
         let beta_runtime_idx = rt_calls
             .iter()
-            .position(|c| c == "cleanup_orphan_container(beta-a)")
-            .expect("expected cleanup_orphan_container(beta-a)");
+            .position(|c| c == "cleanup_container(beta-a)")
+            .expect("expected cleanup_container(beta-a)");
         let beta_egress_idx = eg_calls
             .iter()
             .position(|c| c == "cleanup_orphan_endpoint(beta-a,10.0.0.9)")
@@ -1101,13 +1110,391 @@ mod tests {
         );
     }
 
-    /// `DELETE /apps/<name>` (which lands in `remove_app`) must also
-    /// route through the runtime's `cleanup_orphan_container` so the
-    /// bundle dir + per-app volume tree are reclaimed — otherwise
-    /// persistent-volume apps leak data on every remove, surfaced as
-    /// "stale `/var/lib/bugpot/volumes/<name>/`" weeks later.
+    /// `DELETE /apps/<name>` against a running app must route through
+    /// both runtime cleanup methods: `cleanup_container` (once per
+    /// slot that had live state) for the bundle dir + libcontainer
+    /// state, and `cleanup_app_assets` (once for the app) for the
+    /// log-tail tasks + volume tree. Either omission leaks disk state
+    /// on every remove.
     #[tokio::test]
-    async fn remove_app_runs_cleanup_orphan_container() {
+    async fn remove_app_runs_runtime_cleanup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let controller =
+            make_controller(vec![stored_with_name("alpha", "v1")], tmp.path().to_owned());
+
+        let handle = controller
+            .find_handle("alpha")
+            .await
+            .expect("handle present");
+        // Force into Running so `live_container_ids` reports the
+        // current-slot bundle as something to clean. Otherwise the
+        // app is Stopped at remove time and there's nothing per-slot
+        // to clean — a legitimate (and tested elsewhere) shape.
+        force_running(&handle).await;
+        controller.remove_app(&handle).await.expect("remove_app");
+
+        let rt_calls = controller.runtime.calls();
+        assert!(
+            rt_calls.iter().any(|c| c == "cleanup_container(alpha-a)"),
+            "remove_app must trigger cleanup_container per live slot; got {rt_calls:?}"
+        );
+        assert!(
+            rt_calls.iter().any(|c| c == "cleanup_app_assets(alpha)"),
+            "remove_app must trigger cleanup_app_assets; got {rt_calls:?}"
+        );
+    }
+
+    /// Blue-green happy path: a Running app accepts a new rollout,
+    /// the new container comes up in the opposite slot, readiness
+    /// passes, the resolver atomically flips to the new IP,
+    /// `current_slot` advances, and the from-slot is torn down.
+    ///
+    /// Readiness is satisfied by a real `127.0.0.1:<port>` TCP
+    /// listener bound in the test — `MockEgress` returns
+    /// `container_ip = LOCALHOST`, so probing that IP on the
+    /// listener's port succeeds without standing up libcontainer.
+    #[tokio::test]
+    async fn blue_green_happy_path_flips_slot_and_tears_down_from() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Bind a listener so the readiness probe (TCP connect to
+        // container_ip:port) actually succeeds.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let mut spec = spec_with_name("alpha");
+        spec.port = port;
+        let stored = (
+            spec,
+            Some(Rollout {
+                tag: "v1".into(),
+                created_at: SystemTime::UNIX_EPOCH,
+            }),
+        );
+        let controller = make_controller(vec![stored], tmp.path().to_owned());
+
+        let handle = controller.find_handle("alpha").await.unwrap();
+        // Force the handle into Running on slot A — the precondition
+        // for blue-green. `current_slot` defaults to A so no field
+        // mutation needed.
+        force_running(&handle).await;
+
+        // Two pull successes: one in `set_rollout` (the explicit
+        // pull), one in `build_to_slot` (the cache-hit re-pull
+        // through `pull_image_phase`). One start success for the
+        // to-slot container.
+        controller
+            .runtime
+            .push_pull(Ok(ImageId::new("sha256:newdigest")));
+        controller
+            .runtime
+            .push_pull(Ok(ImageId::new("sha256:newdigest")));
+        controller.runtime.push_start(Ok(RunningApp {
+            name: "alpha-b".into(),
+            pid: 42,
+            image: ImageId::new("sha256:newdigest"),
+        }));
+
+        let rollout = controller
+            .set_rollout(&handle, "v2".into())
+            .await
+            .expect("blue-green rollout");
+        assert_eq!(rollout.tag, "v2");
+
+        let inner = handle.inner.lock().await;
+        assert!(
+            matches!(inner.state, AppState::Running { .. }),
+            "expected Running after switch, got {:?}",
+            inner.state
+        );
+        assert_eq!(inner.current_slot, Slot::B, "slot must have advanced");
+        drop(inner);
+
+        let rt = controller.runtime.calls();
+        let eg = controller.egress.calls();
+        assert!(
+            eg.iter().any(|c| c == "allocate_endpoint(alpha-b)"),
+            "to-slot endpoint must be allocated; got {eg:?}"
+        );
+        assert!(
+            rt.iter().any(|c| c == "start_app(alpha-b)"),
+            "to-slot container must be started; got {rt:?}"
+        );
+        assert!(
+            rt.iter().any(|c| c == "stop_app(alpha-a)"),
+            "from-slot container must be torn down after switch; got {rt:?}"
+        );
+        assert!(
+            eg.iter().any(|c| c == "release_endpoint(alpha-a)"),
+            "from-slot endpoint must be released; got {eg:?}"
+        );
+        // From-slot teardown must happen *after* the to-slot start
+        // (otherwise the resolver sees a window with no live
+        // container).
+        let start_idx = rt.iter().position(|c| c == "start_app(alpha-b)").unwrap();
+        let stop_idx = rt.iter().position(|c| c == "stop_app(alpha-a)").unwrap();
+        assert!(
+            start_idx < stop_idx,
+            "to-slot start must precede from-slot stop"
+        );
+        drop(listener);
+    }
+
+    /// Blue-green rollback: the new slot's start fails (mock returns
+    /// "no start response queued"), `set_rollout` returns
+    /// `StartFailed`, the from-slot keeps serving, and the partial
+    /// new slot is cleaned up.
+    #[tokio::test]
+    async fn blue_green_rolls_back_on_start_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let controller =
+            make_controller(vec![stored_with_name("alpha", "v1")], tmp.path().to_owned());
+
+        let handle = controller.find_handle("alpha").await.unwrap();
+        let from_ip = Ipv4Addr::new(10, 0, 0, 99);
+        {
+            let mut inner = handle.inner.lock().await;
+            inner.state = AppState::Running {
+                container_ip: from_ip,
+            };
+        }
+
+        // Two pulls succeed; no start response queued so
+        // `start_app` returns Err — build_to_slot fails before
+        // readiness, triggering rollback.
+        controller
+            .runtime
+            .push_pull(Ok(ImageId::new("sha256:newdigest")));
+        controller
+            .runtime
+            .push_pull(Ok(ImageId::new("sha256:newdigest")));
+
+        let err = controller
+            .set_rollout(&handle, "v2".into())
+            .await
+            .expect_err("expected rollback");
+        assert!(matches!(err, RolloutError::StartFailed(_)), "got {err:?}");
+
+        let inner = handle.inner.lock().await;
+        assert!(
+            matches!(inner.state, AppState::Running { container_ip } if container_ip == from_ip),
+            "state must roll back to Running{{from_ip}}, got {:?}",
+            inner.state
+        );
+        assert_eq!(
+            inner.current_slot,
+            Slot::A,
+            "current_slot must not advance on rollback"
+        );
+        drop(inner);
+
+        let rt = controller.runtime.calls();
+        let eg = controller.egress.calls();
+        assert!(
+            rt.iter().any(|c| c == "stop_app(alpha-b)"),
+            "partial new slot must be stopped; got {rt:?}"
+        );
+        assert!(
+            eg.iter().any(|c| c == "release_endpoint(alpha-b)"),
+            "partial new slot endpoint must be released; got {eg:?}"
+        );
+        assert!(
+            !rt.iter().any(|c| c == "stop_app(alpha-a)"),
+            "from-slot must NOT be torn down on rollback; got {rt:?}"
+        );
+    }
+
+    /// A second `set_rollout` arriving while a first is mid-flight
+    /// (handle still in `RollingOver`) returns `Conflict` immediately
+    /// — no second pull, no second container churn.
+    #[tokio::test]
+    async fn set_rollout_during_rolling_over_returns_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let controller =
+            make_controller(vec![stored_with_name("alpha", "v1")], tmp.path().to_owned());
+        let handle = controller.find_handle("alpha").await.unwrap();
+        {
+            let mut inner = handle.inner.lock().await;
+            inner.state = AppState::RollingOver {
+                from_ip: Ipv4Addr::new(10, 0, 0, 1),
+            };
+        }
+
+        let err = controller
+            .set_rollout(&handle, "v2".into())
+            .await
+            .expect_err("expected conflict");
+        assert!(
+            matches!(err, RolloutError::Conflict(ref n) if n == "alpha"),
+            "got {err:?}"
+        );
+
+        // No pull was attempted (the pre-flight conflict check fires
+        // before the pull phase).
+        assert!(
+            !controller
+                .runtime
+                .calls()
+                .iter()
+                .any(|c| c.starts_with("pull_image")),
+            "conflict must short-circuit before any pull",
+        );
+    }
+
+    /// Rollover from `Frozen`: the from-side is thawed first so it
+    /// can serve traffic during the rollover window; then the
+    /// regular blue-green ladder runs.
+    #[tokio::test]
+    async fn rollout_from_frozen_thaws_then_blue_greens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut spec = spec_with_name("alpha");
+        spec.port = port;
+        let stored = (
+            spec,
+            Some(Rollout {
+                tag: "v1".into(),
+                created_at: SystemTime::UNIX_EPOCH,
+            }),
+        );
+        let controller = make_controller(vec![stored], tmp.path().to_owned());
+
+        let handle = controller.find_handle("alpha").await.unwrap();
+        {
+            let mut inner = handle.inner.lock().await;
+            inner.state = AppState::Frozen {
+                container_ip: Ipv4Addr::LOCALHOST,
+            };
+        }
+        controller.runtime.set_paused("alpha-a", true);
+
+        controller
+            .runtime
+            .push_pull(Ok(ImageId::new("sha256:newdigest")));
+        controller
+            .runtime
+            .push_pull(Ok(ImageId::new("sha256:newdigest")));
+        controller.runtime.push_start(Ok(RunningApp {
+            name: "alpha-b".into(),
+            pid: 99,
+            image: ImageId::new("sha256:newdigest"),
+        }));
+
+        controller
+            .set_rollout(&handle, "v2".into())
+            .await
+            .expect("rollout from frozen");
+
+        let rt = controller.runtime.calls();
+        // Thaw must precede any to-slot work.
+        let thaw_idx = rt
+            .iter()
+            .position(|c| c == "unfreeze_app(alpha-a)")
+            .expect("unfreeze_app(alpha-a) must fire before rollover starts");
+        let alloc_idx = controller
+            .egress
+            .calls()
+            .iter()
+            .position(|c| c == "allocate_endpoint(alpha-b)")
+            .expect("to-slot endpoint must be allocated");
+        let _ = (thaw_idx, alloc_idx);
+        // Atomic switch happened.
+        let inner = handle.inner.lock().await;
+        assert_eq!(inner.current_slot, Slot::B);
+        drop(inner);
+        drop(listener);
+    }
+
+    /// Reattach with both slots alive on disk is a mid-rollover
+    /// crash: both are purged and the handle stays Stopped, so the
+    /// next request cold-starts under the new (already-persisted)
+    /// rollout tag.
+    #[tokio::test]
+    async fn reattach_purges_both_slots_on_mid_rollover_crash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let controller =
+            make_controller(vec![stored_with_name("alpha", "v1")], tmp.path().to_owned());
+        // Both slots' libcontainer state would be on-disk if a
+        // rollover crashed; simulate by marking both running on the
+        // mock + supplying both netns in claims.
+        controller.runtime.set_running("alpha-a", true);
+        controller.runtime.set_running("alpha-b", true);
+        let mut claims = claims_with(&[
+            ("alpha-a", Ipv4Addr::new(10, 0, 0, 5)),
+            ("alpha-b", Ipv4Addr::new(10, 0, 0, 6)),
+        ]);
+
+        controller.reattach_running(&mut claims).await;
+
+        // Both slots purged.
+        let rt = controller.runtime.calls();
+        let eg = controller.egress.calls();
+        assert!(
+            rt.iter().any(|c| c == "cleanup_container(alpha-a)"),
+            "from-slot must be purged; got {rt:?}"
+        );
+        assert!(
+            rt.iter().any(|c| c == "cleanup_container(alpha-b)"),
+            "to-slot must be purged; got {rt:?}"
+        );
+        assert!(
+            eg.iter()
+                .any(|c| c == "cleanup_orphan_endpoint(alpha-a,10.0.0.5)"),
+            "from-slot endpoint must be cleaned; got {eg:?}"
+        );
+        assert!(
+            eg.iter()
+                .any(|c| c == "cleanup_orphan_endpoint(alpha-b,10.0.0.6)"),
+            "to-slot endpoint must be cleaned; got {eg:?}"
+        );
+
+        // State must remain Stopped (next request cold-starts).
+        let state = handle_state(&controller, "alpha").await;
+        assert!(
+            matches!(state, AppState::Stopped),
+            "handle must be Stopped after both-slot purge; got {state:?}"
+        );
+    }
+
+    /// Reattach picks the actually-live slot, even when it's `B`
+    /// (i.e. a previous bugpot run had already rolled over to slot
+    /// B). `current_slot` must be restored to match what survived
+    /// on disk; otherwise the next operation would target the wrong
+    /// slot.
+    #[tokio::test]
+    async fn reattach_restores_current_slot_b() {
+        let tmp = tempfile::tempdir().unwrap();
+        let controller =
+            make_controller(vec![stored_with_name("alpha", "v1")], tmp.path().to_owned());
+        controller.runtime.set_running("alpha-b", true);
+        let mut claims = claims_with(&[("alpha-b", Ipv4Addr::new(10, 0, 0, 7))]);
+
+        controller.reattach_running(&mut claims).await;
+
+        let handle = controller.find_handle("alpha").await.unwrap();
+        let (slot, state) = {
+            let inner = handle.inner.lock().await;
+            (inner.current_slot, inner.state.clone())
+        };
+        assert_eq!(slot, Slot::B, "current_slot must be B");
+        assert!(
+            matches!(state, AppState::Running { container_ip } if container_ip == Ipv4Addr::new(10, 0, 0, 7)),
+            "expected Running on slot B, got {state:?}"
+        );
+    }
+
+    async fn handle_state(controller: &AppHost<MockRuntime, MockEgress>, name: &str) -> AppState {
+        let handle = controller.find_handle(name).await.unwrap();
+        let inner = handle.inner.lock().await;
+        inner.state.clone()
+    }
+
+    /// Removing a never-started app skips per-slot cleanup (nothing
+    /// to clean) but still drops app-level assets so an operator
+    /// re-registering the same name doesn't inherit a stale volume
+    /// tree.
+    #[tokio::test]
+    async fn remove_never_started_app_skips_container_cleanup() {
         let tmp = tempfile::tempdir().unwrap();
         let controller =
             make_controller(vec![stored_with_name("alpha", "v1")], tmp.path().to_owned());
@@ -1120,10 +1507,12 @@ mod tests {
 
         let rt_calls = controller.runtime.calls();
         assert!(
-            rt_calls
-                .iter()
-                .any(|c| c == "cleanup_orphan_container(alpha-a)"),
-            "remove_app must trigger cleanup_orphan_container; got {rt_calls:?}"
+            !rt_calls.iter().any(|c| c.starts_with("cleanup_container(")),
+            "never-started app must not trigger cleanup_container; got {rt_calls:?}"
+        );
+        assert!(
+            rt_calls.iter().any(|c| c == "cleanup_app_assets(alpha)"),
+            "cleanup_app_assets fires regardless of run state; got {rt_calls:?}"
         );
     }
 }
