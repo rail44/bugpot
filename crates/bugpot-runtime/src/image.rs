@@ -167,42 +167,72 @@ impl Puller {
         let registry_auth: RegistryAuth = auth.into_registry_auth();
         debug!(image = %reference, "resolving image");
 
-        // Determine the expected digest. For sha-pinned refs the
-        // upstream call is unnecessary — the ref is content-addressed.
-        let probed_id = if let Some(digest) = reference.digest() {
-            histogram!("bugpot_image_pull_seconds", "step" => "manifest_probe").record(0.0);
-            ImageId::new(digest.to_owned())
-        } else {
-            let probe_start = Instant::now();
-            let probed_digest = self
-                .client
-                .fetch_manifest_digest(&reference, &registry_auth)
-                .await?;
-            histogram!("bugpot_image_pull_seconds", "step" => "manifest_probe")
-                .record(probe_start.elapsed().as_secs_f64());
-            ImageId::new(probed_digest)
-        };
+        let probed_id = self.probe_digest(&reference, &registry_auth).await?;
 
         if let Some(cached) = load_cached_image(&self.images_root, &probed_id)? {
             info!(id = %probed_id, "image cache hit");
-            histogram!("bugpot_image_pull_seconds", "step" => "registry").record(0.0);
-            histogram!("bugpot_image_pull_seconds", "step" => "extract").record(0.0);
+            record_skipped_pull();
             return Ok(cached);
         }
 
-        // Cache miss. Coalesce with any concurrent pull of the same
-        // image reference. The leader runs the full pull + extract
-        // and publishes the resolved manifest digest into its slot;
-        // waiters block on the slot's barrier and use the published
-        // digest to read the on-disk cache once the leader releases.
-        //
-        // We key on the image reference string (not on `probed_id`)
-        // because for multi-arch images `manifest_probe` returns the
-        // image-index digest while `Client::pull` follows the index
-        // and stores under a different platform manifest digest. The
-        // waiter therefore must not assume "the leader stored under
-        // my probed digest" — it has to learn the storage digest
-        // from the leader directly.
+        self.coordinated_pull(image_ref, &reference, &registry_auth)
+            .await
+    }
+
+    /// Determine the digest this `image_ref` is expected to resolve
+    /// to without doing any layer transfer.
+    ///
+    /// Two paths:
+    /// - **sha-pinned ref** (`...@sha256:...`): use the ref's own
+    ///   digest, no upstream call. The histogram is still emitted with
+    ///   a 0.0 sample so the per-pull total stays comparable across
+    ///   pinned vs. tagged refs.
+    /// - **tag ref**: HEAD-style `fetch_manifest_digest`, sub-second
+    ///   on a warm registry connection.
+    async fn probe_digest(
+        &self,
+        reference: &Reference,
+        registry_auth: &RegistryAuth,
+    ) -> Result<ImageId> {
+        if let Some(digest) = reference.digest() {
+            histogram!("bugpot_image_pull_seconds", "step" => "manifest_probe").record(0.0);
+            return Ok(ImageId::new(digest.to_owned()));
+        }
+        let probe_start = Instant::now();
+        let probed_digest = self
+            .client
+            .fetch_manifest_digest(reference, registry_auth)
+            .await?;
+        histogram!("bugpot_image_pull_seconds", "step" => "manifest_probe")
+            .record(probe_start.elapsed().as_secs_f64());
+        Ok(ImageId::new(probed_digest))
+    }
+
+    /// Coalesce concurrent pulls of the same image reference. The
+    /// leader runs the full pull + extract and publishes the resolved
+    /// manifest digest into its slot; waiters block on the slot's
+    /// barrier and use the published digest to read the on-disk cache
+    /// once the leader releases.
+    ///
+    /// We key on the image reference string (not on the probed
+    /// digest) because for multi-arch images `manifest_probe` returns
+    /// the image-index digest while `Client::pull` follows the index
+    /// and stores under a different platform manifest digest. The
+    /// waiter therefore must not assume "the leader stored under my
+    /// probed digest" — it has to learn the storage digest from the
+    /// leader directly.
+    ///
+    /// The loop only re-iterates when a waiter discovers the leader
+    /// failed (no resolved digest, or the resolved digest's cache
+    /// lookup returned None). On success the function returns; on
+    /// leader error after we ourselves were the leader, the error is
+    /// propagated up.
+    async fn coordinated_pull(
+        &self,
+        image_ref: &str,
+        reference: &Reference,
+        registry_auth: &RegistryAuth,
+    ) -> Result<PulledImage> {
         loop {
             let role = self.claim_inflight(image_ref);
             match role {
@@ -210,7 +240,7 @@ impl Puller {
                     slot,
                     guard: _guard,
                 } => {
-                    let result = self.do_full_pull(&reference, &registry_auth).await;
+                    let result = self.do_full_pull(reference, registry_auth).await;
                     if let Ok(ref pulled) = result {
                         *slot.resolved.lock().expect("resolved slot poisoned") =
                             Some(pulled.id.clone());
@@ -230,12 +260,8 @@ impl Puller {
                     if let Some(id) = resolved {
                         if let Some(cached) = load_cached_image(&self.images_root, &id)? {
                             // Same accounting as the cache-hit fast
-                            // path above: the waiter paid neither
-                            // cost.
-                            histogram!("bugpot_image_pull_seconds", "step" => "registry")
-                                .record(0.0);
-                            histogram!("bugpot_image_pull_seconds", "step" => "extract")
-                                .record(0.0);
+                            // path: the waiter paid neither cost.
+                            record_skipped_pull();
                             info!(%id, "in-flight pull completed; using cache");
                             return Ok(cached);
                         }
@@ -366,6 +392,16 @@ enum InflightRole {
         guard: tokio::sync::OwnedMutexGuard<()>,
     },
     Waiter(Arc<InflightSlot>),
+}
+
+/// Emit zero-duration samples for the two pull phases skipped on a
+/// cache-hit path (whether direct or via in-flight coalescing). Both
+/// histograms get a sample on every successful `pull` regardless of
+/// the path taken, so the bucket distribution reflects "completed
+/// pulls" rather than "pulls that went all the way to the registry".
+fn record_skipped_pull() {
+    histogram!("bugpot_image_pull_seconds", "step" => "registry").record(0.0);
+    histogram!("bugpot_image_pull_seconds", "step" => "extract").record(0.0);
 }
 
 /// Reconstruct a [`PulledImage`] from the on-disk cache for `id`,
