@@ -51,6 +51,7 @@ use mempressure::read_mem_available;
 
 mod handle;
 pub use handle::AppHandle;
+use handle::DigestCache;
 use handle::{
     AppMaps, AppState, MAX_ROLLOUT_HISTORY, StartClaim, make_handle, make_handle_with_rollouts,
 };
@@ -594,10 +595,14 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
     ///     returning the current view. Lets the ops apply workflow
     ///     PATCH unconditionally without restarting containers on
     ///     every CI run.
-    ///   - Spec changed → persist new TOML, reset the per-handle
-    ///     `image_digest` cache if `repo` moved, and (if the app
-    ///     was `Running`) stop + start it so the new config takes
-    ///     effect. The current rollout history is preserved.
+    ///   - Spec changed → persist new TOML and (if the app was
+    ///     `Running`) stop + start it so the new config takes
+    ///     effect. The current rollout history is preserved. The
+    ///     per-handle `image_digest` cache (a `DigestCache` that
+    ///     records the `repo` it was resolved against) needs no
+    ///     explicit invalidation — `pull_image_phase`'s freshness
+    ///     check ignores entries whose `repo` no longer matches
+    ///     `spec.repo`.
     pub async fn update_app(
         &self,
         handle: &Arc<AppHandle>,
@@ -638,18 +643,17 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
 
         let was_running = handle.inner.lock().await.state.is_running();
 
-        // Replace under the write lock.
+        // Replace under the write lock. The digest cache doesn't
+        // need an explicit clear — `DigestCache` carries the `repo`
+        // it was resolved against, so a subsequent pull-phase
+        // freshness check ignores any cache entry whose `repo` no
+        // longer matches `spec.repo`. That removes the
+        // "update + concurrent cold-start races and persists a
+        // stale (new_repo, old_digest) pair" window the old
+        // out-of-band invalidation allowed.
         {
             let mut guard = handle.spec.write().await;
             *guard = new_spec.clone();
-        }
-
-        // The deploy-time digest cache (from PR #73) is bound to
-        // whatever ref the previous `repo` resolved to. Clear it
-        // when `repo` changes so the next pull rebuilds it against
-        // the new registry path.
-        if existing.repo != new_spec.repo {
-            handle.inner.lock().await.image_digest = None;
         }
 
         if let Err(e) = self.persist_spec(handle).await {
@@ -715,8 +719,13 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
             }
         }
 
-        // 1. Pull.
-        let resolved_digest = self.pull_for_rollout(handle, &tag).await?;
+        // 1. Pull. Capture `repo` here so the digest we cache below
+        // is paired with the exact value the pull resolved against —
+        // a concurrent PATCH that changes `repo` mid-flight produces
+        // a (new_repo, ?) on the spec side and our cache stays
+        // (old_repo, old_digest), self-invalidating on next read.
+        let repo = handle.spec.read().await.repo.clone();
+        let resolved_digest = self.pull_for_rollout(handle, &repo, &tag).await?;
 
         // 2. Append to history and update the digest cache so the
         // next `do_start` uses *this* rollout's digest, not the
@@ -725,7 +734,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
             tag,
             created_at: SystemTime::now(),
         };
-        record_rollout(handle, rollout.clone(), resolved_digest).await;
+        record_rollout(handle, rollout.clone(), repo, resolved_digest).await;
 
         // 3. Persist the rollout to its own state file. Spec doesn't
         // change here, so no spec rewrite needed.
@@ -753,13 +762,13 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
     async fn pull_for_rollout(
         &self,
         handle: &AppHandle,
+        repo: &str,
         tag: &str,
     ) -> std::result::Result<bugpot_runtime::ImageId, RolloutError> {
         let name = &handle.identity.name;
-        let repo = handle.spec.read().await.repo.clone();
         let image_ref = format!("{repo}:{tag}");
         self.runtime
-            .pull_image(&image_ref, self.resolve_auth(&repo))
+            .pull_image(&image_ref, self.resolve_auth(repo))
             .await
             .map_err(|e| classify_pull_error_for_rollout(e, name, &image_ref))
     }
@@ -1014,27 +1023,37 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
     ) -> Result<bugpot_runtime::ImageId> {
         let name = &handle.identity.name;
         let phase_start = Instant::now();
-        // If a prior pull on this handle resolved the tag to a
-        // digest, pin to it for this pull so the registry-side
-        // manifest probe is skipped (`Puller::pull` short-circuits on
-        // digest references). The cache invalidates only when the
-        // handle is destroyed (operator redeploy or bugpot restart).
-        let image_ref = digest_pinned_ref(
-            plain_image_ref,
-            handle.inner.lock().await.image_digest.as_ref(),
-        );
+        // If a prior pull on this handle resolved the tag to a digest
+        // *for the same repo*, pin to it so the registry-side manifest
+        // probe is skipped (`Puller::pull` short-circuits on digest
+        // references). The freshness check on `cache.repo` means a
+        // PATCH that changed `repo` since the cache was written
+        // silently falls through to a full pull, no out-of-band
+        // invalidation needed.
+        let cached_digest = handle
+            .inner
+            .lock()
+            .await
+            .image_digest
+            .as_ref()
+            .filter(|cache| cache.repo == spec.repo)
+            .map(|cache| cache.digest.clone());
+        let image_ref = digest_pinned_ref(plain_image_ref, cached_digest.as_ref());
         let image_id = self
             .runtime
             .pull_image(&image_ref, self.resolve_auth(&spec.repo))
             .await
             .with_context(|| format!("pull image for {name}"))?;
-        // Persist the resolved digest the first time we see it.
-        // Subsequent cold-starts (within this process) skip the
-        // probe via the branch above.
+        // Persist the resolved digest paired with the repo it was
+        // resolved against. Future reads will only honour it while
+        // the repo still matches.
         {
             let mut inner = handle.inner.lock().await;
             if inner.image_digest.is_none() {
-                inner.image_digest = Some(image_id.clone());
+                inner.image_digest = Some(DigestCache {
+                    repo: spec.repo.clone(),
+                    digest: image_id.clone(),
+                });
             }
         }
         histogram!("bugpot_cold_start_seconds", "phase" => "pull")
@@ -1172,6 +1191,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
 async fn record_rollout(
     handle: &Arc<AppHandle>,
     rollout: Rollout,
+    repo: String,
     digest: bugpot_runtime::ImageId,
 ) {
     let mut inner = handle.inner.lock().await;
@@ -1179,7 +1199,7 @@ async fn record_rollout(
         inner.rollouts.pop_front();
     }
     inner.rollouts.push_back(rollout);
-    inner.image_digest = Some(digest);
+    inner.image_digest = Some(DigestCache { repo, digest });
 }
 
 /// Best-effort cleanup of a TOML written by `deploy_app` that the
@@ -1745,11 +1765,14 @@ mod tests {
         assert!(controller.find_handle("ghost").await.is_none());
     }
 
-    /// `repo` change clears the per-handle `image_digest` cache so
-    /// the next start re-resolves against the new registry path
-    /// rather than reusing the previous repo's digest.
+    /// `repo` change leaves the `(repo, digest)` cache entry in
+    /// place but the freshness check at the next pull treats it as
+    /// stale — the cache is self-invalidating. The previous shape
+    /// (single `Option<ImageId>` cleared inline) raced against
+    /// concurrent cold-starts; the new shape removes the
+    /// out-of-band clear entirely.
     #[tokio::test]
-    async fn update_app_clears_digest_cache_on_repo_change() {
+    async fn update_app_repo_change_makes_digest_cache_stale() {
         let tmp = tempfile::tempdir().unwrap();
         let controller = make_controller(vec![], tmp.path().to_owned());
         controller
@@ -1761,9 +1784,13 @@ mod tests {
             .find_handle("alpha")
             .await
             .expect("handle present");
-        // Seed the cache as if a prior start populated it.
-        handle.inner.lock().await.image_digest =
-            Some(bugpot_runtime::ImageId::new("sha256:oldcacheddigest"));
+        // Seed the cache as if a prior pull populated it against
+        // the deploy-time repo.
+        let old_repo = handle.spec.read().await.repo.clone();
+        handle.inner.lock().await.image_digest = Some(DigestCache {
+            repo: old_repo.clone(),
+            digest: bugpot_runtime::ImageId::new("sha256:oldcacheddigest"),
+        });
 
         let mut new_spec = spec_with_name("alpha");
         new_spec.repo = "registry.example/other-img".to_owned();
@@ -1772,10 +1799,15 @@ mod tests {
             .await
             .expect("repo change PATCH succeeds");
 
-        assert!(
-            handle.inner.lock().await.image_digest.is_none(),
-            "image_digest cache must clear on repo change"
-        );
+        // The cache entry survives the PATCH — the freshness check
+        // happens at *read* time. Verify its `repo` no longer
+        // matches the spec, which is how `pull_image_phase`
+        // recognises staleness.
+        let cached = handle.inner.lock().await.image_digest.clone();
+        let cached = cached.expect("seeded cache entry should survive the PATCH");
+        let live_repo = handle.spec.read().await.repo.clone();
+        assert_eq!(cached.repo, old_repo);
+        assert_ne!(cached.repo, live_repo);
     }
 
     /// On cold-start failure during image pull, the previously-allocated
