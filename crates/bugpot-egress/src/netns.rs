@@ -39,11 +39,6 @@ pub(crate) type IpCmd = Vec<String>;
 #[derive(Debug)]
 pub struct EndpointLayout {
     pub host_veth: String,
-    /// Temporary name for the container side of the veth pair while it
-    /// still lives in the host netns (before being moved into the
-    /// container's netns). Picked to avoid colliding with the host's own
-    /// interfaces (notably real `eth0`).
-    pub tmp_ns_veth: String,
     /// Final name of the container-side interface, inside the netns.
     pub ns_veth: String,
     pub ns_name: String,
@@ -59,7 +54,6 @@ impl EndpointLayout {
         let ns_name = format!("{NS_PREFIX}{name}");
         Self {
             host_veth: format!("vh-{short}"),
-            tmp_ns_veth: format!("vc-{short}"),
             ns_veth: "eth0".to_string(),
             ns_path: PathBuf::from(format!("/var/run/netns/{ns_name}")),
             ns_name,
@@ -67,6 +61,21 @@ impl EndpointLayout {
             subnet_prefix: subnet.prefix_len(),
         }
     }
+}
+
+/// Transient host-side peer name for `plan`'s veth pair.
+///
+/// Used while the container side of the pair is still in the host
+/// netns; gets renamed to `ns_veth` once it's moved in. Derived from
+/// `host_veth` (canonical prefix `vh-` → `vc-`) so the two stay in
+/// sync; lives outside `EndpointLayout` because no caller needs the
+/// value after `render_attach_endpoint` consumes it.
+#[must_use]
+pub fn tmp_peer_name(host_veth: &str) -> String {
+    let short = host_veth
+        .strip_prefix("vh-")
+        .expect("host_veth uses the canonical 'vh-' prefix");
+    format!("vc-{short}")
 }
 
 /// 12-char-max stable shortening of an app name for use in interface
@@ -109,7 +118,8 @@ pub fn render_setup_bridge(bridge: &str, bridge_ip: Ipv4Addr, subnet: Ipv4Net) -
 pub fn render_attach_endpoint(bridge: &str, plan: &EndpointLayout) -> Vec<IpCmd> {
     let host = &plan.host_veth;
     let ns = &plan.ns_name;
-    let tmp = &plan.tmp_ns_veth;
+    let tmp = tmp_peer_name(host);
+    let tmp = &tmp;
     let final_name = &plan.ns_veth;
     let addr_in_ns = format!("{}/{}", plan.container_ip, plan.subnet_prefix);
     vec![
@@ -343,9 +353,10 @@ mod tests {
                     && c.iter().any(|s| s == "eth0")),
             "veth peer must not be named eth0 while in host netns"
         );
+        let tmp = tmp_peer_name(&plan.host_veth);
         assert!(
             cmds.iter()
-                .any(|c| c.windows(2).any(|w| w == ["set", &plan.tmp_ns_veth])
+                .any(|c| c.windows(2).any(|w| w == ["set", tmp.as_str()])
                     && c.iter().any(|s| s == "name")
                     && c.contains(&"eth0".to_string())),
             "rename to eth0 must happen inside the netns"

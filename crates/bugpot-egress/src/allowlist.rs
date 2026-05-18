@@ -60,8 +60,8 @@ impl Allowlist {
     pub fn matches_domain(&self, name: &str) -> bool {
         let name = normalise_name(name);
         self.rules.iter().any(|r| match r {
-            Rule::Domain(d) => domain_matches_exact_or_sub(d, &name),
-            Rule::Wildcard(d) => domain_matches_strict_sub(d, &name),
+            Rule::Domain(d) => name == *d || is_subdomain_of(d, &name),
+            Rule::Wildcard(d) => is_subdomain_of(d, &name),
             Rule::Cidr(_) => false,
         })
     }
@@ -117,24 +117,14 @@ fn normalise_name(s: &str) -> String {
     s.to_ascii_lowercase()
 }
 
-/// `pattern` matches `name` if `name == pattern` or `name` ends with
-/// `.pattern`. Used for the bare-domain form which implicitly covers
-/// subdomains (Cilium FQDN policy semantics).
-fn domain_matches_exact_or_sub(pattern: &str, name: &str) -> bool {
-    if name == pattern {
-        return true;
-    }
-    name.len() > pattern.len()
-        && name.ends_with(pattern)
-        && name.as_bytes()[name.len() - pattern.len() - 1] == b'.'
-}
-
-/// `*.pattern` matches strict subdomains only — `name` must be longer than
-/// `pattern` and end with `.pattern`.
-fn domain_matches_strict_sub(pattern: &str, name: &str) -> bool {
-    name.len() > pattern.len()
-        && name.ends_with(pattern)
-        && name.as_bytes()[name.len() - pattern.len() - 1] == b'.'
+/// `true` iff `name` is a strict subdomain of `parent` — `name` is
+/// longer than `parent`, ends with `parent`, and the boundary byte
+/// is a `.`. The exact-match case is handled by the call site
+/// (`Rule::Domain` adds `name == parent`, `Rule::Wildcard` doesn't).
+fn is_subdomain_of(parent: &str, name: &str) -> bool {
+    name.len() > parent.len()
+        && name.ends_with(parent)
+        && name.as_bytes()[name.len() - parent.len() - 1] == b'.'
 }
 
 #[cfg(test)]

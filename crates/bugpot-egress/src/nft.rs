@@ -42,10 +42,22 @@ pub struct NftConfig {
 /// Build the textual ruleset that bootstraps the table, chains, and sets.
 ///
 /// The output is meant for `nft -f -`. It first flushes any prior `bugpot`
-/// table (idempotent on first run, replaces on reload).
+/// table (idempotent on first run, replaces on reload). The three
+/// sub-renderers below carry the per-section policy; this fn just
+/// concatenates them in the order `nft` consumes them (table → set →
+/// forward chain → input chain).
 #[must_use]
 pub fn render_bootstrap(cfg: &NftConfig) -> String {
     let mut out = String::new();
+    render_table_and_set(&mut out, cfg);
+    render_forward_chain(&mut out, cfg);
+    render_input_chain(&mut out, cfg);
+    out
+}
+
+/// Atomic-replace the `inet <table>` table and declare the `allow4`
+/// timeout set inside it.
+fn render_table_and_set(out: &mut String, cfg: &NftConfig) {
     // Flush prior state. `add table` is a no-op if it already exists; `delete`
     // then `add` is the standard atomic-replace idiom.
     let _ = writeln!(out, "add table inet {}", cfg.table);
@@ -59,8 +71,12 @@ pub fn render_bootstrap(cfg: &NftConfig) -> String {
         table = cfg.table,
         ttl = cfg.allow_ttl_secs,
     );
+}
 
-    // forward chain, default drop for traffic leaving the bridge.
+/// Forward chain (default drop) — the rule that enforces the
+/// allow-set gate for traffic leaving the bridge plus the
+/// pre-`allow4` external-DNS / `DoT` shoulder drops.
+fn render_forward_chain(out: &mut String, cfg: &NftConfig) {
     let _ = writeln!(
         out,
         "add chain inet {table} forward {{ type filter hook forward priority filter; policy drop; }}",
@@ -101,12 +117,14 @@ pub fn render_bootstrap(cfg: &NftConfig) -> String {
         table = cfg.table,
         subnet = cfg.subnet,
     );
+}
 
-    // input chain: allow the bridge DNS port from inside the subnet plus
-    // any conntrack-related reply (so host-initiated connections to
-    // containers, e.g. bugpot-router → app, receive their responses).
-    // Everything else originating from the bridge subnet is dropped, so
-    // containers cannot probe the host's other services.
+/// Input chain — allows the bridge DNS port from inside the subnet
+/// plus conntrack-related replies (so host-initiated connections to
+/// containers, e.g. bugpot-router → app, receive their responses).
+/// Everything else originating from the bridge subnet is dropped, so
+/// containers cannot probe the host's other services.
+fn render_input_chain(out: &mut String, cfg: &NftConfig) {
     let _ = writeln!(
         out,
         "add chain inet {table} input {{ type filter hook input priority filter; policy accept; }}",
@@ -141,8 +159,6 @@ pub fn render_bootstrap(cfg: &NftConfig) -> String {
         bridge = cfg.bridge,
         subnet = cfg.subnet,
     );
-
-    out
 }
 
 /// Render the command that adds `(src, dst)` to the allow set with the
@@ -237,20 +253,13 @@ pub async fn list_allow_set(table: &str) -> anyhow::Result<Vec<(Ipv4Addr, Ipv4Ad
 /// inherits no leftover allow-list state.
 ///
 /// `nft` cannot delete elements by sub-key, so we list the set first
-/// and emit a per-element `delete element` script. List or parse
-/// failure logs and skips (entries also TTL-expire after
-/// `allow_ttl_secs`, so an outage of the list call is recoverable).
+/// and emit a per-element `delete element` script. Both the list and
+/// the delete may fail; the error is propagated so the caller can
+/// decide whether to surface or swallow it. Entries TTL-expire after
+/// `allow_ttl_secs`, so the typical caller (endpoint release) logs +
+/// drops the error and lets the TTL handle eventual cleanup.
 pub async fn flush_src(table: &str, src: Ipv4Addr) -> anyhow::Result<()> {
-    let entries = match list_allow_set(table).await {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(
-                table, %src, error = %e,
-                "list allow set failed during flush_src; relying on TTL expiry"
-            );
-            return Ok(());
-        }
-    };
+    let entries = list_allow_set(table).await?;
     let mut script = String::new();
     for (s, d) in entries {
         if s == src {
