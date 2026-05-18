@@ -181,6 +181,7 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
 
     async fn do_remove(&self, handle: &Arc<AppHandle>) -> Result<()> {
         let name = handle.name();
+        let container_id = handle.current_id().await;
         self.registry.remove(name, handle.subdomain()).await;
         gauge!("bugpot_apps_active").decrement(1.0);
         if let Err(e) = self.stop(handle).await {
@@ -193,7 +194,13 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
         // here too. Otherwise persistent-volume apps leak data on
         // DELETE — the volume dir survives until the operator runs a
         // restart-with-missing-TOML cycle.
-        if let Err(e) = self.runtime.cleanup_orphan_container(name).await {
+        //
+        // We pass the *current* slot's container ID; the runtime
+        // strips the slot suffix to derive the app name for app-level
+        // assets (log tails, volume dir). The opposite slot's bundle
+        // dir, when it exists post-rollover, is cleaned synchronously
+        // by `set_rollout`'s teardown — not by this path.
+        if let Err(e) = self.runtime.cleanup_orphan_container(&container_id).await {
             warn!(
                 app = %name,
                 error = ?e,

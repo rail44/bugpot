@@ -24,6 +24,53 @@ use tokio::sync::{Mutex, Notify, RwLock};
 /// the image GC on cheap-VM hosts.
 pub(crate) const MAX_ROLLOUT_HISTORY: usize = 2;
 
+/// Which of the two per-app deployment slots a container occupies.
+///
+/// bugpot does blue-green rollouts: a new image is started in the
+/// opposite slot from the currently-running one, readiness is
+/// verified against its endpoint, and the resolver flips atomically
+/// when the probe passes. Old slot is then torn down. The
+/// alternation is stable (a → b → a → b…) so the container ID, the
+/// netns, and the veth pair always have a slot suffix that doesn't
+/// collide with the other side of the transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Slot {
+    A,
+    // `B` is unconstructed today because the only path that would
+    // produce it is the blue-green rollover (a future PR). The
+    // suppression is intentional: keeping the enum binary now means
+    // every container ID / netns / bundle path is already
+    // slot-suffixed, so flipping the rollout to a real two-slot
+    // alternation is a small set of call-site edits, not a
+    // workspace-wide rename.
+    #[allow(
+        dead_code,
+        reason = "constructed only by blue-green rollover (future PR)"
+    )]
+    B,
+}
+
+impl Slot {
+    /// Stable single-char rendering for use in container IDs and
+    /// netns / veth names: `'a'` or `'b'`.
+    pub(crate) const fn as_char(self) -> char {
+        match self {
+            Self::A => 'a',
+            Self::B => 'b',
+        }
+    }
+}
+
+/// Compose the container ID that bugpot hands to libcontainer / nft /
+/// the netns helpers, including the slot suffix. Bugpot's runtime and
+/// egress layers identify a *container instance* (not an *app*) by
+/// this string; an app under rollover briefly owns two — one per
+/// slot.
+#[must_use]
+pub(crate) fn container_id(name: &str, slot: Slot) -> String {
+    format!("{name}-{}", slot.as_char())
+}
+
 /// The live registered-app object. Holds all the state the
 /// controller's lifecycle methods mutate plus the immutable
 /// identity used to key the registry maps.
@@ -80,11 +127,28 @@ impl AppHandle {
     pub async fn repo(&self) -> String {
         self.spec.read().await.repo.clone()
     }
+
+    /// Container ID of the currently-active container instance —
+    /// `"<name>-<slot>"`. Hand this to `RuntimeOps` / `EgressOps`
+    /// methods that operate on a *container* (start / stop / freeze /
+    /// `resource_usage` / `cleanup_orphan` / allocate / release / …).
+    pub(crate) async fn current_id(&self) -> String {
+        let slot = self.inner.lock().await.current_slot;
+        container_id(&self.identity.name, slot)
+    }
 }
 
 #[derive(Debug)]
 pub(crate) struct HandleInner {
     pub(crate) state: AppState,
+    /// Which of the two per-app slots holds the currently-active
+    /// container. Blue-green rollouts (a future PR) will allocate the
+    /// opposite slot for the new image and flip this field once
+    /// readiness passes; for now it monotonically stays on
+    /// `Slot::A` and just slot-suffixes every runtime / egress
+    /// identifier so the future flip is a one-line change at the
+    /// call site, not a workspace-wide rename.
+    pub(crate) current_slot: Slot,
     pub(crate) last_access: Instant,
     /// Bounded rollout history, co-located with `state` because the
     /// two move together: a rollout push advances both the rollout
@@ -309,6 +373,11 @@ pub(crate) fn make_handle_with_rollouts(
         active_upgrades: Arc::new(AtomicUsize::new(0)),
         inner: Mutex::new(HandleInner {
             state: AppState::Stopped,
+            // Fresh handles start in slot A by convention. Subsequent
+            // rollouts alternate to B → A → B → … The reattach path
+            // overwrites this with whichever slot it discovered on
+            // disk.
+            current_slot: Slot::A,
             last_access: Instant::now(),
             rollouts,
             image_digest: None,

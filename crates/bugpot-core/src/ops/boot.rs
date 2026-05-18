@@ -33,18 +33,29 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
         }
         for handle in self.list_handles().await {
             let name = &handle.identity.name;
+            // Slot is initialised to A in `make_handle*`. A previous
+            // bugpot's surviving container is reattached to slot A
+            // even if it crashed mid-rollover — blue-green's "kill
+            // both and redo the rollout" recovery semantic means we
+            // don't try to reconstruct which slot was the
+            // *from* side. Pre-PR1 containers (named without a slot
+            // suffix) fall through to the orphan-cleanup pass below
+            // because their `bugpot-<name>` netns won't match the
+            // `bugpot-<name>-a` we look for here.
+            let container_id = handle.current_id().await;
             // Either Running or Paused (= frozen across the daemon
             // restart) counts as a live container worth reattaching to.
             // libcontainer persists `ContainerStatus::Paused` on disk
             // and the cgroup freezer state is kernel-side, so a frozen
             // container survives a bugpot crash transparently.
-            let is_paused = self.runtime.is_container_paused(name);
-            if !self.runtime.is_container_running(name) && !is_paused {
+            let is_paused = self.runtime.is_container_paused(&container_id);
+            if !self.runtime.is_container_running(&container_id) && !is_paused {
                 continue;
             }
-            let Some(container_ip) = claims.claim(name) else {
+            let Some(container_ip) = claims.claim(&container_id) else {
                 warn!(
                     app = %name,
+                    container = %container_id,
                     "container is running but no netns IP was discovered; \
                      leaving as Stopped — next request will cold-start"
                 );
@@ -53,7 +64,7 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
             let allowlist = handle.spec.read().await.egress.allow.clone();
             match self
                 .egress
-                .reattach_endpoint(name, container_ip, allowlist)
+                .reattach_endpoint(&container_id, container_ip, allowlist)
                 .await
             {
                 Ok(ep) => {
@@ -73,13 +84,17 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
                     // The previous bugpot's tail tasks died with it.
                     // Spawn fresh ones so the new process's tracing
                     // pipeline (and `just logs`) keeps showing app
-                    // output. The tail opens at the start of the
+                    // output. Log files are keyed by app name (not
+                    // container ID): both slots share a destination
+                    // so post-mortem retention isn't fragmented across
+                    // rollovers. The tail opens at the start of the
                     // file, so bytes the app wrote during the
                     // interregnum replay through tracing once
                     // (bounded by `MAX_LOG_BYTES`).
                     self.runtime.ensure_log_tails(name);
                     info!(
                         app = %name,
+                        container = %container_id,
                         container_ip = %ep.container_ip,
                         kind = if is_paused { "frozen" } else { "running" },
                         "reattached to surviving container",
