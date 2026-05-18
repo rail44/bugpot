@@ -16,7 +16,7 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
-use bugpot_admin::AdminAuth;
+use bugpot_admin::{AdminAuth, AdminBackend};
 use bugpot_controller::AppController;
 use bugpot_egress::{Egress, EgressOps};
 use bugpot_metrics::PrometheusHandle;
@@ -269,7 +269,10 @@ fn spawn_admin<R: RuntimeOps, E: EgressOps>(
     info!("admin API bearer token loaded");
     let deploy_secret = Arc::new(read_deploy_secret()?);
     info!("deploy-key secret loaded");
-    let admin_controller = Arc::clone(controller);
+    // Coerce to `dyn AdminBackend` here so the admin crate stays
+    // generic-free; the trait is blanket-implemented for every
+    // `AppController<R: RuntimeOps, E: EgressOps>`.
+    let admin_controller: Arc<dyn AdminBackend> = controller.clone();
     Ok(tokio::spawn(async move {
         if let Err(e) =
             bugpot_admin::serve(admin_listen, admin_controller, admin_auth, deploy_secret).await

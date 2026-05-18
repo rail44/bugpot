@@ -64,11 +64,7 @@ use axum::{
     routing::{get, post},
 };
 use bugpot_config::{AppSpec, Rollout};
-use bugpot_controller::{
-    AppController, AppHandle, AppView, DeployError, RemoveError, RolloutError, UpdateError,
-};
-use bugpot_egress::EgressOps;
-use bugpot_runtime::RuntimeOps;
+use bugpot_controller::{AppHandle, AppView, DeployError, RemoveError, RolloutError, UpdateError};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use tower::ServiceBuilder;
@@ -76,6 +72,9 @@ use tower::limit::RateLimitLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tracing::{info, warn};
 use zeroize::Zeroizing;
+
+pub mod backend;
+pub use backend::AdminBackend;
 
 pub mod deploy_key;
 pub use deploy_key::DeployKeySecret;
@@ -169,36 +168,28 @@ impl AdminAuth {
 /// Bundling these together lets one merged router cover both auth
 /// scopes (admin token + deploy token) without the State-type
 /// juggling that arises from per-route `.with_state(...)`.
-#[derive(Debug)]
-pub struct AdminState<R: RuntimeOps, E: EgressOps> {
-    pub controller: Arc<AppController<R, E>>,
+#[derive(Clone)]
+pub struct AdminState {
+    pub controller: Arc<dyn AdminBackend>,
     pub admin_auth: Arc<AdminAuth>,
     pub deploy_secret: Arc<DeployKeySecret>,
 }
 
-impl<R, E> Clone for AdminState<R, E>
-where
-    R: RuntimeOps,
-    E: EgressOps,
-{
-    fn clone(&self) -> Self {
-        Self {
-            controller: self.controller.clone(),
-            admin_auth: self.admin_auth.clone(),
-            deploy_secret: self.deploy_secret.clone(),
-        }
+impl std::fmt::Debug for AdminState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminState")
+            .field("admin_auth", &self.admin_auth)
+            .field("deploy_secret", &"<redacted>")
+            .field("controller", &"<dyn AdminBackend>")
+            .finish()
     }
 }
 
-async fn require_admin_token<R, E>(
-    State(state): State<AdminState<R, E>>,
+async fn require_admin_token(
+    State(state): State<AdminState>,
     req: Request,
     next: Next,
-) -> Result<Response, StatusCode>
-where
-    R: RuntimeOps,
-    E: EgressOps,
-{
+) -> Result<Response, StatusCode> {
     state.admin_auth.check(req.headers())?;
     Ok(next.run(req).await)
 }
@@ -208,15 +199,11 @@ where
 /// the Bearer token against the per-app HMAC. A miss at any step
 /// returns 401 with no detail, so the verdict reveals nothing
 /// about app existence or token shape.
-async fn require_deploy_token<R, E>(
-    State(state): State<AdminState<R, E>>,
+async fn require_deploy_token(
+    State(state): State<AdminState>,
     req: Request,
     next: Next,
-) -> Result<Response, StatusCode>
-where
-    R: RuntimeOps,
-    E: EgressOps,
-{
+) -> Result<Response, StatusCode> {
     let (mut parts, body) = req.into_parts();
     let Path(name) = Path::<String>::from_request_parts(&mut parts, &state)
         .await
@@ -245,16 +232,12 @@ where
 }
 
 /// Bind the admin API at `addr` and serve until the future is dropped.
-pub async fn serve<R, E>(
+pub async fn serve(
     addr: SocketAddr,
-    controller: Arc<AppController<R, E>>,
+    controller: Arc<dyn AdminBackend>,
     admin_auth: Arc<AdminAuth>,
     deploy_secret: Arc<DeployKeySecret>,
-) -> anyhow::Result<()>
-where
-    R: RuntimeOps,
-    E: EgressOps,
-{
+) -> anyhow::Result<()> {
     let state = AdminState {
         controller,
         admin_auth,
@@ -275,11 +258,7 @@ where
     Ok(())
 }
 
-fn router<R, E>(state: AdminState<R, E>) -> Router
-where
-    R: RuntimeOps,
-    E: EgressOps,
-{
+fn router(state: AdminState) -> Router {
     // `RateLimitLayer` makes the inner service non-Clone and produces
     // `BoxError`, so it has to sit inside a `buffer` (for Clone) and
     // a `HandleErrorLayer` (so the BoxError can be converted into a
@@ -295,27 +274,19 @@ where
     // rollout routes skip the admin-token check entirely — they're
     // scoped to a per-app credential instead.
     let admin_routes = Router::new()
-        .route("/apps", post(deploy::<R, E>).get(list::<R, E>))
-        .route(
-            "/apps/{name}",
-            get(get_one::<R, E>)
-                .patch(update::<R, E>)
-                .delete(remove::<R, E>),
-        )
-        .route("/apps/{name}/deploy-keys", post(issue_deploy_key::<R, E>))
+        .route("/apps", post(deploy).get(list))
+        .route("/apps/{name}", get(get_one).patch(update).delete(remove))
+        .route("/apps/{name}/deploy-keys", post(issue_deploy_key))
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            require_admin_token::<R, E>,
+            require_admin_token,
         ));
 
     let rollout_routes = Router::new()
-        .route(
-            "/apps/{name}/rollouts",
-            post(roll_out::<R, E>).get(list_rollouts::<R, E>),
-        )
+        .route("/apps/{name}/rollouts", post(roll_out).get(list_rollouts))
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            require_deploy_token::<R, E>,
+            require_deploy_token,
         ));
 
     Router::new()
@@ -338,6 +309,29 @@ async fn handle_rate_limit_error(err: BoxError) -> Response {
         message: format!("rate limit exceeded: {err}"),
     }
     .into_response()
+}
+
+/// Axum extractor that consumes the request body as an `AppSpec`.
+/// Composes naturally in handler signatures so `deploy` / `update`
+/// drop the manual `HeaderMap + Bytes + parse_app_spec(...)` triple.
+///
+/// Must be the last extractor in a handler signature — it consumes
+/// the request body.
+struct ParsedAppSpec(AppSpec);
+
+impl<S: Send + Sync> axum::extract::FromRequest<S> for ParsedAppSpec {
+    type Rejection = AdminError;
+
+    async fn from_request(req: Request, _state: &S) -> Result<Self, Self::Rejection> {
+        let headers = req.headers().clone();
+        let bytes = axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES)
+            .await
+            .map_err(|e| AdminError {
+                status: StatusCode::BAD_REQUEST,
+                message: format!("read body: {e}"),
+            })?;
+        parse_app_spec(&headers, &bytes).map(Self)
+    }
 }
 
 /// Parse an `AppSpec` from a request body, dispatching on
@@ -377,17 +371,11 @@ fn parse_app_spec(headers: &HeaderMap, body: &[u8]) -> Result<AppSpec, AdminErro
     }
 }
 
-async fn deploy<R, E>(
+async fn deploy(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    State(state): State<AdminState<R, E>>,
-    headers: HeaderMap,
-    body: axum::body::Bytes,
-) -> Result<(StatusCode, Json<AppView>), AdminError>
-where
-    R: RuntimeOps,
-    E: EgressOps,
-{
-    let spec = parse_app_spec(&headers, &body)?;
+    State(state): State<AdminState>,
+    ParsedAppSpec(spec): ParsedAppSpec,
+) -> Result<(StatusCode, Json<AppView>), AdminError> {
     // Capture what we know up-front so the audit entry stays useful
     // even when validation rejects the spec before a name lands in
     // the controller's maps.
@@ -409,18 +397,12 @@ where
     }
 }
 
-async fn update<R, E>(
+async fn update(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    State(state): State<AdminState<R, E>>,
+    State(state): State<AdminState>,
     Path(name): Path<String>,
-    headers: HeaderMap,
-    body: axum::body::Bytes,
-) -> Result<Json<AppView>, AdminError>
-where
-    R: RuntimeOps,
-    E: EgressOps,
-{
-    let spec = parse_app_spec(&headers, &body)?;
+    ParsedAppSpec(spec): ParsedAppSpec,
+) -> Result<Json<AppView>, AdminError> {
     let audit_repo = spec.repo.clone();
     let handle = state
         .controller
@@ -444,16 +426,12 @@ struct RolloutBody {
     tag: String,
 }
 
-async fn roll_out<R, E>(
+async fn roll_out(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    State(state): State<AdminState<R, E>>,
+    State(state): State<AdminState>,
     axum::extract::Extension(handle): axum::extract::Extension<Arc<AppHandle>>,
     Json(body): Json<RolloutBody>,
-) -> Result<(StatusCode, Json<Rollout>), AdminError>
-where
-    R: RuntimeOps,
-    E: EgressOps,
-{
+) -> Result<(StatusCode, Json<Rollout>), AdminError> {
     let name = handle.name().to_owned();
     let audit_tag = body.tag.clone();
     match state.controller.set_rollout(&handle, body.tag).await {
@@ -468,14 +446,10 @@ where
     }
 }
 
-async fn list_rollouts<R, E>(
-    State(state): State<AdminState<R, E>>,
+async fn list_rollouts(
+    State(state): State<AdminState>,
     axum::extract::Extension(handle): axum::extract::Extension<Arc<AppHandle>>,
-) -> Json<Vec<Rollout>>
-where
-    R: RuntimeOps,
-    E: EgressOps,
-{
+) -> Json<Vec<Rollout>> {
     Json(state.controller.list_rollouts(&handle).await)
 }
 
@@ -486,15 +460,11 @@ struct DeployKeyResponse {
     token: String,
 }
 
-async fn issue_deploy_key<R, E>(
+async fn issue_deploy_key(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    State(state): State<AdminState<R, E>>,
+    State(state): State<AdminState>,
     Path(name): Path<String>,
-) -> Result<(StatusCode, Json<DeployKeyResponse>), AdminError>
-where
-    R: RuntimeOps,
-    E: EgressOps,
-{
+) -> Result<(StatusCode, Json<DeployKeyResponse>), AdminError> {
     let Some(handle) = state.controller.find_handle(&name).await else {
         audit_err!("issue_deploy_key", peer, name, "not found");
         return Err(app_not_found(&name));
@@ -505,15 +475,11 @@ where
     Ok((StatusCode::CREATED, Json(DeployKeyResponse { token })))
 }
 
-async fn remove<R, E>(
+async fn remove(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    State(state): State<AdminState<R, E>>,
+    State(state): State<AdminState>,
     Path(name): Path<String>,
-) -> Result<StatusCode, AdminError>
-where
-    R: RuntimeOps,
-    E: EgressOps,
-{
+) -> Result<StatusCode, AdminError> {
     let handle = state
         .controller
         .find_handle(&name)
@@ -531,22 +497,14 @@ where
     }
 }
 
-async fn list<R, E>(State(state): State<AdminState<R, E>>) -> Json<Vec<AppView>>
-where
-    R: RuntimeOps,
-    E: EgressOps,
-{
+async fn list(State(state): State<AdminState>) -> Json<Vec<AppView>> {
     Json(state.controller.list_apps().await)
 }
 
-async fn get_one<R, E>(
-    State(state): State<AdminState<R, E>>,
+async fn get_one(
+    State(state): State<AdminState>,
     Path(name): Path<String>,
-) -> Result<Json<AppView>, AdminError>
-where
-    R: RuntimeOps,
-    E: EgressOps,
-{
+) -> Result<Json<AppView>, AdminError> {
     state
         .controller
         .get_app(&name)
