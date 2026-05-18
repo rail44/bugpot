@@ -55,12 +55,14 @@ use tokio::net::{TcpListener, UdpSocket};
 pub mod allocator;
 pub mod allowlist;
 pub mod dns;
+pub mod endpoints;
 pub mod netns;
 pub mod nft;
 
 use allocator::IpAllocator;
 use allowlist::Allowlist;
-use dns::{AllowSet, AppEntry, AppRegistry, EgressDnsHandler, Upstream};
+use dns::{AllowSet, EgressDnsHandler, Upstream};
+use endpoints::{AllocatedApp, EndpointStore};
 use netns::EndpointLayout;
 use nft::NftConfig;
 
@@ -236,19 +238,15 @@ impl StartupClaims {
     }
 }
 
-/// In-memory record so we can free addresses on release and apply allowlist
-/// updates without re-allocating.
-#[derive(Debug)]
-struct AllocatedApp {
-    container_ip: Ipv4Addr,
-    plan: EndpointLayout,
-}
-
 /// Internal state that the DNS handler shares with the public surface.
 pub struct Egress {
     allocator: Mutex<IpAllocator>,
-    apps: Mutex<std::collections::HashMap<String, AllocatedApp>>,
-    registry: Arc<AppRegistry>,
+    /// Single source of truth for live endpoints — indexed both by
+    /// name (control path) and by container IP (DNS handler). One
+    /// lock covers both views, so allocate/release writes are atomic
+    /// across them; no by-hand "remember to update both maps in the
+    /// right order" sequence.
+    endpoints: Arc<EndpointStore>,
     // Holding the server keeps the DNS task alive for the lifetime of Egress.
     _dns_server: Option<DnsServer<EgressDnsHandler<HickoryUpstream, NftAllowSet>>>,
 }
@@ -293,14 +291,14 @@ impl Egress {
 
         setup_bridge(bridge_ip, subnet).await;
         install_nftables_ruleset(bridge_ip, subnet).await?;
-        let (registry, dns_server) = start_dns_server(&config, bridge_ip).await?;
+        let endpoints = Arc::new(EndpointStore::new());
+        let dns_server = start_dns_server(&config, bridge_ip, endpoints.clone()).await?;
         let mut allocator = init_allocator(subnet, bridge_ip)?;
         let discovered = discover_existing_endpoints(&mut allocator).await;
 
         let egress = Self {
             allocator: Mutex::new(allocator),
-            apps: Mutex::new(std::collections::HashMap::new()),
-            registry,
+            endpoints,
             _dns_server: Some(dns_server),
         };
         Ok((egress, StartupClaims::new(discovered)))
@@ -343,16 +341,13 @@ async fn install_nftables_ruleset(bridge_ip: Ipv4Addr, subnet: Ipv4Net) -> anyho
 async fn start_dns_server(
     config: &EgressConfig,
     bridge_ip: Ipv4Addr,
-) -> anyhow::Result<(
-    Arc<AppRegistry>,
-    DnsServer<EgressDnsHandler<HickoryUpstream, NftAllowSet>>,
-)> {
-    let registry = Arc::new(AppRegistry::new());
+    endpoints: Arc<EndpointStore>,
+) -> anyhow::Result<DnsServer<EgressDnsHandler<HickoryUpstream, NftAllowSet>>> {
     let upstream = Arc::new(HickoryUpstream::new(&config.dns_upstream)?);
     let allow_set = Arc::new(NftAllowSet {
         table: NFT_TABLE.to_owned(),
     });
-    let handler = EgressDnsHandler::new(registry.clone(), upstream, allow_set, ALLOW_TTL_SECS);
+    let handler = EgressDnsHandler::new(endpoints, upstream, allow_set, ALLOW_TTL_SECS);
     let mut server = DnsServer::new(handler);
     let bind_addr = SocketAddr::from((bridge_ip, DNS_PORT));
     let udp = UdpSocket::bind(bind_addr)
@@ -363,7 +358,7 @@ async fn start_dns_server(
         .await
         .with_context(|| format!("bind DNS TCP {bind_addr}"))?;
     server.register_listener(tcp, std::time::Duration::from_secs(5), 4096);
-    Ok((registry, server))
+    Ok(server)
 }
 
 /// Phase 4: build the IP allocator and verify the subnet is usable
@@ -416,20 +411,19 @@ impl EgressOps for Egress {
             return Err(e).context("attach endpoint");
         }
 
-        self.registry.insert(
-            container_ip,
-            AppEntry {
-                name: name.to_string(),
-                allowlist: parsed,
-            },
-        );
         let ep = Endpoint {
             container_ip,
             netns_path: plan.ns_path.clone(),
         };
-        self.apps
-            .lock()
-            .insert(name.to_string(), AllocatedApp { container_ip, plan });
+        // One write hits both indexes atomically — no risk of the DNS
+        // handler seeing a registered IP whose host-side bookkeeping
+        // hasn't landed yet (or vice versa on the release path).
+        self.endpoints.insert(AllocatedApp {
+            name: name.to_owned(),
+            container_ip,
+            plan,
+            allowlist: parsed,
+        });
         Ok(ep)
     }
 
@@ -445,16 +439,12 @@ impl EgressOps for Egress {
             container_ip,
             netns_path: plan.ns_path.clone(),
         };
-        self.registry.insert(
+        self.endpoints.insert(AllocatedApp {
+            name: name.to_owned(),
             container_ip,
-            AppEntry {
-                name: name.to_string(),
-                allowlist: parsed,
-            },
-        );
-        self.apps
-            .lock()
-            .insert(name.to_string(), AllocatedApp { container_ip, plan });
+            plan,
+            allowlist: parsed,
+        });
         Ok(ep)
     }
 
@@ -483,7 +473,7 @@ impl EgressOps for Egress {
     }
 
     async fn release_endpoint(&self, name: &str) -> anyhow::Result<()> {
-        let Some(app) = self.apps.lock().remove(name) else {
+        let Some(app) = self.endpoints.remove_by_name(name) else {
             return Ok(());
         };
         // In-memory state is authoritative: drop the app from every
@@ -492,7 +482,6 @@ impl EgressOps for Egress {
         // next `discover_endpoints` at startup will reap any leaked
         // kernel resources, but the allocator must not stay marked
         // in_use just because `ip netns del` returned an error.
-        self.registry.remove(app.container_ip);
         self.allocator.lock().release(app.container_ip);
         // Flush this src's entries from the allow set (best-effort; the
         // 60s TTL is a backstop). Only entries matching *this* src IP
