@@ -23,7 +23,7 @@
 #[cfg(test)]
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
@@ -36,7 +36,6 @@ use bugpot_router::{ResolveError, Upstream, UpstreamResolver, subdomain_of};
 use bugpot_runtime::RuntimeError;
 use bugpot_runtime::{Auth, RuntimeOps};
 use metrics::{counter, gauge, histogram};
-use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 mod error;
@@ -52,16 +51,21 @@ use mempressure::read_mem_available;
 mod handle;
 pub use handle::AppHandle;
 use handle::DigestCache;
-use handle::{
-    AppMaps, AppState, MAX_ROLLOUT_HISTORY, StartClaim, make_handle, make_handle_with_rollouts,
-};
+use handle::{AppState, MAX_ROLLOUT_HISTORY, StartClaim, make_handle, make_handle_with_rollouts};
+
+mod registry;
+use registry::{InsertCollision, Registry};
+
+mod store;
+use store::AppStore;
 
 mod view;
 pub use view::{AppStateView, AppView};
 use view::{emit_resource_metrics, view_of};
 
 mod persist;
-use persist::{RolloutsFile, load_persisted_state};
+#[cfg(test)]
+use persist::RolloutsFile;
 
 /// How long to wait for an app to start accepting TCP connections on its
 /// declared port after libcontainer reports the container is running.
@@ -80,14 +84,16 @@ const READINESS_TIMEOUT_DEFAULT: Duration = Duration::from_secs(10);
 pub struct AppHost<R: RuntimeOps, E: EgressOps> {
     runtime: Arc<R>,
     egress: Arc<E>,
-    /// Directory where bugpotd persists its own view of the world:
-    /// `<state>/apps/<name>.toml` for `AppSpec`,
-    /// `<state>/rollouts/<name>.toml` for rollout history. Operators
-    /// do not edit anything under here — every spec change goes
-    /// through the admin API.
-    state_dir: PathBuf,
+    /// In-memory ownership of the registered apps. The two indexes
+    /// (`by_name` + `by_subdomain`) are atomic under a single
+    /// `RwLock` inside [`Registry`].
+    registry: Registry,
+    /// On-disk shadow of `registry`: `<state>/apps/<name>.toml` for
+    /// `AppSpec`, `<state>/rollouts/<name>.toml` for rollout history.
+    /// Operators do not edit anything under here — every spec change
+    /// goes through the admin API.
+    store: AppStore,
     auth: AuthConfig,
-    apps: RwLock<AppMaps>,
     /// One-shot guard for `reattach_running`. The controller is only
     /// meant to reattach once per bugpot process — the function calls
     /// `ensure_log_tails` per surviving app, and a second call would
@@ -110,33 +116,28 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
         state_dir: PathBuf,
         auth: AuthConfig,
     ) -> Result<Self> {
-        let specs_dir = state_dir.join("apps");
-        let rollouts_dir = state_dir.join("rollouts");
-        std::fs::create_dir_all(&specs_dir)
-            .with_context(|| format!("create {}", specs_dir.display()))?;
-        std::fs::create_dir_all(&rollouts_dir)
-            .with_context(|| format!("create {}", rollouts_dir.display()))?;
+        let store = AppStore::new(state_dir);
+        store.ensure_dirs()?;
 
-        let mut maps = AppMaps::default();
-        for (spec, rollouts) in load_persisted_state(&specs_dir, &rollouts_dir)? {
+        let mut handles = Vec::new();
+        for (spec, rollouts) in store.load()? {
             // Specs persisted by bugpot have already passed validation
             // before being written; corrupted state here is operator-
             // investigation territory, but we fail loudly rather than
             // silently dropping the app.
             let handle = make_handle_with_rollouts(spec, rollouts)
                 .map_err(|e| anyhow!("rehydrate handle: {e}"))?;
-            maps.by_subdomain
-                .insert(handle.identity.subdomain.clone(), Arc::clone(&handle));
-            maps.by_name.insert(handle.identity.name.clone(), handle);
+            handles.push(handle);
         }
+        let registry = Registry::from_handles(handles);
         #[allow(clippy::cast_precision_loss)]
-        gauge!("bugpot_apps_active").set(maps.by_name.len() as f64);
+        gauge!("bugpot_apps_active").set(registry.len_blocking() as f64);
         Ok(Self {
             runtime,
             egress,
-            state_dir,
+            registry,
+            store,
             auth,
-            apps: RwLock::new(maps),
             reattach_done: AtomicBool::new(false),
         })
     }
@@ -542,18 +543,18 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
         let name = spec.name.clone();
         let subdomain = spec.subdomain().to_owned();
 
-        // Fast-fail on obvious collisions before persisting.
-        {
-            let maps = self.apps.read().await;
-            if maps.by_name.contains_key(&name) {
-                return Err(DeployError::AlreadyExists(name));
-            }
-            if maps.by_subdomain.contains_key(&subdomain) {
-                return Err(DeployError::SubdomainTaken(subdomain));
-            }
+        // Fast-fail on obvious collisions before doing disk I/O. The
+        // authoritative check is the `try_insert` below, under the
+        // write lock; this just saves a TOML write on the rare
+        // race-loser case.
+        if let Some(collision) = self.registry.would_collide(&name, &subdomain).await {
+            return Err(match collision {
+                InsertCollision::NameTaken => DeployError::AlreadyExists(name),
+                InsertCollision::SubdomainTaken => DeployError::SubdomainTaken(subdomain),
+            });
         }
 
-        let toml_path = self.spec_path(&name);
+        let toml_path = self.store.spec_path(&name);
         let toml_body =
             toml::to_string_pretty(&spec).with_context(|| format!("serialize app for {name}"))?;
         tokio::fs::write(&toml_path, toml_body)
@@ -562,21 +563,12 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
 
         let handle = make_handle(spec.clone(), None)?;
 
-        {
-            let mut maps = self.apps.write().await;
-            // Re-check under the write lock — a concurrent deploy may have
-            // raced into the same keys.
-            if maps.by_name.contains_key(&name) {
-                discard_failed_toml(&toml_path).await;
-                return Err(DeployError::AlreadyExists(name));
-            }
-            if maps.by_subdomain.contains_key(&subdomain) {
-                discard_failed_toml(&toml_path).await;
-                return Err(DeployError::SubdomainTaken(subdomain));
-            }
-            maps.by_subdomain
-                .insert(subdomain.clone(), Arc::clone(&handle));
-            maps.by_name.insert(name.clone(), Arc::clone(&handle));
+        if let Err(collision) = self.registry.try_insert(Arc::clone(&handle)).await {
+            self.store.discard_failed_spec(&name).await;
+            return Err(match collision {
+                InsertCollision::NameTaken => DeployError::AlreadyExists(name),
+                InsertCollision::SubdomainTaken => DeployError::SubdomainTaken(subdomain),
+            });
         }
         gauge!("bugpot_apps_active").increment(1.0);
 
@@ -656,7 +648,7 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
             *guard = new_spec.clone();
         }
 
-        if let Err(e) = self.persist_spec(handle).await {
+        if let Err(e) = self.store.persist_spec(handle).await {
             return Err(UpdateError::Internal(e));
         }
 
@@ -738,7 +730,7 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
 
         // 3. Persist the rollout to its own state file. Spec doesn't
         // change here, so no spec rewrite needed.
-        if let Err(e) = self.persist_rollouts(handle).await {
+        if let Err(e) = self.store.persist_rollouts(handle).await {
             warn!(app = %name, error = ?e, "failed to persist rollouts");
         }
 
@@ -780,46 +772,6 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
         handle.inner.lock().await.rollouts.iter().cloned().collect()
     }
 
-    fn spec_path(&self, name: &str) -> PathBuf {
-        self.state_dir.join("apps").join(format!("{name}.toml"))
-    }
-
-    fn rollouts_path(&self, name: &str) -> PathBuf {
-        self.state_dir.join("rollouts").join(format!("{name}.toml"))
-    }
-
-    /// Persist the handle's spec (post-update) to
-    /// `<state>/apps/<name>.toml`. Best-effort; the caller logs on
-    /// error.
-    async fn persist_spec(&self, handle: &Arc<AppHandle>) -> Result<()> {
-        let name = &handle.identity.name;
-        let spec = handle.spec.read().await.clone();
-        let body =
-            toml::to_string_pretty(&spec).with_context(|| format!("serialize spec for {name}"))?;
-        let path = self.spec_path(name);
-        tokio::fs::write(&path, body)
-            .await
-            .with_context(|| format!("write {}", path.display()))?;
-        Ok(())
-    }
-
-    /// Persist the handle's full rollout history to
-    /// `<state>/rollouts/<name>.toml`. The file is daemon-owned; no
-    /// operator should ever edit it, so the on-disk shape is purely
-    /// `[[rollout]]` entries (oldest first, back = current).
-    async fn persist_rollouts(&self, handle: &Arc<AppHandle>) -> Result<()> {
-        let name = &handle.identity.name;
-        let rollouts: Vec<Rollout> = handle.inner.lock().await.rollouts.iter().cloned().collect();
-        let file = RolloutsFile { rollouts };
-        let body = toml::to_string_pretty(&file)
-            .with_context(|| format!("serialize rollouts for {name}"))?;
-        let path = self.rollouts_path(name);
-        tokio::fs::write(&path, body)
-            .await
-            .with_context(|| format!("write {}", path.display()))?;
-        Ok(())
-    }
-
     /// Unregister an app. Stops the container (if running), drops
     /// the registry entries, and deletes the on-disk spec + rollouts
     /// files. Caller proves the handle is registered (by passing the
@@ -834,11 +786,7 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
 
     async fn do_remove(&self, handle: &Arc<AppHandle>) -> Result<()> {
         let name = handle.name();
-        {
-            let mut maps = self.apps.write().await;
-            maps.by_name.remove(name);
-            maps.by_subdomain.remove(handle.subdomain());
-        }
+        self.registry.remove(name, handle.subdomain()).await;
         gauge!("bugpot_apps_active").decrement(1.0);
         if let Err(e) = self.stop(handle).await {
             warn!(app = %name, error = ?e, "stop failed during remove");
@@ -857,8 +805,7 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
                 "cleanup_orphan_container failed during remove; bundle / volume dir may leak",
             );
         }
-        try_remove_file(&self.spec_path(name)).await;
-        try_remove_file(&self.rollouts_path(name)).await;
+        self.store.remove(name).await;
         Ok(())
     }
 
@@ -880,13 +827,13 @@ impl<R: RuntimeOps, E: EgressOps> AppHost<R, E> {
     /// builders) compose on top of this so the registry's read
     /// access path lives in exactly one place.
     pub async fn find_handle(&self, name: &str) -> Option<Arc<AppHandle>> {
-        self.apps.read().await.by_name.get(name).cloned()
+        self.registry.find_by_name(name).await
     }
 
     /// Snapshot of every registered handle. Ordering is undefined —
     /// callers that need a stable presentation order sort downstream.
     pub async fn list_handles(&self) -> Vec<Arc<AppHandle>> {
-        self.apps.read().await.by_name.values().cloned().collect()
+        self.registry.list().await
     }
 
     /// Ensure the app is running, coalescing concurrent starts. Returns
@@ -1202,34 +1149,6 @@ async fn record_rollout(
     inner.image_digest = Some(DigestCache { repo, digest });
 }
 
-/// Best-effort cleanup of a TOML written by `deploy_app` that the
-/// subsequent collision-check rejected. The error is non-fatal — the
-/// stale file will be picked up by orphan cleanup at the next bugpot
-/// restart — but we log it so operators see leak when it happens.
-async fn discard_failed_toml(path: &Path) {
-    if let Err(e) = tokio::fs::remove_file(path).await {
-        warn!(
-            path = %path.display(),
-            error = %e,
-            "leftover TOML from a failed deploy_app could not be removed; \
-             orphan cleanup at next startup will reclaim it"
-        );
-    }
-}
-
-/// Best-effort `remove_file` that treats `NotFound` as success. Used
-/// by `do_remove` to clear per-app state files; the previous
-/// `path.exists()` + `remove_file` pair had a TOCTOU window (and
-/// would spuriously warn when a concurrent operator beat us to the
-/// delete).
-async fn try_remove_file(path: &Path) {
-    match tokio::fs::remove_file(path).await {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => warn!(path = %path.display(), error = %e, "remove file failed"),
-    }
-}
-
 /// If `digest` is `Some`, return an OCI reference pinned to that
 /// digest so a subsequent pull skips the registry-side
 /// `manifest_probe`. Returns the original reference unchanged when
@@ -1247,12 +1166,9 @@ impl<R: RuntimeOps, E: EgressOps> UpstreamResolver for AppHost<R, E> {
     async fn resolve(&self, host: &str) -> Result<Upstream, ResolveError> {
         let subdomain = subdomain_of(host).ok_or(ResolveError::NoSuchApp)?;
         let handle = self
-            .apps
-            .read()
+            .registry
+            .find_by_subdomain(subdomain)
             .await
-            .by_subdomain
-            .get(subdomain)
-            .cloned()
             .ok_or(ResolveError::NoSuchApp)?;
         let port = handle.spec.read().await.port;
         match self.ensure_running(&handle).await {
@@ -1824,10 +1740,10 @@ mod tests {
             .runtime
             .push_pull(Err(RuntimeError::Other("registry down".into())));
 
-        let handle = {
-            let maps = controller.apps.read().await;
-            maps.by_name.get("alpha").cloned().expect("handle present")
-        };
+        let handle = controller
+            .find_handle("alpha")
+            .await
+            .expect("handle present");
         let res = controller.ensure_running(&handle).await;
         assert!(res.is_err(), "expected pull failure to propagate");
 
@@ -1869,28 +1785,24 @@ mod tests {
 
         controller.reattach_running(&mut claims).await;
 
-        let alpha_state = {
-            let maps = controller.apps.read().await;
-            maps.by_name
-                .get("alpha")
-                .unwrap()
-                .inner
-                .lock()
-                .await
-                .state
-                .clone()
-        };
-        let beta_state = {
-            let maps = controller.apps.read().await;
-            maps.by_name
-                .get("beta")
-                .unwrap()
-                .inner
-                .lock()
-                .await
-                .state
-                .clone()
-        };
+        let alpha_state = controller
+            .find_handle("alpha")
+            .await
+            .unwrap()
+            .inner
+            .lock()
+            .await
+            .state
+            .clone();
+        let beta_state = controller
+            .find_handle("beta")
+            .await
+            .unwrap()
+            .inner
+            .lock()
+            .await
+            .state
+            .clone();
         assert!(
             matches!(alpha_state, AppState::Running { container_ip } if container_ip == Ipv4Addr::new(10, 0, 0, 42)),
             "alpha should be Running with recovered IP, got {alpha_state:?}"
@@ -2009,10 +1921,7 @@ mod tests {
 
         // Force the handle into Running state without going through the
         // real cold-start path.
-        let handle = {
-            let maps = controller.apps.read().await;
-            maps.by_name.get("alpha").cloned().unwrap()
-        };
+        let handle = controller.find_handle("alpha").await.unwrap();
         {
             let mut inner = handle.inner.lock().await;
             inner.state = AppState::Running {
@@ -2066,10 +1975,7 @@ mod tests {
             }),
         );
         let controller = make_controller(vec![stored], tmp.path().to_owned());
-        let handle = {
-            let maps = controller.apps.read().await;
-            maps.by_name.get("alpha").cloned().unwrap()
-        };
+        let handle = controller.find_handle("alpha").await.unwrap();
         force_running(&handle).await;
         controller.runtime.set_running("alpha", true);
 
@@ -2107,10 +2013,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let controller =
             make_controller(vec![stored_with_name("alpha", "v1")], tmp.path().to_owned());
-        let handle = {
-            let maps = controller.apps.read().await;
-            maps.by_name.get("alpha").cloned().unwrap()
-        };
+        let handle = controller.find_handle("alpha").await.unwrap();
         force_running(&handle).await;
         handle.active_upgrades.fetch_add(1, Ordering::Relaxed);
 
@@ -2137,10 +2040,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let controller =
             make_controller(vec![stored_with_name("alpha", "v1")], tmp.path().to_owned());
-        let handle = {
-            let maps = controller.apps.read().await;
-            maps.by_name.get("alpha").cloned().unwrap()
-        };
+        let handle = controller.find_handle("alpha").await.unwrap();
         let frozen_ip = Ipv4Addr::new(10, 0, 0, 7);
         {
             let mut inner = handle.inner.lock().await;
@@ -2180,13 +2080,8 @@ mod tests {
             ],
             tmp.path().to_owned(),
         );
-        let (alpha, beta) = {
-            let maps = controller.apps.read().await;
-            (
-                maps.by_name.get("alpha").cloned().unwrap(),
-                maps.by_name.get("beta").cloned().unwrap(),
-            )
-        };
+        let alpha = controller.find_handle("alpha").await.unwrap();
+        let beta = controller.find_handle("beta").await.unwrap();
         let now = Instant::now();
         {
             let mut inner = alpha.inner.lock().await;
