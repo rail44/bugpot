@@ -11,6 +11,7 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 axum.workspace = true
 hex = "0.4"
 hmac = "0.13"
