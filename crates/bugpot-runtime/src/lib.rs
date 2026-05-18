@@ -36,6 +36,4 @@ mod volumes;
 pub use auth::Auth;
 pub use error::RuntimeError;
 pub use image::ImageId;
-pub use runtime::{
-    ContainerOps, ImageOps, LogOps, ResourceUsage, RunningApp, Runtime, RuntimeOps,
-};
+pub use runtime::{ContainerOps, ImageOps, LogOps, ResourceUsage, RunningApp, Runtime, RuntimeOps};
