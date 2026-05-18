@@ -259,7 +259,7 @@ scripts/analysis (`bugpot-analyzer`; dev-only static-analysis CLI for
 
 1. Router receives HTTP, extracts first DNS label of `Host` (see `subdomain_of` in `bugpot-router`).
 2. Calls `UpstreamResolver::resolve` — the controller's impl, which **may take seconds** (cold start).
-3. Controller's `AppHandle` state machine (`Stopped → Starting → Running ↔ Frozen → Stopping → Stopped`) gates work: concurrent starts on the same app coalesce on a per-handle `Notify`. `Frozen` is the idle-timeout target (see Scale-to-zero below); the `Running ↔ Frozen` edge is bidirectional (freeze on idle, resume on request).
+3. Controller's `AppHandle` state machine (`Stopped → Starting → Running ↔ Frozen → Stopping → Stopped`, plus `Running → RollingOver → Running` for blue-green rollouts) gates work: concurrent starts on the same app coalesce on a per-handle `Notify`. `Frozen` is the idle-timeout target (see Scale-to-zero below); the `Running ↔ Frozen` edge is bidirectional (freeze on idle, resume on request). `RollingOver` is the in-flight half of a blue-green deployment (see Blue-green rollouts below); the resolver returns `from_ip` for the duration, then flips atomically when readiness passes on the new slot.
 4. On cold start: `Egress::allocate_endpoint` (netns + veth + IP + DNS registry) → `Runtime::pull_image` → `Runtime::start_app` (passes the netns path to libcontainer) → readiness probe on the app's declared port (TCP-bind by default; HTTP GET when `[readiness] path` is set — see below).
 5. Router proxies via `hyper_util` legacy client; HTTP/1.1 Upgrade (e.g. WebSocket) is spliced bidirectionally.
 
@@ -320,6 +320,23 @@ path = "/health"     # optional; opt into HTTP probing
 
 The HTTP probe is implemented inline (raw `TcpStream` + a 200-byte read of the response head) rather than via a hyper or reqwest client to keep `bugpot-core`'s dep graph stable — a single `GET` with `Connection: close` is the smallest possible HTTP/1.1 exchange and the parser only needs the status code.
 
+### Blue-green rollouts
+
+Both `POST /apps/<name>/rollouts` and `PATCH /apps/<name>` (when the spec actually changes) bring traffic to the new image without a serving gap. The new container starts in the *opposite* slot from the running one, readiness is verified against its endpoint, and the resolver flips atomically. The old slot is then drained (60s defensive cap on spliced WebSocket / SSE upgrades) and torn down. On readiness or start failure, state restores to the from-side; the new slot is reaped.
+
+**Slot suffix in identifiers.** Each app owns two slot identities `name-a` and `name-b`. Bugpot alternates between them on every successful rollover, and the slot suffix appears in:
+
+- the libcontainer container ID (`<state>/containers/<app>-{a,b}/`),
+- the bundle directory (`<state>/bundles/<app>-{a,b}/`),
+- the network namespace name (`bugpot-<app>-{a,b}`),
+- the veth pair names (derived from a hash of the container ID).
+
+The per-app **log files** (`<state>/logs/<app>/{stdout,stderr}.log`) and **volume tree** (`<state>/volumes/<app>/`) stay app-keyed — both slots share them so logs aren't fragmented across rollovers and persistent volume data survives a slot flip.
+
+**Mid-rollover crash recovery.** If bugpotd crashes mid-rollover, both slots are on disk. On reattach, bugpot detects this (probes both slot A and B), purges both containers + endpoints, and leaves the app `Stopped` — the next request cold-starts under the new tag, which `set_rollout` had already persisted before any container work began. Convention: never try to reconstruct which slot was the "from" side from libcontainer state; always redo the rollout.
+
+**Frozen rollover.** If the app is `Frozen` when a rollout arrives, the from-side is thawed first so it can serve any request that lands during the build window. Without thawing, the resolver returns `from_ip` but the container is paused and requests stall.
+
 ### Persistent volumes
 
 Stateful self-hosted apps (Vaultwarden's sqlite DB, Linkding's bookmarks DB, etc.) survive freeze (the container's fs is untouched while paused) but **would lose data on a stop** — including memory-pressure eviction, manual restart, or any bugpot-side teardown. The `[[volumes]]` section of an app TOML declares one or more bind mounts from `<state>/volumes/<app>/<name>/` into the container:
@@ -333,7 +350,7 @@ user = 33           # optional: chown the host dir to this UID at start
 
 **Permissions trap.** Containers typically run as a non-root user (Linkding uid=33, Vaultwarden uid=1000, …). The host-side directory inherits root ownership at creation; without setting `user` the app will get `EACCES` on first write. bugpot chowns to `user:user` on every start (idempotent for unchanged values; correctly re-chowns if the operator updates the TOML).
 
-**Lifecycle.** Volumes are created lazily on first start (`volumes::ensure_volume_host_dirs`, a `bugpot-runtime` free fn called from `Runtime::start_app`), preserved across freeze / rollouts / memory-pressure eviction, and removed only when the app itself is removed (`DELETE /apps/<name>` flows through `cleanup_orphan_container`, which now also drops the volume dir). Removing the `[[volumes]]` entry from a TOML without deleting the app leaves the host directory on disk — operators can re-add the same `name` and the data is still there.
+**Lifecycle.** Volumes are created lazily on first start (`volumes::ensure_volume_host_dirs`, a `bugpot-runtime` free fn called from `Runtime::start_app`), preserved across freeze / rollouts / memory-pressure eviction, and removed only when the app itself is removed (`DELETE /apps/<name>` flows through `RuntimeOps::cleanup_app_assets`, paired with `cleanup_container` per slot for the bundle + libcontainer state). Removing the `[[volumes]]` entry from a TOML without deleting the app leaves the host directory on disk — operators can re-add the same `name` and the data is still there.
 
 **Reserved paths.** Volumes cannot target `/`, `/proc`, `/sys`, `/dev`, `/dev/pts`, `/dev/shm`, `/dev/mqueue`, or `/etc/resolv.conf` — these are owned by the OCI default mounts or bugpot's DNS bind. `validate_volumes` rejects collisions at deploy time so a bad TOML never reaches `start_app`.
 

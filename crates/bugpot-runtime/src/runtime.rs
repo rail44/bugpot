@@ -162,7 +162,7 @@ pub struct Runtime {
     /// `<state>/logs/<app>/{stdout,stderr}.log` via inotify.
     /// `ensure_log_tails` inserts on first spawn (idempotent;
     /// re-entry is a no-op so reattach + start-time spawns can't
-    /// double up). `cleanup_orphan_container` removes + aborts on
+    /// double up). `cleanup_app_assets` removes + aborts on
     /// app removal — without that the inotify watches outlive the
     /// container because the log files themselves are kept around
     /// for post-mortem (CLAUDE.md L333). `std::sync::Mutex` (not
@@ -398,7 +398,7 @@ impl RuntimeOps for Runtime {
         // for an existing volume is a no-op aside from re-asserting
         // ownership (so a TOML `user` change does the right thing on
         // next start). Data survives across container restarts and
-        // rollouts; only `cleanup_orphan_container` removes the dir.
+        // rollouts; only `cleanup_app_assets` removes the dir.
         let volume_host_paths =
             ensure_volume_host_dirs(&self.volumes_dir, app_name, &spec.volumes)?;
 

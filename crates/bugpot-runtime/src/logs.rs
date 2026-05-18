@@ -149,7 +149,7 @@ pub(crate) async fn forward_log_file(path: PathBuf, app: String, stream: &'stati
 /// return their `JoinHandle`s. The caller is responsible for parking
 /// the handles somewhere they can be `.abort()`-ed when the app is
 /// removed (see `Runtime::ensure_log_tails` /
-/// `Runtime::cleanup_orphan_container`). Without that pairing the
+/// `Runtime::cleanup_app_assets`). Without that pairing the
 /// tasks leak — inotify watches survive container removal because
 /// the log files themselves are kept around for post-mortem
 /// (CLAUDE.md L333).
