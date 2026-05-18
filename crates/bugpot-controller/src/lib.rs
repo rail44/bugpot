@@ -31,7 +31,7 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use bugpot_config::{AppSpec, AuthConfig, RegistryCredential, Rollout, registry_host};
-use bugpot_egress::EgressOps;
+use bugpot_egress::{EgressOps, StartupClaims};
 use bugpot_router::{ResolveError, Upstream, UpstreamResolver, subdomain_of};
 #[cfg(test)]
 use bugpot_runtime::RuntimeError;
@@ -185,7 +185,7 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
     /// surviving app, and running it twice would double-tail every
     /// file — harmless functionally but visible as duplicate lines in
     /// tracing.
-    pub async fn reattach_running(&self) {
+    pub async fn reattach_running(&self, claims: &mut StartupClaims) {
         if self.reattach_done.swap(true, Ordering::SeqCst) {
             warn!("reattach_running called more than once; ignoring subsequent calls");
             return;
@@ -201,9 +201,21 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
             if !self.runtime.is_container_running(name) && !is_paused {
                 continue;
             }
+            let Some(container_ip) = claims.claim(name) else {
+                warn!(
+                    app = %name,
+                    "container is running but no netns IP was discovered; \
+                     leaving as Stopped — next request will cold-start"
+                );
+                continue;
+            };
             let allowlist = handle.spec.read().await.egress.allow.clone();
-            match self.egress.reattach_endpoint(name, allowlist).await {
-                Ok(Some(ep)) => {
+            match self
+                .egress
+                .reattach_endpoint(name, container_ip, allowlist)
+                .await
+            {
+                Ok(ep) => {
                     {
                         let mut inner = handle.inner.lock().await;
                         inner.state = if is_paused {
@@ -232,13 +244,6 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
                         "reattached to surviving container",
                     );
                 }
-                Ok(None) => {
-                    warn!(
-                        app = %name,
-                        "container is running but no netns IP was discovered; \
-                         leaving as Stopped — next request will cold-start"
-                    );
-                }
                 Err(e) => {
                     warn!(app = %name, error = ?e, "reattach failed; leaving as Stopped");
                 }
@@ -259,9 +264,8 @@ impl<R: RuntimeOps, E: EgressOps> AppController<R, E> {
     ///
     /// Called once at startup after `reattach_running`. Safe to call
     /// when there are no orphans (no-op).
-    pub async fn cleanup_orphans(&self) {
-        let orphans = self.egress.drain_unreclaimed_endpoints();
-        for (name, ip) in orphans {
+    pub async fn cleanup_orphans(&self, claims: StartupClaims) {
+        for (name, ip) in claims.drain() {
             info!(app = %name, %ip, "cleaning up orphan: TOML no longer present");
             if let Err(e) = self.runtime.cleanup_orphan_container(&name).await {
                 warn!(app = %name, error = ?e, "cleanup orphan container failed");
@@ -1376,9 +1380,6 @@ mod tests {
     struct MockEgress {
         allocate_fail: StdMutex<bool>,
         endpoints: StdMutex<HashMap<String, Endpoint>>,
-        /// Pre-discovered endpoints — the reattach analogue of what real
-        /// `Egress::new` would have found by scanning `bugpot-*` netns.
-        discovered: StdMutex<HashMap<String, Ipv4Addr>>,
         calls: StdMutex<Vec<String>>,
     }
 
@@ -1386,9 +1387,16 @@ mod tests {
         fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
         }
-        fn set_discovered(&self, name: &str, ip: Ipv4Addr) {
-            self.discovered.lock().unwrap().insert(name.to_owned(), ip);
-        }
+    }
+
+    /// Build a [`StartupClaims`] for tests. Mirrors what
+    /// `Egress::new`'s discovery phase produces in production.
+    fn claims_with(entries: &[(&str, Ipv4Addr)]) -> StartupClaims {
+        let map = entries
+            .iter()
+            .map(|(name, ip)| ((*name).to_owned(), *ip))
+            .collect();
+        StartupClaims::new(map)
     }
 
     impl EgressOps for MockEgress {
@@ -1427,15 +1435,13 @@ mod tests {
         async fn reattach_endpoint(
             &self,
             name: &str,
+            container_ip: Ipv4Addr,
             _allowlist: Vec<String>,
-        ) -> anyhow::Result<Option<Endpoint>> {
+        ) -> anyhow::Result<Endpoint> {
             self.calls
                 .lock()
                 .unwrap()
                 .push(format!("reattach_endpoint({name})"));
-            let Some(container_ip) = self.discovered.lock().unwrap().remove(name) else {
-                return Ok(None);
-            };
             let ep = Endpoint {
                 container_ip,
                 netns_path: PathBuf::from(format!("/run/netns/mock-{name}")),
@@ -1444,15 +1450,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(name.to_owned(), ep.clone());
-            Ok(Some(ep))
-        }
-
-        fn drain_unreclaimed_endpoints(&self) -> Vec<(String, Ipv4Addr)> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push("drain_unreclaimed_endpoints".to_owned());
-            self.discovered.lock().unwrap().drain().collect()
+            Ok(ep)
         }
 
         async fn cleanup_orphan_endpoint(
@@ -1851,11 +1849,9 @@ mod tests {
         );
         // alpha is alive with a recovered IP; beta is gone.
         controller.runtime.set_running("alpha", true);
-        controller
-            .egress
-            .set_discovered("alpha", Ipv4Addr::new(10, 0, 0, 42));
+        let mut claims = claims_with(&[("alpha", Ipv4Addr::new(10, 0, 0, 42))]);
 
-        controller.reattach_running().await;
+        controller.reattach_running(&mut claims).await;
 
         let alpha_state = {
             let maps = controller.apps.read().await;
@@ -1920,15 +1916,13 @@ mod tests {
         let controller =
             make_controller(vec![stored_with_name("alpha", "v1")], tmp.path().to_owned());
         controller.runtime.set_running("alpha", true);
-        controller
-            .egress
-            .set_discovered("alpha", Ipv4Addr::new(10, 0, 0, 5));
-        controller
-            .egress
-            .set_discovered("beta", Ipv4Addr::new(10, 0, 0, 9));
+        let mut claims = claims_with(&[
+            ("alpha", Ipv4Addr::new(10, 0, 0, 5)),
+            ("beta", Ipv4Addr::new(10, 0, 0, 9)),
+        ]);
 
-        controller.reattach_running().await;
-        controller.cleanup_orphans().await;
+        controller.reattach_running(&mut claims).await;
+        controller.cleanup_orphans(claims).await;
 
         // alpha was reattached, not orphaned.
         let rt_calls = controller.runtime.calls();
@@ -1964,12 +1958,13 @@ mod tests {
         let controller =
             make_controller(vec![stored_with_name("alpha", "v1")], tmp.path().to_owned());
         controller.runtime.set_running("alpha", true);
-        controller
-            .egress
-            .set_discovered("alpha", Ipv4Addr::new(10, 0, 0, 7));
+        let mut claims = claims_with(&[("alpha", Ipv4Addr::new(10, 0, 0, 7))]);
 
-        controller.reattach_running().await;
-        controller.reattach_running().await; // should short-circuit
+        controller.reattach_running(&mut claims).await;
+        // A second pass with a freshly-discovered claims map should
+        // still short-circuit at the controller's once-guard.
+        let mut second = claims_with(&[("alpha", Ipv4Addr::new(10, 0, 0, 7))]);
+        controller.reattach_running(&mut second).await;
 
         let eg_reattach_calls = controller
             .egress

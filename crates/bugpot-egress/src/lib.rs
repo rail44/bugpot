@@ -165,22 +165,17 @@ pub trait EgressOps: Send + Sync + std::fmt::Debug + 'static {
         allowlist: Vec<String>,
     ) -> impl Future<Output = anyhow::Result<Endpoint>> + Send;
     fn release_endpoint(&self, name: &str) -> impl Future<Output = anyhow::Result<()>> + Send;
-    /// Re-register an endpoint that was already provisioned by a previous
-    /// bugpot run. Returns `Ok(None)` when no live netns matches `name`
-    /// (no IP was discovered for it at startup), `Ok(Some(_))` when the
-    /// app has been re-bound to its existing IP + allowlist without
-    /// touching netns/veth/nft. Does not allocate or release host
-    /// resources.
+    /// Re-register an endpoint that was already provisioned by a
+    /// previous bugpot run. Caller passes the `container_ip` returned
+    /// from [`StartupClaims::claim`]; the host-side netns + veth + nft
+    /// entries are reused as-is and a fresh [`Endpoint`] is produced.
+    /// Does not allocate or release host resources.
     fn reattach_endpoint(
         &self,
         name: &str,
+        container_ip: Ipv4Addr,
         allowlist: Vec<String>,
-    ) -> impl Future<Output = anyhow::Result<Option<Endpoint>>> + Send;
-    /// Drain the set of endpoints that were discovered at startup but
-    /// never claimed by `reattach_endpoint` (i.e. their `AppSpec` is no
-    /// longer present). The returned entries must be passed to
-    /// `cleanup_orphan_endpoint` to release the kernel resources.
-    fn drain_unreclaimed_endpoints(&self) -> Vec<(String, Ipv4Addr)>;
+    ) -> impl Future<Output = anyhow::Result<Endpoint>> + Send;
     /// Tear down an orphan endpoint discovered at startup: delete the
     /// netns + host-side veth, flush its nft allow-set entries, and
     /// release its IP back to the allocator. Idempotent.
@@ -189,6 +184,56 @@ pub trait EgressOps: Send + Sync + std::fmt::Debug + 'static {
         name: &str,
         container_ip: Ipv4Addr,
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
+}
+
+/// Discovered-endpoint inventory built once during [`Egress::new`].
+///
+/// Endpoints from a previous bugpot run live here until they're
+/// matched against the current registration set. Callers move through
+/// two phases:
+///
+///   1. Per known app, call [`Self::claim`] to take ownership of the
+///      IP (if any) and pass it to
+///      [`EgressOps::reattach_endpoint`].
+///   2. After the reattach pass, call [`Self::drain`] to consume the
+///      remainder — those are orphans whose `AppSpec` was deleted
+///      while bugpot was down — and feed each `(name, ip)` into
+///      [`EgressOps::cleanup_orphan_endpoint`].
+///
+/// The `&mut` on `claim` and the consuming `drain` make the lifecycle
+/// single-pass at the type level. The value is returned alongside
+/// `Egress`, not stored on it, so a future refactor can't accidentally
+/// re-discover endpoints mid-run.
+#[derive(Debug)]
+pub struct StartupClaims {
+    discovered: std::collections::HashMap<String, Ipv4Addr>,
+}
+
+impl StartupClaims {
+    #[must_use]
+    pub const fn new(discovered: std::collections::HashMap<String, Ipv4Addr>) -> Self {
+        Self { discovered }
+    }
+
+    /// Take the discovered IP for `name`, if one was discovered.
+    /// Subsequent calls for the same name return `None`.
+    pub fn claim(&mut self, name: &str) -> Option<Ipv4Addr> {
+        self.discovered.remove(name)
+    }
+
+    /// Consume the un-claimed entries. Called once after every
+    /// reattach pass completes.
+    #[must_use]
+    pub fn drain(mut self) -> Vec<(String, Ipv4Addr)> {
+        self.discovered.drain().collect()
+    }
+
+    /// Inspection helper: how many endpoints are still un-claimed.
+    /// Used for startup-log lines, not for control flow.
+    #[must_use]
+    pub fn remaining(&self) -> usize {
+        self.discovered.len()
+    }
 }
 
 /// In-memory record so we can free addresses on release and apply allowlist
@@ -203,10 +248,6 @@ struct AllocatedApp {
 pub struct Egress {
     allocator: Mutex<IpAllocator>,
     apps: Mutex<std::collections::HashMap<String, AllocatedApp>>,
-    /// IPs recovered from live `bugpot-*` netns at startup. Drained by
-    /// `reattach_endpoint` as each app gets reclaimed by the controller;
-    /// anything left over after reattach is an orphan netns (see #35).
-    discovered_endpoints: Mutex<std::collections::HashMap<String, Ipv4Addr>>,
     registry: Arc<AppRegistry>,
     // Holding the server keeps the DNS task alive for the lifetime of Egress.
     _dns_server: Option<DnsServer<EgressDnsHandler<HickoryUpstream, NftAllowSet>>>,
@@ -223,74 +264,130 @@ impl std::fmt::Debug for Egress {
 }
 
 impl Egress {
-    /// Bring up the bridge, install the nftables ruleset, and start the DNS
-    /// server. Requires root.
-    pub async fn new(config: EgressConfig) -> anyhow::Result<Self> {
+    /// Bring up the bridge, install the nftables ruleset, start the DNS
+    /// server, and discover any endpoints left behind by a previous
+    /// bugpot run. Requires root.
+    ///
+    /// Returns `(Egress, StartupClaims)`. The caller owns the claims
+    /// and threads them through the reattach + orphan-cleanup pass; the
+    /// `Egress` itself never reaches back into them, which is how the
+    /// type system enforces the "discover once, drain once" protocol.
+    ///
+    /// Failure modes by phase (each phase's failure leaves the
+    /// preceding phases' work in place; the next bugpot run reapplies
+    /// the bootstrap idempotently):
+    ///   1. **bridge setup** — best-effort, ignores `already exists`;
+    ///      never fails the call.
+    ///   2. **nftables ruleset** — fails closed. The previous table is
+    ///      flushed by `render_bootstrap`'s `delete table` line, so a
+    ///      partially-installed ruleset cannot linger.
+    ///   3. **DNS bind (UDP + TCP)** — fails closed. Leaves the nft
+    ///      ruleset active. Recovery: next bugpot start re-flushes the
+    ///      table.
+    ///   4. **allocator probe** — fails closed. Same recovery story.
+    ///   5. **`discover_endpoints`** — fails-soft inside the helper
+    ///      (logged + treated as empty); never bubbles up.
+    pub async fn new(config: EgressConfig) -> anyhow::Result<(Self, StartupClaims)> {
         let subnet = subnet();
         let bridge_ip = bridge_ip();
 
-        // 1. bridge + sysctl
-        let bridge_cmds = netns::render_setup_bridge(BRIDGE_NAME, bridge_ip, subnet);
-        // Best-effort: ignore "already exists" by re-running individually.
-        for cmd in bridge_cmds {
-            let _ = netns::run_cmds(vec![cmd]).await;
-        }
+        setup_bridge(bridge_ip, subnet).await;
+        install_nftables_ruleset(bridge_ip, subnet).await?;
+        let (registry, dns_server) = start_dns_server(&config, bridge_ip).await?;
+        let mut allocator = init_allocator(subnet, bridge_ip)?;
+        let discovered = discover_existing_endpoints(&mut allocator).await;
 
-        // 2. nftables ruleset
-        let nft_cfg = NftConfig {
-            table: NFT_TABLE.to_owned(),
-            bridge: BRIDGE_NAME.to_owned(),
-            subnet,
-            bridge_ip,
-            dns_port: DNS_PORT,
-            allow_ttl_secs: ALLOW_TTL_SECS,
-        };
-        nft::run_script(&nft::render_bootstrap(&nft_cfg))
-            .await
-            .context("install nft ruleset")?;
-
-        // 3. DNS handler + server
-        let registry = Arc::new(AppRegistry::new());
-        let upstream = Arc::new(HickoryUpstream::new(&config.dns_upstream)?);
-        let allow_set = Arc::new(NftAllowSet {
-            table: NFT_TABLE.to_owned(),
-        });
-        let handler = EgressDnsHandler::new(registry.clone(), upstream, allow_set, ALLOW_TTL_SECS);
-        let mut server = DnsServer::new(handler);
-        let bind_addr = SocketAddr::from((bridge_ip, DNS_PORT));
-        let udp = UdpSocket::bind(bind_addr)
-            .await
-            .with_context(|| format!("bind DNS UDP {bind_addr}"))?;
-        server.register_socket(udp);
-        let tcp = TcpListener::bind(bind_addr)
-            .await
-            .with_context(|| format!("bind DNS TCP {bind_addr}"))?;
-        server.register_listener(tcp, std::time::Duration::from_secs(5), 4096);
-
-        let mut allocator = IpAllocator::new(subnet, bridge_ip)?;
-        // Sanity allocate-and-release to prove the subnet works.
-        let probe = allocator.allocate()?;
-        allocator.release(probe);
-
-        // Discover endpoints left behind by a previous bugpot run so
-        // their IPs don't get re-allocated under another app. The
-        // controller drains this map via `reattach_endpoint` for apps
-        // that are still actually running; the rest remain orphans
-        // (#35).
-        let discovered = discover_endpoints().await;
-        for (name, ip) in &discovered {
-            tracing::info!(app = %name, %ip, "discovered existing endpoint");
-            allocator.mark_used(*ip);
-        }
-
-        Ok(Self {
+        let egress = Self {
             allocator: Mutex::new(allocator),
             apps: Mutex::new(std::collections::HashMap::new()),
-            discovered_endpoints: Mutex::new(discovered),
             registry,
-            _dns_server: Some(server),
-        })
+            _dns_server: Some(dns_server),
+        };
+        Ok((egress, StartupClaims::new(discovered)))
     }
+}
+
+/// Phase 1: bring up the bridge and turn on `ip_forward`. Idempotent
+/// across runs — each `ip` command is dispatched individually so an
+/// `already exists` failure on one doesn't poison the rest. Never
+/// fails the caller; missing bridge state surfaces later as endpoint
+/// allocation failures.
+async fn setup_bridge(bridge_ip: Ipv4Addr, subnet: Ipv4Net) {
+    let cmds = netns::render_setup_bridge(BRIDGE_NAME, bridge_ip, subnet);
+    for cmd in cmds {
+        let _ = netns::run_cmds(vec![cmd]).await;
+    }
+}
+
+/// Phase 2: render and install the bugpot nftables ruleset. The
+/// bootstrap script starts with `delete table inet <table>` so a prior
+/// run's state is replaced atomically.
+async fn install_nftables_ruleset(bridge_ip: Ipv4Addr, subnet: Ipv4Net) -> anyhow::Result<()> {
+    let nft_cfg = NftConfig {
+        table: NFT_TABLE.to_owned(),
+        bridge: BRIDGE_NAME.to_owned(),
+        subnet,
+        bridge_ip,
+        dns_port: DNS_PORT,
+        allow_ttl_secs: ALLOW_TTL_SECS,
+    };
+    nft::run_script(&nft::render_bootstrap(&nft_cfg))
+        .await
+        .context("install nft ruleset")
+}
+
+/// Phase 3: start the DNS handler, bind UDP + TCP on the bridge IP,
+/// and return the running server. A bind failure here leaves the nft
+/// ruleset active; the comment on `Egress::new` documents the
+/// idempotent recovery on next start.
+async fn start_dns_server(
+    config: &EgressConfig,
+    bridge_ip: Ipv4Addr,
+) -> anyhow::Result<(
+    Arc<AppRegistry>,
+    DnsServer<EgressDnsHandler<HickoryUpstream, NftAllowSet>>,
+)> {
+    let registry = Arc::new(AppRegistry::new());
+    let upstream = Arc::new(HickoryUpstream::new(&config.dns_upstream)?);
+    let allow_set = Arc::new(NftAllowSet {
+        table: NFT_TABLE.to_owned(),
+    });
+    let handler = EgressDnsHandler::new(registry.clone(), upstream, allow_set, ALLOW_TTL_SECS);
+    let mut server = DnsServer::new(handler);
+    let bind_addr = SocketAddr::from((bridge_ip, DNS_PORT));
+    let udp = UdpSocket::bind(bind_addr)
+        .await
+        .with_context(|| format!("bind DNS UDP {bind_addr}"))?;
+    server.register_socket(udp);
+    let tcp = TcpListener::bind(bind_addr)
+        .await
+        .with_context(|| format!("bind DNS TCP {bind_addr}"))?;
+    server.register_listener(tcp, std::time::Duration::from_secs(5), 4096);
+    Ok((registry, server))
+}
+
+/// Phase 4: build the IP allocator and verify the subnet is usable
+/// via a probe allocate-and-release.
+fn init_allocator(subnet: Ipv4Net, bridge_ip: Ipv4Addr) -> anyhow::Result<IpAllocator> {
+    let mut allocator = IpAllocator::new(subnet, bridge_ip)?;
+    let probe = allocator.allocate()?;
+    allocator.release(probe);
+    Ok(allocator)
+}
+
+/// Phase 5: discover endpoints from `bugpot-*` netns left behind by a
+/// previous bugpot run. Each (name, ip) is marked in-use in the
+/// allocator so subsequent allocations don't collide; the map itself
+/// is moved into `StartupClaims` for the controller to drain.
+async fn discover_existing_endpoints(
+    allocator: &mut IpAllocator,
+) -> std::collections::HashMap<String, Ipv4Addr> {
+    let discovered = discover_endpoints().await;
+    for (name, ip) in &discovered {
+        tracing::info!(app = %name, %ip, "discovered existing endpoint");
+        allocator.mark_used(*ip);
+    }
+    discovered
 }
 
 impl EgressOps for Egress {
@@ -339,11 +436,9 @@ impl EgressOps for Egress {
     async fn reattach_endpoint(
         &self,
         name: &str,
+        container_ip: Ipv4Addr,
         allowlist: Vec<String>,
-    ) -> anyhow::Result<Option<Endpoint>> {
-        let Some(container_ip) = self.discovered_endpoints.lock().remove(name) else {
-            return Ok(None);
-        };
+    ) -> anyhow::Result<Endpoint> {
         let parsed = Allowlist::parse(allowlist)?;
         let plan = EndpointLayout::new(name, container_ip, subnet());
         let ep = Endpoint {
@@ -360,11 +455,7 @@ impl EgressOps for Egress {
         self.apps
             .lock()
             .insert(name.to_string(), AllocatedApp { container_ip, plan });
-        Ok(Some(ep))
-    }
-
-    fn drain_unreclaimed_endpoints(&self) -> Vec<(String, Ipv4Addr)> {
-        self.discovered_endpoints.lock().drain().collect()
+        Ok(ep)
     }
 
     async fn cleanup_orphan_endpoint(

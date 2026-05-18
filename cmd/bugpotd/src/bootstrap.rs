@@ -87,11 +87,10 @@ impl Bootstrap {
             bridge_ip = %bugpot_egress::bridge_ip(),
             "bringing up egress"
         );
-        let egress = Arc::new(
-            Egress::new(cfg.egress)
-                .await
-                .context("init egress (bridge/DNS/nftables)")?,
-        );
+        let (egress, mut startup_claims) = Egress::new(cfg.egress)
+            .await
+            .context("init egress (bridge/DNS/nftables)")?;
+        let egress = Arc::new(egress);
 
         let state_dir = Runtime::default_state_dir();
         info!(state_dir = %state_dir.display(), "init runtime");
@@ -102,8 +101,8 @@ impl Bootstrap {
         let controller = Arc::new(
             AppController::new(runtime, egress, state_dir, auth).context("init controller")?,
         );
-        controller.reattach_running().await;
-        controller.cleanup_orphans().await;
+        controller.reattach_running(&mut startup_claims).await;
+        controller.cleanup_orphans(startup_claims).await;
 
         if let Err(e) = controller.deploy_always_on().await {
             error!(error = ?e, "eager-start failed; rolling back");
