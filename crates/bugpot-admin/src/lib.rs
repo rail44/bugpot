@@ -10,7 +10,7 @@
 //!   plane — `POST/GET /apps/<name>/rollouts` only. See
 //!   [`deploy_key`] for the HMAC derivation and verification rules.
 //!
-//! Translates HTTP requests to mutations on [`bugpot_controller::AppController`].
+//! Translates HTTP requests to mutations on [`bugpot_core::AppHost`].
 //! This crate is one of several possible deploy frontends (future: webhook
 //! receiver, GitHub poller, CLI over Unix socket); each translates an
 //! external trigger into the same controller method calls.
@@ -64,8 +64,8 @@ use axum::{
     routing::{get, post},
 };
 use bugpot_config::{AppSpec, Rollout};
-use bugpot_controller::{
-    AppController, AppHandle, AppView, DeployError, RemoveError, RolloutError, UpdateError,
+use bugpot_core::{
+    AppHandle, AppHost, AppView, DeployError, RemoveError, RolloutError, UpdateError,
 };
 use bugpot_egress::Egress;
 use bugpot_runtime::Runtime;
@@ -174,11 +174,11 @@ impl AdminAuth {
 /// The Linux production stack only has one `Runtime` / `Egress` pair,
 /// so spelling them out here avoids the `<R, E>` noise that used to
 /// follow every handler signature — without resorting to a `dyn`
-/// abstraction that no caller swaps. The `AppController`'s own
+/// abstraction that no caller swaps. The `AppHost`'s own
 /// parameterisation stays in place for controller-side tests
 /// (the mocks live in that crate); this crate just commits to the
 /// one shape it actually deploys with.
-type Controller = AppController<Runtime, Egress>;
+type Controller = AppHost<Runtime, Egress>;
 
 #[derive(Clone, Debug)]
 pub struct AdminState {

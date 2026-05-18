@@ -33,7 +33,7 @@ Dockerfile → automated rollouts via GitHub Actions).
 - **`bugpot-egress`** — bridge + netns + nftables + DNS allowlist
 - **`bugpot-runtime`** — OCI image pull + libcontainer lifecycle
 - **`bugpot-router`** — axum reverse proxy; routes by Host subdomain
-- **`bugpot-controller`** — per-app state machine, cold-start, idle reaper
+- **`bugpot-core`** — per-app state machine, cold-start, idle reaper
 - **`bugpot-admin`** — admin HTTP API (CRUD over the controller)
 - **`bugpot-metrics`** — Prometheus recorder + `/metrics`, `/healthz`
 

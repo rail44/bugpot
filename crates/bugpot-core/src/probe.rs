@@ -1,6 +1,6 @@
 //! Readiness probing for the cold-start path.
 //!
-//! Used by `AppController::do_start` after libcontainer reports the
+//! Used by `AppHost::do_start` after libcontainer reports the
 //! container is running but before the controller declares the start
 //! successful. Two modes selected by the app's TOML:
 //!

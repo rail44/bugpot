@@ -48,7 +48,7 @@ changes.
 ### Mac-native fast paths
 
 Most cargo commands have to run inside Lima because `bugpot-runtime`,
-`bugpot-egress`, `bugpot-controller`, `bugpot-admin`, and `cmd/bugpotd`
+`bugpot-egress`, `bugpot-core`, `bugpot-admin`, and `cmd/bugpotd`
 all transitively depend on Linux-only crates (`libcontainer`,
 `procfs`, `nix::sched`, `inotify`). Four crates are pure Rust and
 compile on macOS directly:
@@ -153,7 +153,7 @@ raw API response verbatim — useful for piping into `jq` from a
 self-hosted CI runner.
 
 The CLI is intentionally pure-Rust and dep-free of `bugpot-runtime` /
-`bugpot-controller` / `bugpot-admin` so it compiles on macOS too;
+`bugpot-core` / `bugpot-admin` so it compiles on macOS too;
 operators can run it from their laptop against a remote `bugpotd`.
 
 Bearer-token auth is **mandatory** (`BUGPOT_ADMIN_TOKEN_FILE` preferred,
@@ -203,7 +203,7 @@ Rollout endpoint (`/apps/{name}/rollouts`):
 
 Adapter crates (webhook receiver, GitHub poller, CLI) can be added later
 as siblings of `bugpot-admin`; the public mutation API on
-`AppController` (`deploy_app` / `remove_app` / `list_apps` / `get_app`)
+`AppHost` (`deploy_app` / `remove_app` / `list_apps` / `get_app`)
 is the shared boundary.
 
 ## Exposing apps externally
@@ -239,8 +239,8 @@ cmd/bugpotd (main: wires everything; no business logic)
    ├─► bugpot-egress     : bridge + netns + nft + DNS allowlist
    ├─► bugpot-runtime    : OCI pull + libcontainer lifecycle
    ├─► bugpot-router     : axum reverse proxy, resolves by Host subdomain
-   ├─► bugpot-controller : AppHandle state machine + cold-start orchestration + idle reaper
-   ├─► bugpot-admin      : admin HTTP API (CRUD over AppController), bearer auth
+   ├─► bugpot-core       : AppHandle state machine + cold-start orchestration + idle reaper
+   ├─► bugpot-admin      : admin HTTP API (CRUD over AppHost), bearer auth
    └─► bugpot-metrics    : Prometheus recorder + /metrics + /healthz listener
 
 cmd/bugpot (CLI; pure-Rust, also builds on macOS — talks to bugpotd's admin API)
@@ -286,13 +286,13 @@ A user namespace was investigated and **deferred**: libcontainer creates the use
 
 ### Scale-to-zero
 
-`scaling.idle_timeout` in app TOML: `"0"` / `""` / missing → always-on (eagerly started at bring-up, never frozen); `"30s"` / `"5m"` / `"2h"` → freezer kicks in once `last_access` is older than the timeout. Default 5m. The state-transition logic lives in `crates/bugpot-controller`.
+`scaling.idle_timeout` in app TOML: `"0"` / `""` / missing → always-on (eagerly started at bring-up, never frozen); `"30s"` / `"5m"` / `"2h"` → freezer kicks in once `last_access` is older than the timeout. Default 5m. The state-transition logic lives in `crates/bugpot-core`.
 
 **Freeze vs stop.** The default scale-to-zero path is **freeze, not stop** (cgroup v2 freezer). Frozen apps keep their full RSS resident but consume zero CPU; the next request resumes in sub-ms (no image pull, no libcontainer fork, no TCP readiness probe). The trade-off — RAM stays allocated — is bounded by a memory-pressure handler that polls `MemAvailable` and evicts oldest-frozen apps to `Stopped` when memory drops below `BUGPOT_FREEZE_MEM_LO`. This shifts the bottleneck from "cold-start CPU spike on every long-idle hit" to "RAM in steady state", which is what's wanted for the "many small self-hosted apps on a cheap VM" use case (Vaultwarden / Grafana / Linkding-class). Set `BUGPOT_FREEZE_ENABLED=false` to restore the pre-freeze idle = stop behavior. The router's `forward_upgrade` increments `AppHandle::active_upgrades` for the lifetime of every WebSocket / SSE splice, and the idle reaper refuses to freeze while that counter is non-zero — so long-lived upgraded connections survive idle gaps without being silently stranded.
 
 ### Readiness probe
 
-`bugpot-controller` waits for the app to signal ready after starting the container; the cold-start path doesn't return success (and the router doesn't forward the first request) until the probe passes. Two modes, selected per-app in TOML:
+`bugpot-core` waits for the app to signal ready after starting the container; the cold-start path doesn't return success (and the router doesn't forward the first request) until the probe passes. Two modes, selected per-app in TOML:
 
 ```toml
 [readiness]
@@ -305,7 +305,7 @@ path = "/health"     # optional; opt into HTTP probing
 
 `path` is opt-in rather than a fixed default like `/healthz` because the self-hosted-tool ecosystem hasn't standardised: Vaultwarden serves `/alive`, Linkding `/health`, Miniflux `/healthcheck`, Grafana `/api/health`, Mastodon `/health`, Nextcloud `/status.php`. Forcing a single name would break most pre-built images. Operators pick the right path per app.
 
-The HTTP probe is implemented inline (raw `TcpStream` + a 200-byte read of the response head) rather than via a hyper or reqwest client to keep `bugpot-controller`'s dep graph stable — a single `GET` with `Connection: close` is the smallest possible HTTP/1.1 exchange and the parser only needs the status code.
+The HTTP probe is implemented inline (raw `TcpStream` + a 200-byte read of the response head) rather than via a hyper or reqwest client to keep `bugpot-core`'s dep graph stable — a single `GET` with `Connection: close` is the smallest possible HTTP/1.1 exchange and the parser only needs the status code.
 
 ### Persistent volumes
 

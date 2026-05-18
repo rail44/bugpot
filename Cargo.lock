@@ -235,7 +235,7 @@ dependencies = [
  "anyhow",
  "axum",
  "bugpot-config",
- "bugpot-controller",
+ "bugpot-core",
  "bugpot-egress",
  "bugpot-runtime",
  "hex",
@@ -268,7 +268,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "bugpot-controller"
+name = "bugpot-core"
 version = "0.0.1"
 dependencies = [
  "anyhow",
@@ -373,7 +373,7 @@ dependencies = [
  "anyhow",
  "bugpot-admin",
  "bugpot-config",
- "bugpot-controller",
+ "bugpot-core",
  "bugpot-egress",
  "bugpot-metrics",
  "bugpot-router",

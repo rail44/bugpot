@@ -136,7 +136,7 @@ impl Scaling {
 /// default when missing.
 ///
 /// **`path`** opts the app into an HTTP-level probe instead of the
-/// default TCP-bind check. When set, `bugpot-controller` issues
+/// default TCP-bind check. When set, `bugpot-core` issues
 /// `GET <ip>:<port><path>` until it gets a 2xx response (or the
 /// timeout fires). When unset, the controller only waits for the
 /// container to accept TCP connections on `port`.

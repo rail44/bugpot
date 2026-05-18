@@ -2,7 +2,7 @@
 //!
 //! Loads `apps/*.toml`, brings up the egress stack (bridge / DNS / nftables),
 //! initialises the runtime, and starts the router. Apps are deployed
-//! lazily by the [`bugpot_controller::AppController`] on first request,
+//! lazily by the [`bugpot_core::AppHost`] on first request,
 //! except those that explicitly opt out of scale-to-zero
 //! (`scaling.idle_timeout = "0"`), which are started eagerly on bring-up.
 //!
@@ -58,7 +58,7 @@ fn init_tracing() {
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new(
-            "bugpot=info,bugpot_admin=info,bugpot_router=info,bugpot_runtime=info,bugpot_egress=info,bugpot_controller=info",
+            "bugpot=info,bugpot_admin=info,bugpot_router=info,bugpot_runtime=info,bugpot_egress=info,bugpot_core=info",
         )
     });
     let fmt_layer = tracing_subscriber::fmt::layer().with_filter(filter);

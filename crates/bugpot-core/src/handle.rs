@@ -1,10 +1,10 @@
 //! Per-app handle and state machine types.
 //!
-//! These are the building blocks the `AppController` operates on:
+//! These are the building blocks the `AppHost` operates on:
 //! a long-lived [`AppHandle`] per registered app, an [`AppState`]
 //! enum capturing the lifecycle, and [`AppMaps`] for the
 //! registration index. The transition logic that mutates them
-//! lives in `AppController`'s methods (in `lib.rs`); this module
+//! lives in `AppHost`'s methods (in `lib.rs`); this module
 //! is the *types and their construction*.
 
 use std::collections::{HashMap, VecDeque};
@@ -30,7 +30,7 @@ pub(crate) const MAX_ROLLOUT_HISTORY: usize = 2;
 ///
 /// `pub` so callers outside the crate (e.g. `bugpot-admin`'s auth
 /// middleware) can hold an `Arc<AppHandle>` returned by
-/// [`AppController::find_handle`](crate::AppController::find_handle)
+/// [`AppHost::find_handle`](crate::AppHost::find_handle)
 /// and pass it back into operation methods, removing the
 /// "look-the-app-up-twice" footgun the name-keyed API encouraged.
 /// Internal fields stay `pub(crate)` — only the named accessor

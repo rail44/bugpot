@@ -79,7 +79,7 @@ fn fake_app(name: &str, port: u16) -> AppSpec {
 }
 
 /// Static (name → 127.0.0.1:port) route table used as the test's
-/// `UpstreamResolver`. The production resolver is `AppController`,
+/// `UpstreamResolver`. The production resolver is `AppHost`,
 /// which cold-starts containers on demand; tests just need a fixed
 /// host → upstream mapping to exercise the proxy layer in isolation.
 #[derive(Debug)]

@@ -115,10 +115,10 @@ enum RolloutsCmd {
     },
 }
 
-// ---- Wire types (mirror of bugpot-admin / bugpot-controller) --------------
+// ---- Wire types (mirror of bugpot-admin / bugpot-core) --------------------
 //
 // These are the *client* view. We don't share the server crate's structs
-// because pulling in `bugpot-controller` would drag the Linux-only
+// because pulling in `bugpot-core` would drag the Linux-only
 // libcontainer dependency tree into the CLI.
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
