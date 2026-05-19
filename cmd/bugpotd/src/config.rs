@@ -6,14 +6,20 @@
 //! also keeps `main` short and makes "which env var is this?"
 //! answerable by grepping one file.
 
-use std::{net::SocketAddr, path::PathBuf};
+use std::net::SocketAddr;
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use bugpot_egress::EgressConfig;
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:8080";
 const DEFAULT_ADMIN_LISTEN: &str = "127.0.0.1:8081";
-const DEFAULT_AUTH_FILE: &str = "/etc/bugpot/auth.toml";
+/// Fixed registry-auth file location. Not an env knob: parallel
+/// bugpotd instances on the same host already share `/etc/bugpot/`
+/// for `admin-token` / `deploy-secret`, so sharing `auth.toml`
+/// is the matching convention. A second instance wanting different
+/// registry credentials should run on a different host.
+const AUTH_FILE: &str = "/etc/bugpot/auth.toml";
 
 /// Resolved startup configuration. Constructed once at process
 /// start; never re-read while the daemon runs (the systemd unit
@@ -22,7 +28,6 @@ const DEFAULT_AUTH_FILE: &str = "/etc/bugpot/auth.toml";
 pub(crate) struct Config {
     pub(crate) listen: SocketAddr,
     pub(crate) admin_listen: SocketAddr,
-    pub(crate) auth_file: PathBuf,
     pub(crate) egress: EgressConfig,
 }
 
@@ -38,17 +43,20 @@ impl Config {
             .parse()
             .context("parse BUGPOT_ADMIN_LISTEN")?;
 
-        let auth_file = std::env::var("BUGPOT_AUTH_FILE")
-            .map_or_else(|_| PathBuf::from(DEFAULT_AUTH_FILE), PathBuf::from);
-
         let egress = parse_egress_config()?;
 
         Ok(Self {
             listen,
             admin_listen,
-            auth_file,
             egress,
         })
+    }
+
+    /// Fixed path to the registry-auth TOML. Static rather than a
+    /// field so callers can't accidentally read a stale snapshot
+    /// across a `systemctl reload` cycle.
+    pub(crate) fn auth_file() -> &'static Path {
+        Path::new(AUTH_FILE)
     }
 }
 
@@ -76,11 +84,17 @@ fn parse_egress_config() -> Result<EgressConfig> {
 /// `BUGPOT_TRUSTED_PROXIES` is a comma-separated CIDR list. Peers
 /// outside this set have their incoming `X-Forwarded-For` discarded
 /// so an attacker cannot spoof an upstream chain. Empty / unset →
-/// behave as the historical proxy (always append).
+/// **no peer is trusted**: every incoming `X-Forwarded-For` is
+/// dropped before the proxied request reaches the upstream. This is
+/// the secure-by-default position; deployments that actually sit
+/// behind a TLS-terminating front populate the list explicitly with
+/// that front's CIDR.
 ///
-/// `BUGPOT_FORWARDED_PROTO` overrides the value bugpot writes into
-/// `X-Forwarded-Proto`. Set to `https` when bugpot sits behind a
-/// TLS-terminating front; default is `http`.
+/// `X-Forwarded-Proto` is fixed at `http` (the `RouterConfig` default).
+/// Reverse-proxy front-ends that terminate TLS are expected to
+/// inject their own `X-Forwarded-Proto: https` ahead of bugpot; the
+/// router preserves operator-set values and only writes the default
+/// when no header is present.
 pub(crate) fn parse_router_config() -> Result<bugpot_router::RouterConfig> {
     let mut cfg = bugpot_router::RouterConfig::default();
     if let Ok(raw) = std::env::var("BUGPOT_TRUSTED_PROXIES") {
@@ -95,33 +109,5 @@ pub(crate) fn parse_router_config() -> Result<bugpot_router::RouterConfig> {
             cfg.trusted_proxies.push(net);
         }
     }
-    if let Ok(raw) = std::env::var("BUGPOT_FORWARDED_PROTO") {
-        let trimmed = raw.trim();
-        if !trimmed.is_empty() {
-            trimmed.clone_into(&mut cfg.forwarded_proto);
-        }
-    }
     Ok(cfg)
-}
-
-pub(crate) fn parse_env_bool(key: &str, default: bool) -> Result<bool> {
-    parse_env(key, default, |s| match s.to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Ok(true),
-        "0" | "false" | "no" | "off" | "" => Ok(false),
-        other => anyhow::bail!("{key}: expected boolean, got '{other}'"),
-    })
-}
-
-pub(crate) fn parse_env_bytes(key: &str, default: u64) -> Result<u64> {
-    parse_env(key, default, |s| {
-        s.parse::<u64>().with_context(|| format!("parse {key}"))
-    })
-}
-
-/// Read `key` from the environment and pass its trimmed value through
-/// `parse`. Returns `default` when the variable is unset. Centralises
-/// the "trim + var-or-default" envelope that every `parse_env_*`
-/// helper used to repeat.
-fn parse_env<T>(key: &str, default: T, parse: impl FnOnce(&str) -> Result<T>) -> Result<T> {
-    std::env::var(key).map_or(Ok(default), |raw| parse(raw.trim()))
 }
