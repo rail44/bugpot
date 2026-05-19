@@ -24,7 +24,7 @@ use bugpot_runtime::Runtime;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
-use crate::config::{Config, parse_env_bool, parse_env_bytes, parse_router_config};
+use crate::config::{Config, parse_router_config};
 use crate::secrets::{read_admin_token, read_deploy_secret};
 
 /// Cadence for the controller's lifecycle sweep (crash detection +
@@ -39,17 +39,21 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// 1 GiB VM" and "noise floor on `/proc/meminfo` read cost".
 const MEM_PRESSURE_POLL: Duration = Duration::from_millis(500);
 
-/// Default low-water mark for memory pressure (bytes of `MemAvailable`).
-/// Below this, the controller starts evicting frozen apps LRU-first.
-/// 150 MiB is comfortable for an e2-micro (1 GiB); operators on a
-/// larger VM can override via `BUGPOT_FREEZE_MEM_LO`.
-const MEM_PRESSURE_LO_DEFAULT: u64 = 150 * 1024 * 1024;
-
-/// Default high-water mark (bytes). Eviction halts once `MemAvailable`
-/// rises back to this level — the hysteresis gap keeps the handler
-/// from flap-flipping at the threshold edge. Override via
-/// `BUGPOT_FREEZE_MEM_HI`.
-const MEM_PRESSURE_HI_DEFAULT: u64 = 250 * 1024 * 1024;
+/// Memory-pressure thresholds are derived from `MemTotal` at startup
+/// rather than configured: `lo = 15% of total`, `hi = 25% of total`,
+/// with absolute caps so the eviction window doesn't grow boundlessly
+/// on a large host. The 15/25 split matches the historical `e2-micro`
+/// defaults (150 MiB / 256 MiB on a 1 GiB host) and is the ratio that
+/// was already in production use before this auto-derive landed.
+const MEM_PRESSURE_LO_RATIO: u64 = 15;
+const MEM_PRESSURE_HI_RATIO: u64 = 25;
+const MEM_PRESSURE_LO_CAP: u64 = 1024 * 1024 * 1024; // 1 GiB
+const MEM_PRESSURE_HI_CAP: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+/// Fallback `MemTotal` when `/proc/meminfo` is unreadable or missing
+/// the `MemTotal:` line (the latter shouldn't happen on Linux but the
+/// helper has to return *something*). 1 GiB matches the e2-micro
+/// reference target.
+const MEM_TOTAL_FALLBACK: u64 = 1024 * 1024 * 1024;
 
 /// How often the in-process tokio runtime monitor samples and emits
 /// `bugpot_tokio_*` gauges / counters. Unconditional — the cost is
@@ -73,9 +77,10 @@ impl Bootstrap {
     /// the partially-built controller is torn down before the error
     /// propagates, so the host nft / netns state stays consistent.
     pub(crate) async fn build(cfg: Config, metrics_handle: PrometheusHandle) -> Result<Self> {
-        let auth = bugpot_config::load_auth(&cfg.auth_file).context("load auth.toml")?;
+        let auth_file = Config::auth_file();
+        let auth = bugpot_config::load_auth(auth_file).context("load auth.toml")?;
         info!(
-            file = %cfg.auth_file.display(),
+            file = %auth_file.display(),
             registries = auth.registries.len(),
             "loaded registry auth",
         );
@@ -110,9 +115,7 @@ impl Bootstrap {
 
         let mut tasks = Vec::new();
         tasks.push(spawn_sweep(&controller));
-        if let Some(t) = spawn_memory_pressure(&controller)? {
-            tasks.push(t);
-        }
+        tasks.push(spawn_memory_pressure(&controller));
         tasks.push(spawn_router(cfg.listen, &controller)?);
 
         bugpot_metrics::spawn_runtime_monitor(RUNTIME_MONITOR_INTERVAL);
@@ -179,39 +182,48 @@ fn spawn_sweep(controller: &Arc<AppHost<Runtime, Egress>>) -> JoinHandle<()> {
     tokio::spawn(c.sweep_loop(SWEEP_INTERVAL))
 }
 
-/// Memory-pressure loop runs only when freeze is enabled. With freeze
-/// disabled there are no Frozen apps to evict and the loop would just
-/// burn cycles reading `/proc/meminfo`. Returns `Ok(None)` when
-/// disabled.
-///
-/// `BUGPOT_FREEZE_ENABLED` (default `true`) is the kill switch:
-/// flipping it off restores pre-freeze scale-to-zero behavior
-/// (idle apps stop, no RAM-resident pool).
-fn spawn_memory_pressure(
-    controller: &Arc<AppHost<Runtime, Egress>>,
-) -> Result<Option<JoinHandle<()>>> {
-    if !parse_env_bool("BUGPOT_FREEZE_ENABLED", true)? {
-        info!("BUGPOT_FREEZE_ENABLED=false; memory-pressure handler disabled");
-        return Ok(None);
-    }
-    let lo = parse_env_bytes("BUGPOT_FREEZE_MEM_LO", MEM_PRESSURE_LO_DEFAULT)?;
-    let hi = parse_env_bytes("BUGPOT_FREEZE_MEM_HI", MEM_PRESSURE_HI_DEFAULT)?;
-    if hi <= lo {
-        anyhow::bail!(
-            "BUGPOT_FREEZE_MEM_HI ({hi}) must be greater than BUGPOT_FREEZE_MEM_LO ({lo})",
-        );
-    }
+/// Spawn the memory-pressure loop with thresholds auto-derived from
+/// `/proc/meminfo`. Unconditional now (freeze is always on): the loop
+/// is cheap when there are no Frozen apps to evict, and the
+/// "stop-on-idle" pre-freeze fallback is gone.
+fn spawn_memory_pressure(controller: &Arc<AppHost<Runtime, Egress>>) -> JoinHandle<()> {
+    let (lo, hi) = derive_mem_pressure_thresholds();
     info!(
         lo_bytes = lo,
         hi_bytes = hi,
-        "memory-pressure handler enabled"
+        "memory-pressure handler enabled (auto-derived from MemTotal)"
     );
     let c = Arc::clone(controller);
-    Ok(Some(tokio::spawn(c.memory_pressure_loop(
-        MEM_PRESSURE_POLL,
-        lo,
-        hi,
-    ))))
+    tokio::spawn(c.memory_pressure_loop(MEM_PRESSURE_POLL, lo, hi))
+}
+
+/// Compute `(lo, hi)` byte thresholds for the memory-pressure handler
+/// from the host's `MemTotal`. 15% / 25% of total, capped at 1 GiB /
+/// 2 GiB so the eviction window doesn't widen unboundedly on a host
+/// where almost all the RAM is for other things anyway.
+fn derive_mem_pressure_thresholds() -> (u64, u64) {
+    let total = read_mem_total().unwrap_or(MEM_TOTAL_FALLBACK);
+    let lo = (total * MEM_PRESSURE_LO_RATIO / 100).min(MEM_PRESSURE_LO_CAP);
+    let hi = (total * MEM_PRESSURE_HI_RATIO / 100).min(MEM_PRESSURE_HI_CAP);
+    (lo, hi)
+}
+
+/// Parse `MemTotal` (bytes) from `/proc/meminfo`. Mirrors
+/// `bugpot_core::mempressure::read_mem_available` in shape — kept here
+/// because `bugpot-core` doesn't expose its parser and the daemon only
+/// needs this once at startup.
+fn read_mem_total() -> Option<u64> {
+    let raw = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in raw.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kb: u64 = rest
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse().ok())?;
+            return Some(kb * 1024);
+        }
+    }
+    None
 }
 
 fn spawn_router(

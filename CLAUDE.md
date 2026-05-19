@@ -135,11 +135,16 @@ Env vars (read by bugpot directly):
 - `BUGPOT_ADMIN_LISTEN` — admin HTTP API (default `127.0.0.1:8081`)
 - `BUGPOT_ADMIN_TOKEN_FILE` — **required** unless `BUGPOT_ADMIN_TOKEN` is set. Path to a file whose trimmed contents are the bearer token. The file must be `0600` (any group/other permission bit set causes bugpot to refuse to start, ssh-key style). Typical layout when bugpot runs as the unprivileged `bugpot` user (the shipped systemd unit's setup): `/etc/bugpot/admin-token` with `bugpot:bugpot 0600`.
 - `BUGPOT_ADMIN_TOKEN` — fallback bearer token for development. **Logs a warning** when used because env vars are visible in `/proc/<pid>/environ` and shell history; prefer `BUGPOT_ADMIN_TOKEN_FILE` in production. bugpot refuses to start unless one of these two is set.
-- `BUGPOT_AUTH_FILE` — registry-auth TOML (default `/etc/bugpot/auth.toml`, missing file = anonymous)
 - `BUGPOT_METRICS_LISTEN` — opt-in Prometheus listener (e.g. `127.0.0.1:9090`). Unset = `/metrics` + `/healthz` disabled.
-- `BUGPOT_FREEZE_ENABLED` — `true` (default) or `false`. When on, `idle_timeout` freezes the container (cgroup v2 freezer) instead of stopping it, keeping RAM resident so the next request resumes in sub-ms. The memory-pressure handler evicts oldest-frozen apps to `Stopped` under low memory; see the two knobs below. Off restores pre-freeze behavior (idle = stop).
-- `BUGPOT_FREEZE_MEM_LO` / `BUGPOT_FREEZE_MEM_HI` — bytes of `MemAvailable` that trigger / release the eviction handler (hysteresis pair, defaults 150 MiB / 250 MiB sized for e2-micro). Bump for larger VMs. `LO < HI` is enforced; the daemon refuses to start otherwise.
+- `BUGPOT_EGRESS_DNS_UPSTREAM` — comma-separated upstream resolvers for the bridge DNS (default `1.1.1.1:53,8.8.8.8:53`). Set this on corporate networks that mandate a private resolver.
+- `BUGPOT_TRUSTED_PROXIES` — comma-separated CIDR list of reverse-proxy / front-end peers whose incoming `X-Forwarded-For` should be honoured. **Default: empty = trust nobody** (every request's XFF is replaced by the peer IP). Populate this when bugpot sits behind a TLS-terminating front, so the upstream's client-IP chain is preserved instead of dropped.
 - `RUST_LOG`
+
+Fixed (no env knob):
+
+- Registry-auth TOML lives at `/etc/bugpot/auth.toml`. Missing file = anonymous.
+- Scale-to-zero always uses the cgroup freezer; the `idle = stop` legacy path is gone. The memory-pressure handler is always on with thresholds auto-derived from `MemTotal` (15% / 25%, capped at 1 GiB / 2 GiB so the eviction window doesn't widen unboundedly on large hosts).
+- `X-Forwarded-Proto` defaults to `http`. Reverse proxies that terminate TLS are expected to inject their own `X-Forwarded-Proto: https`; bugpot only writes the default when no header is present.
 
 ### Admin HTTP API
 

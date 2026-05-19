@@ -118,9 +118,10 @@ pub struct RouterConfig {
     /// IPv4/IPv6 networks whose `X-Forwarded-For` is honoured. Requests
     /// from any other peer have their incoming XFF discarded — the
     /// peer's IP becomes the head of a fresh chain. Empty (default)
-    /// means trust the existing chain (current behaviour); set to the
-    /// IP ranges of whichever reverse proxy / private network sits in
-    /// front of bugpot in real deployments.
+    /// means **trust no peer**: every request's XFF is reset to the
+    /// peer IP. Deployments that want to preserve upstream chains
+    /// populate this list with the CIDR of the reverse proxy / load
+    /// balancer / tailnet sitting in front of bugpot.
     pub trusted_proxies: Vec<IpNet>,
     /// Value to set in `X-Forwarded-Proto` when the upstream request
     /// doesn't already carry one. Defaults to `http`. Set to `https`
@@ -732,12 +733,14 @@ fn inject_forwarded_headers(
 /// `trusted_proxies`; otherwise reset XFF to just the peer's IP so an
 /// attacker can't spoof an upstream chain.
 ///
-/// `trusted_proxies` empty (default) preserves the historical
-/// behaviour of unconditionally appending — operators who haven't
-/// configured trust boundaries see no behaviour change.
+/// `trusted_proxies` empty (default) means trust nobody: every
+/// request's XFF is replaced by the peer IP. The historical
+/// "empty = trust all" was a footgun — a deployment one typo away
+/// from `BUGPOT_LISTEN=0.0.0.0:8080` would accept any client's
+/// claimed chain — and is intentionally gone.
 fn rewrite_forwarded_for(headers: &mut HeaderMap, peer_ip: IpAddr, trusted: &[IpNet]) {
     let peer_str = peer_ip.to_string();
-    let trust_peer = trusted.is_empty() || trusted.iter().any(|n| n.contains(&peer_ip));
+    let trust_peer = trusted.iter().any(|n| n.contains(&peer_ip));
     let new_value = if trust_peer {
         headers
             .get(&X_FORWARDED_FOR)
@@ -821,18 +824,23 @@ mod tests {
     }
 
     #[test]
-    fn appends_forwarded_for_with_empty_trust_list() {
-        // Empty trust list = trust everyone (back-compat).
+    fn empty_trust_list_resets_xff_to_peer() {
+        // Empty trust list = trust nobody. Any incoming XFF claim is
+        // replaced by the peer IP — `1.2.3.4` (whatever a malicious
+        // client tried to inject) never reaches the upstream.
         let mut h = HeaderMap::new();
+        h.insert(X_FORWARDED_FOR, HeaderValue::from_static("evil-spoof"));
         rewrite_forwarded_for(&mut h, "10.0.0.1".parse().unwrap(), &[]);
         assert_eq!(
             h.get(&X_FORWARDED_FOR).and_then(|v| v.to_str().ok()),
             Some("10.0.0.1")
         );
+        // Successive request from a different peer: again just the
+        // peer IP (no append, no preservation).
         rewrite_forwarded_for(&mut h, "10.0.0.2".parse().unwrap(), &[]);
         assert_eq!(
             h.get(&X_FORWARDED_FOR).and_then(|v| v.to_str().ok()),
-            Some("10.0.0.1, 10.0.0.2")
+            Some("10.0.0.2")
         );
     }
 
@@ -907,14 +915,8 @@ mod tests {
     }
 
     #[test]
-    fn xff_appends_when_trusted_or_empty() {
-        // Empty trusted list = trust everything (historical behaviour).
-        let mut h = HeaderMap::new();
-        h.insert(X_FORWARDED_FOR, HeaderValue::from_static("1.2.3.4"));
-        rewrite_forwarded_for(&mut h, "5.6.7.8".parse().unwrap(), &[]);
-        assert_eq!(h.get(X_FORWARDED_FOR).unwrap(), "1.2.3.4, 5.6.7.8");
-
-        // Trusted peer: append.
+    fn xff_appends_only_when_peer_is_trusted() {
+        // Trusted peer: existing chain is preserved, peer IP appended.
         let mut h = HeaderMap::new();
         h.insert(X_FORWARDED_FOR, HeaderValue::from_static("1.2.3.4"));
         let trusted: Vec<IpNet> = vec!["5.6.7.0/24".parse().unwrap()];
